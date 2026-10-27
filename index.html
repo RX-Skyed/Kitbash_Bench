@@ -86,6 +86,15 @@ button, input, select { font: inherit; color: inherit; }
 .ofield input[type=range] { width: 90px; accent-color: var(--accent); }
 .ofield .num { width: 62px; }
 .ofield .osel { width: auto; text-align: left; }
+.swatches { display: inline-flex; gap: 3px; }
+.swatch { width: 18px; height: 18px; border-radius: 3px; border: 1px solid rgba(0,0,0,.4); padding: 0; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); }
+.swatch[aria-checked="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+#paint-color { width: 28px; height: 22px; padding: 0; border: 1px solid var(--line); border-radius: 3px; background: none; cursor: pointer; }
+#paint-mode button { padding: 3px 9px; }
+.mag-list { display: grid; gap: 4px; }
+.mag-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+.mag-row span { flex: 1 1 100%; color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+.mag-row .btn { font-size: 11px; padding: 2px 7px; }
 .optbar .check { color: var(--muted); }
 .ohint { color: var(--muted); }
 
@@ -458,8 +467,8 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
     <div class="brand"><i></i>Kitbash Bench</div>
     <nav class="menus" aria-label="Menu">
       <div class="menu"><button class="mtop" type="button" aria-haspopup="menu" aria-expanded="false">File</button><div class="mlist" role="menu" aria-label="File" hidden><button class="mi" role="menuitem" type="button" id="proj-new"><span>New project</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="proj-open-file"><span>Open project file…</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="proj-list-btn"><span>Saved projects…</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="proj-save-file"><span>Save project file</span><kbd></kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="btn-import"><span>Import STL…</span><kbd>Ctrl+O</kbd></button><button class="mi" role="menuitem" type="button" id="btn-folder"><span>Open folder…</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="btn-sample"><span>Load sample kit</span><kbd></kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-export"><span>Export…</span><kbd>Ctrl+E</kbd></button></div></div>
-      <div class="menu"><button class="mtop" type="button" aria-haspopup="menu" aria-expanded="false">Edit</button><div class="mlist" role="menu" aria-label="Edit" hidden><button class="mi" role="menuitem" type="button" id="menu-undo"><span>Undo</span><kbd>Ctrl+Z</kbd></button><button class="mi" role="menuitem" type="button" id="menu-redo"><span>Redo</span><kbd>Ctrl+Shift+Z</kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-selall"><span>Select all</span><kbd>Ctrl+A</kbd></button><button class="mi" role="menuitem" type="button" id="menu-selnone"><span>Deselect</span><kbd>Esc</kbd></button><button class="mi" role="menuitem" type="button" id="menu-delete"><span>Delete</span><kbd>Del</kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-prefs"><span>Preferences…</span><kbd>Ctrl+,</kbd></button></div></div>
-      <div class="menu"><button class="mtop" type="button" aria-haspopup="menu" aria-expanded="false">Kit</button><div class="mlist" role="menu" aria-label="Kit" hidden><button class="mi" role="menuitem" type="button" id="btn-autorig"><span>Auto-assemble…</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="btn-arrange"><span>Lay out parts</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="btn-sprue"><span>Put on sprues</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-unbox"><span>Open the box</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-unsprue"><span>Remove sprue frames</span><kbd></kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-slot"><span>Make option slot from selection</span><kbd></kbd></button></div></div>
+      <div class="menu"><button class="mtop" type="button" aria-haspopup="menu" aria-expanded="false">Edit</button><div class="mlist" role="menu" aria-label="Edit" hidden><button class="mi" role="menuitem" type="button" id="menu-undo"><span>Undo</span><kbd>Ctrl+Z</kbd></button><button class="mi" role="menuitem" type="button" id="menu-redo"><span>Redo</span><kbd>Ctrl+Shift+Z</kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-selall"><span>Select all</span><kbd>Ctrl+A</kbd></button><button class="mi" role="menuitem" type="button" id="menu-selnone"><span>Deselect</span><kbd>Esc</kbd></button><button class="mi" role="menuitem" type="button" id="menu-delete"><span>Delete</span><kbd>Del</kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-clearpaint"><span>Clear all paint</span><kbd></kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-prefs"><span>Preferences…</span><kbd>Ctrl+,</kbd></button></div></div>
+      <div class="menu"><button class="mtop" type="button" aria-haspopup="menu" aria-expanded="false">Kit</button><div class="mlist" role="menu" aria-label="Kit" hidden><button class="mi" role="menuitem" type="button" id="btn-autorig"><span>Auto-assemble…</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="btn-arrange"><span>Lay out parts</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="btn-sprue"><span>Put on sprues</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-unbox"><span>Open the box</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-unsprue"><span>Remove sprue frames</span><kbd></kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitem" type="button" id="menu-nomagnets"><span>Remove all magnets</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-pockets"><span>Check for hollow pockets</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-slot"><span>Make option slot from selection</span><kbd></kbd></button></div></div>
       <div class="menu"><button class="mtop" type="button" aria-haspopup="menu" aria-expanded="false">View</button><div class="mlist" role="menu" aria-label="View" hidden><button class="mi" role="menuitem" type="button" id="menu-home"><span>Home view</span><kbd></kbd></button><button class="mi" role="menuitem" type="button" id="menu-front"><span>Front</span><kbd>Num 1</kbd></button><button class="mi" role="menuitem" type="button" id="menu-right"><span>Right</span><kbd>Num 3</kbd></button><button class="mi" role="menuitem" type="button" id="menu-top"><span>Top</span><kbd>Num 7</kbd></button><button class="mi" role="menuitem" type="button" id="menu-frame"><span>Frame selected</span><kbd>F</kbd></button><div class="msep" role="separator"></div><button class="mi" role="menuitemcheckbox" type="button" id="menu-joints" aria-checked="false"><span>Joints and skeleton</span><kbd></kbd></button><button class="mi" role="menuitemcheckbox" type="button" id="menu-seams" aria-checked="false"><span>Seams to fill</span><kbd></kbd></button></div></div>
     </nav>
     <div class="doc"><input class="doc-name" id="proj-name" value="Untitled kit" aria-label="Project name" spellcheck="false"><span id="proj-status" class="proj-status"></span></div>
@@ -479,6 +488,16 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
             <option value="alone">Move just that part</option>
             <option value="group">Make it the base, bring the group</option>
           </select></span><label class="check"><input type="checkbox" id="set-orbitsel-2" data-mirror="set-orbitsel" checked> Orbit around selection</label></span>
+    <span class="ogroup" data-tools="paint"><span class="swatches" id="paint-swatches" role="radiogroup" aria-label="Paint colour"></span><input type="color" id="paint-color" value="#8a1414" aria-label="Custom colour" title="Any colour">
+      <span class="seg" id="paint-mode" role="group" aria-label="How to paint"><button type="button" data-v="brush" aria-pressed="true">Brush</button><button type="button" data-v="fill" aria-pressed="false">Fill part</button></span>
+      <span class="ofield" id="paint-size-f"><label for="paint-size">Size mm</label><input type="range" id="paint-size-r" min="0.2" max="8" step="0.1" value="1.5" aria-label="Brush size"><input class="num" id="paint-size" type="number" min="0.1" max="30" step="0.1" value="1.5"></span>
+      <label class="check" title="Paint back to bare plastic (E)"><input type="checkbox" id="paint-erase"> Erase</label>
+      <span class="ofield"><label for="set-plastic-2">Plastic</label><select id="set-plastic-2" data-mirror="set-plastic" class="num osel"><option value="parts">Part colours</option><option value="grey">Grey plastic</option><option value="lightgrey">Light grey resin</option><option value="cream">Cream resin</option><option value="white">White plastic</option><option value="bone">Bone plastic</option><option value="black-primer">Black primer</option><option value="grey-primer">Grey primer</option><option value="white-primer">White primer</option></select></span></span>
+    <span class="ogroup" data-tools="MAGNET"><span class="ofield"><label for="mag-size">Magnet</label><select id="mag-size" class="num osel"><option value="1x1">1 × 1 mm</option><option value="2x1">2 × 1 mm</option><option value="2x2">2 × 2 mm</option><option value="3x1">3 × 1 mm</option><option value="3x2" selected>3 × 2 mm</option><option value="4x2">4 × 2 mm</option><option value="5x1">5 × 1 mm</option><option value="5x2">5 × 2 mm</option><option value="5x3">5 × 3 mm</option><option value="6x2">6 × 2 mm</option><option value="6x3">6 × 3 mm</option><option value="8x2">8 × 2 mm</option><option value="8x3">8 × 3 mm</option><option value="10x2">10 × 2 mm</option><option value="10x3">10 × 3 mm</option><option value="custom">Custom</option></select></span>
+      <span class="ofield"><label for="mag-d">Ø</label><input class="num" id="mag-d" type="number" min="0.5" max="40" step="0.1" value="3"><label for="mag-t">×</label><input class="num" id="mag-t" type="number" min="0.3" max="20" step="0.1" value="2"><span>mm</span></span>
+      <span class="ofield"><label for="mag-fit">Fit</label><select id="mag-fit" class="num osel"><option value="resin">Resin (+0.15)</option><option value="fdm">FDM (+0.3)</option><option value="custom">Custom</option></select></span>
+      <span class="ofield"><label for="mag-cd">Hole Ø +</label><input class="num" id="mag-cd" type="number" min="0" max="2" step="0.05" value="0.15"><label for="mag-ct">depth +</label><input class="num" id="mag-ct" type="number" min="0" max="2" step="0.05" value="0.15"></span>
+      <button class="btn" id="mag-apply" type="button" title="Give every magnet on the bench this size and fit">Apply to all</button></span>
     <span class="ogroup" data-tools="BALL"><span class="ofield"><label for="set-smooth">Crease angle °</label><input id="set-smooth" type="range" min="2" max="90" step="1" value="30"><input class="num" id="set-smooth-n" type="number" min="2" max="90" step="1" value="30" aria-label="Ball crease angle in degrees"></span><span class="ofield"><label for="set-balltol">Fit tolerance %</label><input id="set-balltol-r" type="range" min="0.5" max="20" step="0.5" value="3" aria-label="Ball fit tolerance"><input class="num" id="set-balltol" type="number" min="0.5" max="20" step="0.5" value="3"></span><span class="ofield"><label for="set-radius">Max radius mm</label><input id="set-radius-r" type="range" min="0" max="30" step="0.5" value="0" aria-label="Ball max radius"><input class="num" id="set-radius" type="number" min="0" step="0.5" value="0"></span></span>
     <span class="ogroup" data-tools="MATCH"><span class="ofield"><label for="set-crease">Face edge angle °</label><input id="set-crease-r" type="range" min="5" max="80" step="1" value="30" aria-label="Match face edge angle"><input class="num" id="set-crease" type="number" min="5" max="80" step="1" value="30"></span></span>
     <span class="ogroup" data-tools="PLANE MID MATCH ORIENT"><span class="ofield"><label for="set-flat">Flat face tolerance mm</label><input id="set-flat-r" type="range" min="0.001" max="0.3" step="0.001" value="0.02" aria-label="Flat face tolerance"><input class="num" id="set-flat" type="number" min="0.001" max="2" step="0.005" value="0.02"></span></span>
@@ -496,6 +515,8 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
       <svg viewBox="0 0 24 24"><circle cx="7" cy="17" r="2.5"/><path d="M8.8 15.2 15 9"/><circle cx="16.5" cy="7.5" r="2"/><path d="M18 9.5l2.5 5"/></svg>Pose</button>
     <button class="tool" data-tool="ORIENT" type="button" title="Orient: lay a face flat, square parts or seams to X, Y, Z (O)"><span class="k">O</span>
       <svg viewBox="0 0 24 24"><path d="M7 4h10l-2 8H9z"/><path d="M12 13v5M9.5 15.5 12 18l2.5-2.5"/><path d="M3 21h18"/></svg>Orient</button>
+    <button class="tool" data-tool="paint" type="button" title="Colour: brush paint onto parts, fill a whole part, Alt-click to pick a colour (C)"><span class="k">C</span>
+      <svg viewBox="0 0 24 24"><path d="M14.5 4.5l5 5-8.5 8.5h-5v-5z"/><path d="M12 7l5 5"/><path d="M6 18c-1 1.5-2.5 2-3.5 2 .5-1 .5-2.5 2-3.5"/></svg>Colour</button>
     <div class="group-label">Snap</div>
     <button class="tool" data-tool="BALL" type="button" title="Ball &amp; socket (B)"><span class="k">B</span>
       <svg viewBox="0 0 24 24"><circle cx="9" cy="12" r="4.5"/><path d="M15 6.5a6.5 6.5 0 0 1 0 11"/><path d="M3 12h1.5"/></svg>Ball</button>
@@ -507,6 +528,8 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
       <svg viewBox="0 0 24 24"><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><circle cx="12" cy="5" r="2"/><path d="M6.5 16.5 11 6.8M13 6.8l4.5 9.7M7 18h10" stroke-dasharray="2 2"/></svg>3-Point</button>
     <button class="tool" data-tool="MATCH" type="button" title="Surface match: fit two parts by the shaped face they share (J)"><span class="k">J</span>
       <svg viewBox="0 0 24 24"><path d="M3 7h6l1.5 2.5L13 6l2 3.5L17 7h4"/><path d="M3 15h6l1.5 2.5L13 14l2 3.5L17 15h4"/><path d="M12 10.5v2" stroke-dasharray="1 1.5"/></svg>Match</button>
+    <button class="tool" data-tool="MAGNET" type="button" title="Magnets: click where two parts meet to set a pair of magnet holes (N)"><span class="k">N</span>
+      <svg viewBox="0 0 24 24"><path d="M6 4v8a6 6 0 0 0 12 0V4"/><path d="M10 4v8a2 2 0 0 0 4 0V4"/><path d="M6 7h4M14 7h4"/></svg>Magnet</button>
   </nav>
 
   <section class="view" id="view">
@@ -798,6 +821,13 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
           <div class="btnrow"><button class="btn" id="exp-preview" type="button" aria-pressed="false">Show seams</button></div>
           <p class="note" id="exp-fill-note">Where parts nearly touch (seams, joints, pegs in holes), their surfaces are pushed out to overlap, so the slicer sees one solid with no slits. Nothing else changes. Applies to the one-file exports.</p>
         </div>
+        <label class="check"><input type="checkbox" id="exp-pockets"> Fill hollow pockets (for resin printing)</label>
+        <div class="fill-f" id="exp-pockets-f" hidden>
+          <label for="exp-pocket-res">Detail</label>
+          <select class="num osel" id="exp-pocket-res" style="width:auto;text-align:left"><option value="0.5">Quick (0.5 mm)</option><option value="0.35" selected>Normal (0.35 mm)</option><option value="0.2">Fine (0.2 mm, slower)</option></select>
+          <div class="btnrow"><button class="btn" id="exp-pocket-show" type="button" aria-pressed="false">Show pockets</button></div>
+          <p class="note" id="exp-pocket-note">Air sealed inside the model, between parts or inside a part, is filled solid in the exported file so no uncured resin gets trapped. Your parts don't change: keep posing and moving them, it's worked out again each export. Pockets that open to the outside (drain holes, gaps you left on purpose) and specks under 1 mm³ are left alone. Applies to the one-file exports.</p>
+        </div>
         <div id="exp-sprue-f" class="btnrow" hidden>
           <button class="btn" id="exp-sprue" type="button" title="One STL per sprue frame: the plastic, its gates and the pieces still on it">Sprues as printable kits</button>
           <button class="btn" id="exp-sprue-clear" type="button" title="Remove the sprue frames (the pieces stay where they are)">Remove sprue frames</button>
@@ -812,6 +842,9 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
             <option value="ask">Ask each time</option><option value="kit">Model kit: sprues in a sealed box</option><option value="spread">Off the sprue, spread out</option><option value="asis">Where the files put them</option><option value="auto" hidden>Decide for me</option>
           </select></div><label class="check" title="A file named &quot;Leg x8&quot;, &quot;leg_8x&quot; or &quot;2x Pauldron&quot; brings in that many copies"><input type="checkbox" id="set-qty" checked> Read "x8" or "2x" in file names as copies</label></div>
         <div class="pgroup"><h3>Bench</h3><div class="field">
+          <label for="set-plastic">Plastic</label>
+          <select id="set-plastic" class="num" style="width:auto;text-align:left"><option value="parts">Part colours</option><option value="grey">Grey plastic</option><option value="lightgrey">Light grey resin</option><option value="cream">Cream resin</option><option value="white">White plastic</option><option value="bone">Bone plastic</option><option value="black-primer">Black primer</option><option value="grey-primer">Grey primer</option><option value="white-primer">White primer</option></select>
+        </div><div class="field">
           <label for="set-bench">Bench surface</label>
           <select id="set-bench" class="num" style="width:auto;text-align:left">
             <option value="green" selected>Cutting mat, green</option><option value="black">Cutting mat, black</option><option value="blue">Cutting mat, blue</option><option value="grid">Plain grid</option>
@@ -846,7 +879,7 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
   "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-  "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js"
+  "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js", "three-bvh-csg": "https://cdn.jsdelivr.net/npm/three-bvh-csg@0.0.16/build/index.module.js"
 } }
 </script>
 <script type="module">
@@ -1336,14 +1369,15 @@ function computeSnap(op) {
 
 /** Binary STL of meshes in their current world pose. */
 function writeSTL(meshes) {
-  let n = 0; for (const m of meshes) n += m.geometry.index.count / 3;
+  const idxOf = g => g.index ? g.index.array : (g.userData.seqIdx ||= Uint32Array.from({ length: g.attributes.position.count }, (_, i) => i));   // cut meshes come unindexed
+  let n = 0; for (const m of meshes) n += idxOf(m.geometry).length / 3;
   const buf = new ArrayBuffer(84 + 50 * n), dv = new DataView(buf);
   const head = "Kitbash Bench export (mm)";
   for (let i = 0; i < head.length; i++) dv.setUint8(i, head.charCodeAt(i));
   dv.setUint32(80, n, true);
   let o = 84; const a = V(), b = V(), c = V(), u = V(), w = V();
   for (const m of meshes) {
-    const M = m.matrixWorld, flip = M.determinant() < 0, idx = m.geometry.index.array, pos = m.geometry.attributes.position.array;
+    const M = m.matrixWorld, flip = M.determinant() < 0, idx = idxOf(m.geometry), pos = m.geometry.attributes.position.array;
     for (let t = 0; t < idx.length; t += 3) {
       a.fromArray(pos, idx[t]*3).applyMatrix4(M); b.fromArray(pos, idx[t+1]*3).applyMatrix4(M); c.fromArray(pos, idx[t+2]*3).applyMatrix4(M);
       if (flip) { const tmp = b.clone(); b.copy(c); c.copy(tmp); }
@@ -2518,9 +2552,18 @@ function patchMesh(topo, M, list) {
  * groupsA/B: arrays of triangle lists. Returns fits sorted best first: { T, joint, axis, coverage, gap, score }.
  */
 function multiFit(topoA, MA, groupsA, topoB, MB, groupsB, opts = {}) {
-  const listA = [...new Set(groupsA.flat())], listB = [...new Set(groupsB.flat())];
-  const gA = patchMesh(topoA, MA, listA), gB = patchMesh(topoB, MB, listB);
-  const SA = areaSamples(topoA, MA, listA, 1500, 11), SB = areaSamples(topoB, MB, listB, 1500, 23);
+  // the fixed side can be several parts (the last piece of a puzzle): topoB = [{ topo, M, groups }, …]
+  const srcB = Array.isArray(topoB) ? topoB : [{ topo: topoB, M: MB, groups: groupsB }];
+  const listA = [...new Set(groupsA.flat())];
+  const gA = patchMesh(topoA, MA, listA), SA = areaSamples(topoA, MA, listA, 1500, 11);
+  const partsB = srcB.map(sb => { const list = [...new Set(sb.groups.flat())]; return { ...sb, list, area: list.reduce((a, t) => a + sb.topo.fa[t], 0) }; });
+  const areaB = partsB.reduce((a, q) => a + q.area, 0) || 1;
+  const gB = partsB.length === 1 ? patchMesh(partsB[0].topo, partsB[0].M, partsB[0].list) : (() => {      // one BVH over every fixed part's picked areas
+    const gs = partsB.map(q => patchMesh(q.topo, q.M, q.list)), n = gs.reduce((a, g) => a + g.attributes.position.count, 0), pos = new Float32Array(n * 3); let o = 0;
+    for (const g of gs) { pos.set(g.attributes.position.array, o); o += g.attributes.position.array.length; g.disposeBoundsTree?.(); g.dispose(); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setIndex(Array.from({ length: n }, (_, i) => i)); g.computeBoundsTree(); return g; })();
+  const SB = { P: [], N: [], area: 0 };
+  partsB.forEach((q, k) => { const r = areaSamples(q.topo, q.M, q.list, Math.max(150, Math.round(1500 * q.area / areaB)), 23 + k); SB.P.push(...r.P); SB.N.push(...r.N); SB.area += r.area; });
   // outline points of every picked area: flat areas only line up across the face by their edges
   const edgeSamples = (topo, M, list, n) => {
     const inSet = new Set(list), segs = []; let L = 0; const a = V(), b = V();
@@ -2531,10 +2574,10 @@ function multiFit(topoA, MA, groupsA, topoB, MB, groupsB, opts = {}) {
     for (const [p, q, l] of segs) { while (acc <= l) { out.push(p.clone().lerp(q, acc / l)); acc += step; } acc -= l; }
     return out;
   };
-  const EA = edgeSamples(topoA, MA, listA, 400), EB = edgeSamples(topoB, MB, listB, 400);
+  const EA = edgeSamples(topoA, MA, listA, 400), EB = partsB.flatMap(q => edgeSamples(q.topo, q.M, q.list, Math.max(80, Math.round(400 * q.area / areaB))));
   const nearestPt = (p, set) => { let bi = -1, bd = Infinity; for (let i = 0; i < set.length; i++) { const d = p.distanceToSquared(set[i]); if (d < bd) { bd = d; bi = i; } } return bi < 0 ? null : { q: set[bi], d: Math.sqrt(bd) }; };
   const plane = (topo, M, list) => { const pl = regionPlane(topo, list); const nm = new THREE.Matrix3().getNormalMatrix(M); return { n: pl.n.clone().applyMatrix3(nm).normalize(), p: pl.p.clone().applyMatrix4(M), A: pl.A }; };
-  const pa = groupsA.map(l => plane(topoA, MA, l)), pb = groupsB.map(l => plane(topoB, MB, l));
+  const pa = groupsA.map(l => plane(topoA, MA, l)), pb = partsB.flatMap(q => q.groups.map(l => plane(q.topo, q.M, l)));
   const all = (ps) => { const n = V(), p = V(); let A = 0; ps.forEach(q => { n.addScaledVector(q.n, q.A); p.addScaledVector(q.p, q.A); A += q.A; }); return { n: n.normalize(), p: p.multiplyScalar(1 / A), A }; };
   const uA = all(pa), uB = all(pb);
   const size = Math.max(new THREE.Box3().setFromPoints(SA.P).getSize(V()).length(), 1);
@@ -2906,7 +2949,111 @@ function addPart(name, geom, opts = {}) {
   if (opts.at) mesh.position.fromArray(opts.at);
   if (opts.rot) mesh.rotation.set(...opts.rot);
   parts.push(mesh);
+  if ($('set-plastic') && $('set-plastic').value !== 'parts') refreshPaint(mesh);
   return mesh;
+}
+// ---------------------------------------------------------------------------
+// Plastic and paint: the bare-plastic look of every part, and colour brushed or filled onto them
+// ---------------------------------------------------------------------------
+const PLASTICS = {
+  parts: { name: 'Part colours', rough: 0.72 },
+  grey: { name: 'Grey plastic', color: '#8f9296', rough: 0.6 },
+  lightgrey: { name: 'Light grey resin', color: '#c3c5c7', rough: 0.42 },
+  cream: { name: 'Cream resin', color: '#d8cfb5', rough: 0.45 },
+  white: { name: 'White plastic', color: '#e3e1da', rough: 0.55 },
+  bone: { name: 'Bone plastic', color: '#cbbd9a', rough: 0.6 },
+  'black-primer': { name: 'Black primer', color: '#28292b', rough: 0.92 },
+  'grey-primer': { name: 'Grey primer', color: '#7b7d80', rough: 0.92 },
+  'white-primer': { name: 'White primer', color: '#dedcd6', rough: 0.92 },
+};
+const PAINTS = [['Chalk white', '#e9e6dc'], ['Bone', '#d2c49a'], ['Skin', '#d9a383'], ['Leather', '#7a4b2a'], ['Rust', '#8e3d1f'], ['Blood red', '#8a1414'], ['Bright red', '#c0262b'],
+  ['Orange', '#d9661f'], ['Ochre', '#c99a2e'], ['Yellow', '#e2c13b'], ['Moss green', '#5a6b2e'], ['Sickly green', '#8a9a3c'], ['Forest green', '#2f4a2a'], ['Teal', '#2b6b6b'],
+  ['Sky blue', '#5f93c5'], ['Deep blue', '#1f3a78'], ['Purple', '#4b2d5e'], ['Steel', '#9aa2a8'], ['Gunmetal', '#4a4f55'], ['Brass', '#b08d3c'], ['Gold', '#c9a237'], ['Copper', '#a86a3c'],
+  ['Mid grey', '#6e7074'], ['Black', '#1b1b1d']];
+const plastic = () => PLASTICS[$('set-plastic')?.value] || PLASTICS.parts;
+/** The colour of a part where it isn't brushed: its fill, or the plastic. */
+function baseColor(m) { const pt = m.userData.part; return pt.fill || plastic().color || pt.color; }
+/** Give a part its own geometry wrapper (same mesh data, its own colour layer) so copies don't share paint. */
+function ownGeometry(m) {
+  const g0 = m.geometry; if (g0.userData.owner === m.uuid) return g0;
+  const g = new THREE.BufferGeometry(); g.setIndex(g0.index); g.setAttribute('position', g0.attributes.position);
+  g.boundingBox = g0.boundingBox?.clone() || null; g.boundingSphere = g0.boundingSphere?.clone() || null; g.boundsTree = g0.boundsTree;
+  g.userData = { ...g0.userData, owner: m.uuid }; m.geometry = g; return g;
+}
+const _c = new THREE.Color();
+const SRGB2LIN = Float32Array.from({ length: 256 }, (_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); });
+const hexBytes = h => { const v = parseInt(h.slice(1), 16); return [(v >> 16) & 255, (v >> 8) & 255, v & 255]; };
+/** Show a part's plastic, fill and brushed paint. Paint is kept as ordinary (sRGB) bytes; the display layer is linear light. */
+function refreshPaint(m, range) {
+  const pt = m.userData.part, mat = m.material, base = _c.set(baseColor(m));        // linear
+  const br = base.r, bg = base.g, bb = base.b;
+  mat.roughness = plastic().rough;
+  if (!pt.paint) {
+    if (mat.vertexColors) { mat.vertexColors = false; mat.needsUpdate = true; }
+    if (m.geometry.attributes.color && m.geometry.userData.owner === m.uuid) m.geometry.deleteAttribute('color');
+    mat.color.set(baseColor(m)); return;
+  }
+  const g = ownGeometry(m), n = g.attributes.position.count, P = pt.paint;
+  let col = g.attributes.color;
+  if (!col || col.count !== n) { col = new THREE.BufferAttribute(new Float32Array(n * 3), 3); g.setAttribute('color', col); range = null; }
+  const a = col.array, [i0, i1] = range || [0, n - 1], L = SRGB2LIN;
+  for (let i = i0; i <= i1; i++) { const w = P[4*i+3] / 255;
+    a[3*i] = br + (L[P[4*i]] - br) * w; a[3*i+1] = bg + (L[P[4*i+1]] - bg) * w; a[3*i+2] = bb + (L[P[4*i+2]] - bb) * w; }
+  if (range) { col.clearUpdateRanges?.(); col.addUpdateRange?.(i0 * 3, (i1 - i0 + 1) * 3); }
+  col.needsUpdate = true;
+  if (!mat.vertexColors) { mat.vertexColors = true; mat.needsUpdate = true; }
+  mat.color.set('#ffffff');
+}
+const sprueColor = () => plastic().color || '#c9ccce';
+function applyPlastic() {
+  for (const m of liveParts()) refreshPaint(m);
+  if (typeof sprueMat !== 'undefined') { sprueMat.color.set(sprueColor()); sprueMat.roughness = Math.min(plastic().rough, 0.6); }
+  if (typeof renderOutliner === 'function') renderOutliner();
+}
+const brush = { color: '#8a1414', stroke: null };
+/** Brush paint around a world point on part m: full strength in the middle, softening to the rim. */
+function paintAt(m, wp, face = -1) {
+  const pt = m.userData.part, g = ownGeometry(m), n = g.attributes.position.count, st = brush.stroke;
+  if (!st.touched.has(m)) { st.touched.add(m); pt.paint = pt.paint ? pt.paint.slice() : new Uint8Array(n * 4); pt.paintVer = (pt.paintVer || 0) + 1; }   // copy on first touch: undo keeps the old one
+  m.updateMatrixWorld(true);
+  const inv = m.matrixWorld.clone().invert(), lp = wp.clone().applyMatrix4(inv), sc = new THREE.Vector3().setFromMatrixScale(m.matrixWorld);
+  const r = +$('paint-size').value / 2, rl = r / (Math.max(Math.abs(sc.x), Math.abs(sc.y), Math.abs(sc.z)) || 1), rl2 = rl * rl;
+  const pos = g.attributes.position.array, ix = g.index.array, P = pt.paint, erase = $('paint-erase').checked;
+  const [cr, cg, cb] = hexBytes(brush.color);
+  const seen = new Set(); let lo = Infinity, hi = -1;
+  g.boundsTree.shapecast({
+    intersectsBounds: box => box.distanceToPoint(lp) <= rl,
+    intersectsTriangle: (tri, ti) => { for (let k = 0; k < 3; k++) seen.add(ix[3 * ti + k]); return false; },
+  });
+  for (const i of seen) {
+    const dx = pos[3*i] - lp.x, dy = pos[3*i+1] - lp.y, dz = pos[3*i+2] - lp.z, d2 = dx*dx + dy*dy + dz*dz; if (d2 > rl2) continue;
+    const t = Math.sqrt(d2) / rl, w = t < 0.55 ? 1 : 1 - (t - 0.55) / 0.45;          // soft rim
+    if (erase) P[4*i+3] = Math.round(P[4*i+3] * (1 - w));
+    else { const a0 = P[4*i+3] / 255, k = a0 > 0 ? w : 1;                       // first coat takes the colour; later coats blend
+      P[4*i] = Math.round(P[4*i] + (cr - P[4*i]) * k); P[4*i+1] = Math.round(P[4*i+1] + (cg - P[4*i+1]) * k); P[4*i+2] = Math.round(P[4*i+2] + (cb - P[4*i+2]) * k);
+      P[4*i+3] = Math.max(P[4*i+3], Math.round(w * 255)); }
+    if (i < lo) lo = i; if (i > hi) hi = i;
+  }
+  if (hi < 0 && face >= 0 && !erase) for (let k = 0; k < 3; k++) {     // a blocky part with no points under the brush: colour the triangle it's on
+    const i = ix[3 * face + k]; P[4*i] = cr; P[4*i+1] = cg; P[4*i+2] = cb; P[4*i+3] = 255; lo = Math.min(lo, i); hi = Math.max(hi, i); }
+  if (hi >= 0) refreshPaint(m, [lo, hi]);
+}
+/** The colour showing at a point on a part (for Alt-click). */
+function colourAt(hit) {
+  const m = hit.object, pt = m.userData.part, ix = m.geometry.index.array, f = hit.faceIndex * 3;
+  const pos = m.geometry.attributes.position.array, lp = hit.point.clone().applyMatrix4(m.matrixWorld.clone().invert());
+  let best = ix[f], bd = Infinity; for (let k = 0; k < 3; k++) { const i = ix[f + k], d = (pos[3*i] - lp.x) ** 2 + (pos[3*i+1] - lp.y) ** 2 + (pos[3*i+2] - lp.z) ** 2; if (d < bd) { bd = d; best = i; } }
+  if (pt.paint && pt.paint[4 * best + 3] > 127) return '#' + [0, 1, 2].map(k => pt.paint[4 * best + k].toString(16).padStart(2, '0')).join('');
+  return '#' + new THREE.Color(baseColor(m)).getHexString();
+}
+function setBrushColor(hex) {
+  brush.color = hex; $('paint-color').value = hex;
+  document.querySelectorAll('#paint-swatches .swatch').forEach(b => b.setAttribute('aria-checked', String(b.dataset.c === hex)));
+}
+function clearPaint(list) {
+  const painted = list.filter(m => m.userData.part.paint || m.userData.part.fill); if (!painted.length) return 0;
+  pushUndo(); painted.forEach(m => { const pt = m.userData.part; pt.paint = null; pt.fill = null; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(m); });
+  markDirty(); renderOutliner(); renderPartPanel(); return painted.length;
 }
 function topoOf(mesh) { return mesh.userData.part.topo ||= (mesh.geometry.userData.topo ||= buildTopo(mesh.geometry)); }
 /** A part's candidate mating faces, worked out once per part and setting. */
@@ -3058,10 +3205,12 @@ const undoStack = [], redoStack = [];
 function snapshot() {
   const snap = [...parts, ...joints].filter(o => o.parent).map(o => ({
     o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name,
-    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, off: !!o.userData.optOff }));
+    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, off: !!o.userData.optOff,
+    paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null }));
   snap.options = JSON.parse(JSON.stringify(options));
   snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
   snap.kit = kit ? JSON.parse(JSON.stringify(kit)) : null;
+  snap.magnets = JSON.parse(JSON.stringify(magnets));
   return snap;
 }
 function restore(snap) {
@@ -3069,10 +3218,12 @@ function restore(snap) {
   for (const e of snap) {
     e.p.add(e.o); e.o.position.copy(e.pos); e.o.quaternion.copy(e.q); e.o.scale.copy(e.s); e.o.visible = e.vis; e.o.name = e.name;
     if (e.rest) e.o.userData.joint.rest.copy(e.rest);
-    if (e.o.userData.part) e.o.userData.optOff = e.off;
+    if (e.o.userData.part) { e.o.userData.optOff = e.off;
+      const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); } }
   }
   if (snap.options) options = JSON.parse(JSON.stringify(snap.options));
   if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
+  if (snap.magnets) { magnets = JSON.parse(JSON.stringify(snap.magnets)); }
   if ('kit' in snap && JSON.stringify(snap.kit) !== JSON.stringify(kit)) { kit = snap.kit ? JSON.parse(JSON.stringify(snap.kit)) : null; buildKit(); }
   scene.updateMatrixWorld(true);
 }
@@ -3104,7 +3255,7 @@ let tool = 'select', picks = [], lastOp = null;
 const settings = () => ({ smoothDeg: +$('set-smooth').value, maxRadius: +$('set-radius').value || 0, flatTol: +$('set-flat').value || 0.02, ballTol: +$('set-balltol').value || 3, creaseDeg: +$('set-crease').value || 30 });
 
 function setTool(t) {
-  cancelPick(); if (typeof clearHover === 'function') clearHover();
+  cancelPick(); if (typeof magPending !== 'undefined' && magPending) { magPending = null; rebuildMagnets(); } if (typeof clearHover === 'function') clearHover();
   if (t !== 'ORIENT' && typeof closeOrient === 'function' && !$('orient').hidden) closeOrient();
   tool = t;
   document.querySelectorAll('.tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === t ? 'true' : 'false'));
@@ -3125,7 +3276,9 @@ function updateStep() {
   if (!SNAP_STEPS[tool]) {
     const msgs = { select: "Click a part to select it. Ctrl-click or Ctrl-drag to select several", move: "Select parts, then drag the arrows (Ctrl-click to add)", rotate: "Select parts, then drag the rings (Ctrl-click to add)",
                    pose: "Click a jointed part, then drag the rings to pose it around its joint",
-                   ORIENT: "Click a face to lay it flat or square it to the X, Y, Z planes" };
+                   ORIENT: "Click a face to lay it flat or square it to the X, Y, Z planes",
+                   MAGNET: "Click where two parts meet to set a pair of magnet holes, one in each. Not touching yet? Click one part, then the other",
+                   paint: "Drag on a part to paint it. Alt-click picks up a colour; drag off the parts to turn the view" };
     el.hidden = false; $('step-count').textContent = ''; $('step-side').style.background = 'var(--muted)';
     $('step-text').textContent = msgs[tool]; $('step-hint').textContent = ''; return;
   }
@@ -3137,8 +3290,8 @@ function updateStep() {
     $('step-count').textContent = `Match ${nA} + ${nB}`;
     $('step-text').textContent = !nA ? 'Click the mating areas on the part that moves'
       : !nB ? `Moving part: ${nA} area${nA > 1 ? 's' : ''}. Click more, or click the part it fits against`
-      : `${nA} area${nA > 1 ? 's' : ''} ↔ ${nB} area${nB > 1 ? 's' : ''}. Add more on either part, then Fit parts`;
-    $('step-hint').textContent = picks.length ? 'Click a picked area again to drop it. Enter: fit · Esc: clear' : 'Each area grows out to the sharp edge around it. Pick several where parts touch in more than one place.';
+      : `${nA} area${nA > 1 ? 's' : ''} ↔ ${nB} area${nB > 1 ? 's' : ''}${(() => { const k = new Set(picks.filter(q => q.side === 'fixed').map(q => q.mesh)).size; return k > 1 ? ` on ${k} parts` : ''; })()}. Add more on any part, then Fit parts`;
+    $('step-hint').textContent = picks.length ? 'Areas on other parts fit against them all at once. Click a picked area again to drop it. Enter: fit · Esc: clear' : 'Each area grows out to the sharp edge around it. Pick several where parts touch in more than one place.';
     $('step-apply').disabled = !(nA && nB);
     return;
   }
@@ -3202,8 +3355,7 @@ function handleMatchPick(hit) {
   // clicking inside an area already picked drops it
   const k = picks.findIndex(q => q.mesh === mesh && q.region.includes(hit.faceIndex));
   if (k >= 0) { const q = picks.splice(k, 1)[0]; rebuildPickFx(); updateStep(); toast(`Dropped that ${q.side === 'move' ? 'moving' : 'fixed'} area.`); return; }
-  const side = !a || mesh === a ? 'move' : !b || mesh === b ? 'fixed' : null;
-  if (!side) { toast(`Areas go on two parts: ${a.name} (moves) and ${b.name} (stays). Clear to start over.`, 'bad'); return; }
+  const side = !a || mesh === a ? 'move' : 'fixed';          // the fixed areas can be on several parts: the last piece of the puzzle
   mesh.updateMatrixWorld(true);
   const res = pickSurface(topoOf(mesh), mesh.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
   if (res.err) { toast(res.err, 'bad'); return; }
@@ -3215,13 +3367,19 @@ async function applyMatch() {
   const A = picks.filter(q => q.side === 'move'), B = picks.filter(q => q.side === 'fixed');
   if (!A.length || !B.length) { toast('Pick at least one area on each part first.', 'bad'); return; }
   const union = list => [...new Set(list.flatMap(q => q.region))];
+  // several fixed parts: it attaches to the one with the most picked area, and fits against them all
+  const byMesh = new Map(); for (const q of B) { if (!byMesh.has(q.mesh)) byMesh.set(q.mesh, []); byMesh.get(q.mesh).push(q); }
+  const areaOf = qs => qs.reduce((a, q) => a + q.region.reduce((s2, t) => s2 + topoOf(q.mesh).fa[t], 0), 0);
+  const fixedParts = [...byMesh.entries()].sort((x, y) => areaOf(y[1]) - areaOf(x[1]));
+  const B0 = fixedParts[0][1];
   const op = {
-    mode: 'MATCH', child: A[0].mesh, fixed: B[0].mesh, a: [keepPick(A[0])], b: [keepPick(B[0])],
+    mode: 'MATCH', child: A[0].mesh, fixed: B0[0].mesh, a: [keepPick(A[0])], b: [keepPick(B0[0])],
     p: { spin: 0, gap: 0, flip: false, across: false, attach: lastAttach, centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat },
     before: snapshot(),
   };
-  op.match = { regionA: union(A), regionB: union(B), groupsA: A.map(q => q.region), groupsB: B.map(q => q.region), Ma: A[0].mesh.matrixWorld.clone(), Mb: B[0].mesh.matrixWorld.clone(), results: [], chosen: 0,
+  op.match = { regionA: union(A), regionB: union(B0), groupsA: A.map(q => q.region), groupsB: B0.map(q => q.region), Ma: A[0].mesh.matrixWorld.clone(), Mb: B0[0].mesh.matrixWorld.clone(), results: [], chosen: 0,
                flat: A.length === 1 && B.length === 1 && A[0].kind === 'flat' && B[0].kind === 'flat', areas: [A.length, B.length] };
+  if (fixedParts.length > 1) op.match.targets = fixedParts.map(([mesh, qs]) => ({ mesh, M: mesh.matrixWorld.clone(), groups: qs.map(q => q.region), region: union(qs) }));
   const how = await askLink(op.child, 'Fit', { fixed: op.fixed });
   if (!how) { toast('Still picking. Fit parts when ready.'); return; }
   op.reroot = how === 'group';
@@ -3282,6 +3440,13 @@ async function startMatch(op) {
   const s = settings(), tA = topoOf(op.child), tB = topoOf(op.fixed), m = op.match;
   toast('Matching surfaces…'); await nextFrame();
   try {
+    if (m.targets) {                                                // the last piece: fit against several parts at once
+      const fits = multiFit(tA, m.Ma, m.groupsA, m.targets.map(t => ({ topo: topoOf(t.mesh), M: t.M, groups: t.groups })));
+      const nB = m.targets.reduce((a, t) => a + t.groups.length, 0), label = `your ${m.groupsA.length} + ${nB} areas on ${m.targets.length} parts`;
+      const sig = regionSig(m.regionA) + '|' + m.targets.map(t => regionSig(t.region)).join('|');
+      finishMatch(op, fits.map(r => ({ ...r, label, regionA: m.regionA, regionB: m.regionB, sig })));
+      return;
+    }
     if (m.groupsA.length > 1 || m.groupsB.length > 1) {             // several areas: fit them all at once
       const fits = multiFit(tA, m.Ma, m.groupsA, tB, m.Mb, m.groupsB);
       const sig = regionSig(m.regionA) + '|' + regionSig(m.regionB), label = `your ${m.groupsA.length} + ${m.groupsB.length} areas`;
@@ -3347,7 +3512,7 @@ async function seatMatches(op, fits, A, spins = [Math.PI, 0.35], extra = {}) {
 function finishMatch(op, results, keepChoice) {
   const m = op.match;
   for (const r of results) if (r.inside == null) {
-    r.inside = insideFraction(op.child.geometry, m.Ma, r.T, op.fixed.geometry, m.Mb);
+    r.inside = m.targets ? Math.max(...m.targets.map(t => insideFraction(op.child.geometry, m.Ma, r.T, t.mesh.geometry, t.M))) : insideFraction(op.child.geometry, m.Ma, r.T, op.fixed.geometry, m.Mb);
     if (!r.seated) r.score += r.inside * 4;                   // a seat already weighs any overlap
   }
   const seen = new Set(), list = results.sort((a, b) => a.score - b.score).filter(r => {
@@ -3379,7 +3544,8 @@ function matchVerdict(r) {
 function flashMatch() {
   const op = lastOp; if (!op?.match?.results.length) return;
   const r = op.match.results[op.match.chosen]; clearFx(); scene.updateMatrixWorld(true);
-  showRegion(op.child, r.regionA, '#4db4dc'); showRegion(op.fixed, r.regionB, '#e2804f');
+  showRegion(op.child, r.regionA, '#4db4dc');
+  if (op.match.targets) op.match.targets.forEach(t => showRegion(t.mesh, t.region, '#e2804f')); else showRegion(op.fixed, r.regionB, '#e2804f');
   clearTimeout(flashCentres.t); flashCentres.t = setTimeout(clearFx, 1600);
 }
 /** Every candidate face of one part against every candidate face of the other. Returns fits. */
@@ -3408,6 +3574,7 @@ async function searchFits(op, progress) {
   return out;
 }
 async function searchAllFaces() {
+  if (lastOp?.match?.targets) { toast('Search all faces works between two parts. Pick areas on just one fixed part to use it.', 'bad'); return; }
   const op = lastOp; if (!op || op.mode !== 'MATCH') return;
   $('adj-search').disabled = true;
   try { const more = await searchFits(op, t => toast(t)); finishMatch(op, [...op.match.results, ...more]); }
@@ -3718,6 +3885,7 @@ function showAdjust() {
   const mk = (txt, col, bold) => { const s = document.createElement('span'); if (col) { const d = document.createElement('i'); d.className = 'dot'; d.style.background = col; s.append(d, ' '); }
     const t = document.createElement(bold ? 'b' : 'span'); t.textContent = txt; s.append(t); return s; };
   $('adj-chain').append(mk(op.child.name, 'var(--move)', true), mk(op.p.attach === 'none' ? 'moved to' : 'attached to'), mk(op.fixed.name, 'var(--fixed)', true));
+  if (op.match?.targets) $('adj-chain').append(mk('· also fitted against'), mk(op.match.targets.slice(1).map(t => t.mesh.name).join(', '), 'var(--fixed)', true));
   const geo = op.mode === 'PLANE' || op.mode === 'MID', isMatch = op.mode === 'MATCH';
   $('adj-spin-f').hidden = !(geo || isMatch); $('adj-gap-f').hidden = !(geo || isMatch); $('adj-flip-f').hidden = !geo; $('adj-across-f').hidden = op.mode !== 'MID';
   $('adj-match-f').hidden = !isMatch;
@@ -3835,6 +4003,7 @@ function bindAdjust() {
   // swap roles: the other part moves and becomes the child
   $('adj-swap').addEventListener('click', () => {
     const op = lastOp; if (!op) return;
+    if (op.match?.targets) { toast(`${op.child.name} was fitted against ${op.match.targets.length} parts, so it can't swap roles with one of them.`, 'bad'); return; }
     restore(op.before);
     Object.assign(op, { child: op.fixed, fixed: op.child, a: op.b, b: op.a });
     op.p.offset = [0, 0, 0]; op.p.spin = 0;
@@ -3927,10 +4096,12 @@ tc.addEventListener('mouseDown', () => {
   }
 });
 tc.addEventListener('objectChange', () => {
+  if (tc.object !== proxy && magnets.length) rebuildMagnets();       // posing a joint carries its magnets
   if (tc.object === proxy && gizmoBase) {
     proxy.updateMatrixWorld(true);
     const D = proxy.matrixWorld.clone().multiply(gizmoBase.M0inv);          // the same move for every selected part
     for (const it of gizmoBase.items) setWorld(it.m, D.clone().multiply(it.W0));
+    if (magnets.length) rebuildMagnets();             // the hole previews ride along
     if (gizmoBase.bench) { setWorld(gizmoBase.bench.o, D.clone().multiply(gizmoBase.bench.W0)); markBench(); }
   }
 });
@@ -3961,7 +4132,7 @@ function renderOutliner() {
     r.style.paddingLeft = (12 + depth * 14) + 'px';
     const link = document.createElement('span'); link.className = 'link';
     link.textContent = depth ? (jointOf(p) ? '◆' : '└') : ''; link.title = jointOf(p) ? 'Jointed (pose with P)' : 'Fixed to parent';
-    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = p.userData.part.color;
+    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = baseColor(p);
     const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = p.name;
     const eye = document.createElement('button'); eye.className = 'eye'; eye.type = 'button'; eye.title = p.visible ? 'Hide' : 'Show';
     eye.innerHTML = p.visible ? eyeOpen : eyeShut;
@@ -4002,6 +4173,7 @@ function renderPartPanel() {
   add('Triangles', p.userData.part.tris.toLocaleString());
   add('Attached to', par ? `${par.name} (${j ? 'joint' : 'fixed'})` : '—');
   add('Carries', subtreeParts(p).length - 1 + ' parts');
+  if (p.userData.part.paint || p.userData.part.fill) add('Paint', [p.userData.part.fill ? 'filled ' + p.userData.part.fill : '', p.userData.part.paint ? 'brushed' : ''].filter(Boolean).join(', '));
   { const sl = slotOf(p); if (sl) add('Option', `${sl.name}: ${sl.members.indexOf(p.uuid) + 1} of ${sl.members.length}${p.userData.optOff ? ' (not chosen)' : ' (chosen)'}`); }
   const row = document.createElement('div'); row.className = 'btnrow';
   const b = (txt, fn, dis) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.disabled = !!dis; x.addEventListener('click', fn); row.append(x); };
@@ -4018,8 +4190,10 @@ function renderPartPanel() {
     applyWorld(p, Tr(c).multiply(new THREE.Matrix4().makeScale(-1, 1, 1)).multiply(Tr(c.clone().negate()))); afterHierarchyChange(); });
   b('Drop to grid', () => { pushUndo(); applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); });
   b('Square up', () => openOrient(p, { kind: 'auto' }));
+  if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
   b('Delete', () => deleteSelected());
   el.append(name, dl, row);
+  magnetRows(p, el);
 }
 function renderMultiPanel(el) {
   const list = selection, roots = selectionRoots(), box = new THREE.Box3(); list.forEach(m => box.union(exactBox(m)));
@@ -4063,11 +4237,12 @@ function afterHierarchyChange() {
   scene.updateMatrixWorld(true);
   markDirty();
   if (typeof seamFx !== 'undefined' && seamFx.children.length) clearSeamPreview();
+  if (typeof pocketFx !== 'undefined' && pocketFx.children.length) clearPocketPreview();      // the parts moved: the pockets may have too
   if (typeof renderFolderStatus === 'function') renderFolderStatus();
   selection = selection.filter(m => m.parent);
   if (selected && !selected.parent) selected = selection[selection.length - 1] || null;
   paintSelection();
-  renderOutliner(); renderPartPanel(); renderOptions(); rebuildSprues(); showAdjust(); updateButtons(); updateStats(); syncGizmo();
+  renderOutliner(); renderPartPanel(); renderOptions(); rebuildSprues(); rebuildMagnets(); showAdjust(); updateButtons(); updateStats(); syncGizmo();
 }
 // ---------------------------------------------------------------------------
 // Options: interchangeable parts for one spot (heads, weapons…), sets of choices, export per set
@@ -4405,8 +4580,9 @@ async function exportSprues(only) {
   sprues.frames.forEach((f, k) => {
     if (Array.isArray(only) && !only.includes(k)) return;
     const pieces = Object.keys(sprues.poses).map(partById).filter(m => m && onSprue(m) && sprues.gates.some(g => g.part === m.uuid && g.frame === k));
-    files.push({ name: `Sprue ${f.letter}.stl`, data: writeSTL([sprueMeshes(k), ...pieces]) });
+    files.push({ name: `Sprue ${f.letter}.stl`, pieces });
   });
+  for (const f of files) { const cut = await cutMagnetHoles(f.pieces, f.pieces); f.data = writeSTL([sprueMeshes(sprues.frames.findIndex(x => `Sprue ${x.letter}.stl` === f.name)), ...cut.meshes]); delete f.pieces; }
   await deliver(files, `${safe(project.name || 'kit')}-sprues.zip`);
 }
 // ---------------------------------------------------------------------------
@@ -5454,12 +5630,20 @@ function filledMesh(m, positions) {
 }
 /** One STL of these parts, with the seams filled if that option is on. */
 async function oneSTL(ms) {
-  if (!$('exp-fill').checked || ms.length < 2) return { data: writeSTL(ms), note: '' };
+  // hollow pockets first, on the parts as they are: the filler goes in as one more solid
+  let extra = [], pnote = '';
+  if ($('exp-pockets').checked) {
+    const r = await runPockets('Filling hollow pockets', ms);
+    if (r?.geometry) { const f = new THREE.Mesh(r.geometry); f.updateMatrixWorld(true); extra = [f]; }
+    if (r) pnote = (r.pockets ? `Filled ${pocketSummary(r).replace(/^\d+ sealed/, m => m.toLowerCase())}.` : 'No sealed pockets to fill.') + ' ';
+  }
+  if (!$('exp-fill').checked || ms.length < 2) { const cut = await cutMagnetHoles(ms, ms); return { data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note }; }
   toast('Filling seams…'); await nextFrame();
   const { out, stats } = fillSeamsAll(ms, fillOpts());
   const left = gapsLeft(ms, out, fillOpts().maxGap * 2);
   const note = stats.moved ? `Filled ${stats.seams} seam${stats.seams === 1 ? '' : 's'}: pushed ${stats.moved.toLocaleString()} corners by up to ${stats.largest.toFixed(2)} mm.` : 'No seams within reach to fill.';
-  return { data: writeSTL(ms.map((m, k) => filledMesh(m, out[k].positions))), note: note + (left.open ? ` ${left.open} spot${left.open > 1 ? 's' : ''} have gaps wider than ${fillOpts().maxGap} mm; raise "Close gaps up to" to fill them.` : '') };
+  const cut = await cutMagnetHoles(ms.map((m, k) => filledMesh(m, out[k].positions)), ms);
+  return { data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note + note + (left.open ? ` ${left.open} spot${left.open > 1 ? 's' : ''} have gaps wider than ${fillOpts().maxGap} mm; raise "Close gaps up to" to fill them.` : '') };
 }
 $('exp-all').addEventListener('click', async () => {
   const ms = exportMeshes(); if (!ms.length) return;
@@ -5473,6 +5657,228 @@ $('exp-sel').addEventListener('click', async () => {
   const { data, note } = await oneSTL(ms); if (note) $('exp-note').textContent = note;
   deliver([{ name: name + '.stl', data }], name + '-stl.zip');
 });
+
+// ---------------------------------------------------------------------------
+// Hollow pockets: air sealed inside the model. Found on a voxel grid of all the parts together (inside where
+// two of three ray directions agree), the outside air flooded in from the edges; whatever air it can't reach
+// is a pocket. The filler fills each pocket and overlaps one cell into the parts round it. Parts don't change.
+// ---------------------------------------------------------------------------
+async function findPockets(ms, h, progress = () => {}) {
+  scene.updateMatrixWorld(true);
+  const bb = new THREE.Box3(); ms.forEach(m => bb.union(exactBox(m))); if (bb.isEmpty()) return null;
+  let size = bb.getSize(V());
+  while ((size.x / h + 5) * (size.y / h + 5) * (size.z / h + 5) > 40e6) h *= 1.25;          // keep the grid in memory
+  bb.expandByScalar(2 * h); size = bb.getSize(V());
+  const n = [Math.ceil(size.x / h) + 1, Math.ceil(size.y / h) + 1, Math.ceil(size.z / h) + 1], [nx, ny, nz] = n, N = nx * ny * nz;
+  const at = (i, j, k) => i + nx * (j + ny * k), o = bb.min, votes = new Uint8Array(N), stamp = new Uint8Array(N);
+  const parts = ms.map(m => ({ m, inv: m.matrixWorld.clone().invert(), box: exactBox(m) }));
+  const ray = new THREE.Ray(), wp = V(); let done = 0, lastYield = performance.now(); const total = 3;
+  for (let ax = 0; ax < 3; ax++) {                       // columns along x, then y, then z
+    const u = (ax + 1) % 3, w = (ax + 2) % 3, dir = V(); dir.setComponent(ax, 1);
+    for (const P of parts) {
+      const u0 = Math.max(0, Math.floor((P.box.min.getComponent(u) - o.getComponent(u)) / h)), u1 = Math.min(n[u] - 1, Math.ceil((P.box.max.getComponent(u) - o.getComponent(u)) / h));
+      const w0 = Math.max(0, Math.floor((P.box.min.getComponent(w) - o.getComponent(w)) / h)), w1 = Math.min(n[w] - 1, Math.ceil((P.box.max.getComponent(w) - o.getComponent(w)) / h));
+      const bvh = P.m.geometry.boundsTree, ldir = dir.clone().transformDirection(P.inv);
+      for (let a = u0; a <= u1; a++) {
+        for (let c = w0; c <= w1; c++) {
+          const org = V(); org.setComponent(ax, o.getComponent(ax) - h); org.setComponent(u, o.getComponent(u) + a * h); org.setComponent(w, o.getComponent(w) + c * h);
+          ray.origin.copy(org).applyMatrix4(P.inv); ray.direction.copy(ldir);
+          const hits = bvh.raycast(ray, THREE.DoubleSide); if (hits.length < 2 || hits.length % 2) continue;   // open or touching: no say here
+          const ts = hits.map(x => wp.copy(x.point).applyMatrix4(P.m.matrixWorld).getComponent(ax)).sort((p, q) => p - q);
+          for (let k = 0; k + 1 < ts.length; k += 2) {
+            const i0 = Math.max(0, Math.ceil((ts[k] - o.getComponent(ax)) / h)), i1 = Math.min(n[ax] - 1, Math.floor((ts[k + 1] - o.getComponent(ax)) / h));
+            for (let t = i0; t <= i1; t++) { const idx = [0, 0, 0]; idx[ax] = t; idx[u] = a; idx[w] = c; const v = at(idx[0], idx[1], idx[2]);
+              if (stamp[v] !== ax + 1) { stamp[v] = ax + 1; votes[v]++; } }
+          }
+        }
+        if (performance.now() - lastYield > 120) { progress((done + (a - u0) / Math.max(1, u1 - u0) / parts.length) / total * 0.8, 'Measuring the solid…'); await nextFrame(); lastYield = performance.now(); }
+      }
+    }
+    done++;
+  }
+  const solid = new Uint8Array(N); for (let v = 0; v < N; v++) solid[v] = votes[v] >= 2 ? 1 : 0;
+  // flood the outside air in from the edges of the grid
+  progress(0.85, 'Letting the air out…'); await nextFrame();
+  const outside = new Uint8Array(N), q = new Int32Array(N); let qh = 0, qt = 0;
+  const seed = v => { if (!solid[v] && !outside[v]) { outside[v] = 1; q[qt++] = v; } };
+  for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) { seed(at(i, j, 0)); seed(at(i, j, nz - 1)); }
+  for (let i = 0; i < nx; i++) for (let k = 0; k < nz; k++) { seed(at(i, 0, k)); seed(at(i, ny - 1, k)); }
+  for (let j = 0; j < ny; j++) for (let k = 0; k < nz; k++) { seed(at(0, j, k)); seed(at(nx - 1, j, k)); }
+  const sx = 1, sy = nx, sz = nx * ny;
+  while (qh < qt) { const v = q[qh++], i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
+    if (i > 0) seed(v - sx); if (i < nx - 1) seed(v + sx); if (j > 0) seed(v - sy); if (j < ny - 1) seed(v + sy); if (k > 0) seed(v - sz); if (k < nz - 1) seed(v + sz); }
+  // pockets: air the outside can't reach. Count them, and fill each plus one cell into the parts around it.
+  progress(0.92, 'Filling the pockets…'); await nextFrame();
+  const fill = new Uint8Array(N), label = new Int32Array(N); let cells = 0, pockets = 0, biggest = 0;
+  for (let v = 0; v < N; v++) {
+    if (solid[v] || outside[v] || label[v]) continue;
+    pockets++; let c = 0; qh = qt = 0; q[qt++] = v; label[v] = pockets;
+    while (qh < qt) { const x = q[qh++]; c++; fill[x] = 1; const i = x % nx, j = Math.floor(x / nx) % ny, k = Math.floor(x / sz);
+      for (const [ok, y] of [[i > 0, x - sx], [i < nx - 1, x + sx], [j > 0, x - sy], [j < ny - 1, x + sy], [k > 0, x - sz], [k < nz - 1, x + sz]])
+        if (ok && !solid[y] && !outside[y] && !label[y]) { label[y] = pockets; q[qt++] = y; } }
+    if (c < 8 || c * h ** 3 < 1) { for (let y = 0; y < qt; y++) fill[q[y]] = 0; pockets--; continue; }      // a speck (under 1 mm³): ray directions disagreeing in a wall, or too small to matter
+    cells += c; biggest = Math.max(biggest, c);
+  }
+  if (!pockets) return { pockets: 0, volume: 0, biggest: 0, h, geometry: null };
+  const grow = new Uint8Array(fill);
+  const nearOutside = y => [y - sx, y + sx, y - sy, y + sy, y - sz, y + sz].some(z => z >= 0 && z < N && outside[z]);
+  for (let v = 0; v < N; v++) if (fill[v]) { for (const y of [v - sx, v + sx, v - sy, v + sy, v - sz, v + sz]) if (y >= 0 && y < N && solid[y] && !nearOutside(y)) grow[y] = 1; }   // into the walls, never through to the outside
+  // the filler's skin: a square face wherever a filled cell meets an unfilled one
+  const pos = []; const cube = (i, j, k, d) => {
+    const x0 = o.x + (i - 0.5) * h, y0 = o.y + (j - 0.5) * h, z0 = o.z + (k - 0.5) * h, x1 = x0 + h, y1 = y0 + h, z1 = z0 + h;
+    const F = [[[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
+               [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]], [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]], [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]][d];
+    pos.push(...F[0], ...F[1], ...F[2], ...F[0], ...F[2], ...F[3]); };
+  for (let v = 0; v < N; v++) { if (!grow[v]) continue; const i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
+    [[i > 0 ? v - sx : -1, 0], [i < nx - 1 ? v + sx : -1, 1], [j > 0 ? v - sy : -1, 2], [j < ny - 1 ? v + sy : -1, 3], [k > 0 ? v - sz : -1, 4], [k < nz - 1 ? v + sz : -1, 5]]
+      .forEach(([y, d]) => { if (y < 0 || !grow[y]) cube(i, j, k, d); }); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(Array.from({ length: pos.length / 3 }, (_, i) => i));
+  return { pockets, volume: cells * h ** 3, biggest: biggest * h ** 3, h, geometry: g };
+}
+const pocketFx = new THREE.Group(); scene.add(pocketFx);
+function clearPocketPreview() { while (pocketFx.children.length) { const c = pocketFx.children.pop(); c.geometry?.dispose(); } $('exp-pocket-show').setAttribute('aria-pressed', 'false'); $('exp-pocket-show').textContent = 'Show pockets'; }
+const pocketSummary = r => r.pockets ? `${r.pockets} sealed pocket${r.pockets > 1 ? 's' : ''}, ${r.volume < 1 ? r.volume.toFixed(2) : r.volume.toFixed(0)} mm³ in all (largest ${r.biggest < 1 ? r.biggest.toFixed(2) : r.biggest.toFixed(0)} mm³)` : 'No sealed pockets';
+async function runPockets(title, ms = exportMeshes()) {
+  if (!ms.length) return null;
+  loading.show(title);
+  try { return await findPockets(ms, +$('exp-pocket-res').value, (f, t) => loading.set(f, t)); }
+  finally { loading.hide(); }
+}
+async function showPocketPreview() {
+  clearPocketPreview();
+  const r = await runPockets('Looking for hollow pockets'); if (!r) return;
+  $('exp-pocket-note').textContent = `${pocketSummary(r)}, checked at ${r.h.toFixed(2)} mm.` + (r.pockets ? ' Shown in red through the model; exports with this option on fill them solid.' : ' Nothing to fill.');
+  toast(pocketSummary(r) + '.', r.pockets ? 'bad' : 'ok');
+  if (!r.geometry) return;
+  const m = new THREE.Mesh(r.geometry, new THREE.MeshBasicMaterial({ color: '#e36b6b', transparent: true, opacity: 0.55, depthTest: false, depthWrite: false }));
+  m.renderOrder = 998; pocketFx.add(m);
+  $('exp-pocket-show').setAttribute('aria-pressed', 'true'); $('exp-pocket-show').textContent = 'Hide pockets';
+}
+
+// ---------------------------------------------------------------------------
+// Magnets: a pair of round holes, one in each part, facing each other across where they meet. Each hole is
+// kept in its own part's frame, so it moves and poses with the part; holes are cut only when exporting.
+// ---------------------------------------------------------------------------
+let magnets = [];       // [{ id, d, t, cd, ct, sides: [{ part, o: local point, n: local outward normal, pole: 'N'|'S' }] }]
+const magnetFx = new THREE.Group(); scene.add(magnetFx);
+const magSize = () => ({ d: Math.max(0.5, +$('mag-d').value || 3), t: Math.max(0.3, +$('mag-t').value || 2), cd: Math.max(0, +$('mag-cd').value || 0), ct: Math.max(0, +$('mag-ct').value || 0) });
+const magLabel = mg => `${+mg.d.toFixed(2)} × ${+mg.t.toFixed(2)} mm`;
+let magPending = null;
+function toLocal(part, p, n) { part.updateMatrixWorld(true); const inv = part.matrixWorld.clone().invert(); return { o: p.clone().applyMatrix4(inv).toArray(), n: n.clone().transformDirection(inv).toArray() }; }
+function sideWorld(sd) { const m = partById(sd.part); if (!m) return null; m.updateMatrixWorld(true); return { m, o: V(...sd.o).applyMatrix4(m.matrixWorld), n: V(...sd.n).transformDirection(m.matrixWorld).normalize() }; }
+const hitNormal = hit => hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize();
+/** How much part is left behind a hole of this depth (the wall to the far side). */
+function wallBehind(m, o, n, depth) {
+  const rc = new THREE.Raycaster(o.clone().addScaledVector(n, -0.01), n.clone().negate(), 0, depth + 5); rc.firstHitOnly = true;
+  const h = rc.intersectObject(m, false)[0]; return h ? h.distance + 0.01 : Infinity;
+}
+function addMagnet(sides) {
+  const sz = magSize(); pushUndo();
+  const mg = { id: uid(), ...sz, sides: sides.map((sd, k) => ({ part: sd.m.uuid, ...toLocal(sd.m, sd.o, sd.n), pole: k ? 'S' : 'N' })) };
+  magnets.push(mg); markDirty(); rebuildMagnets(); renderPartPanel();
+  const depth = sz.t + sz.ct, thin = sides.filter(sd => wallBehind(sd.m, sd.o, sd.n, depth) < depth + 0.6).map(sd => sd.m.name);
+  const what = sides.length > 1 ? `between ${sides[0].m.name} and ${sides[1].m.name}` : `in ${sides[0].m.name}`;
+  toast(thin.length ? `Magnet ${magLabel(mg)} ${what}, but ${thin.join(' and ')} ${thin.length > 1 ? 'are' : 'is'} too thin there: the hole would break through or leave under 0.6 mm. Try a thinner magnet or another spot.`
+                    : `Magnet ${magLabel(mg)} ${what}: holes ${(sz.d + sz.cd).toFixed(2)} mm wide, ${depth.toFixed(2)} mm deep.`, thin.length ? 'bad' : 'ok');
+}
+function handleMagnetClick(hit) {
+  if (!hit) { toast('Missed. Click on a part where it meets another.'); return; }
+  const m = hit.object, p = hit.point.clone(), n = hitNormal(hit);
+  if (magPending) {                               // second click: the part it fits against
+    if (m === magPending.m) { toast(`That's ${m.name} again. Click the part it fits against.`, 'bad'); return; }
+    const a = magPending; magPending = null; updateStep();
+    // touching? then the pair goes where they really meet (that face is usually hidden once assembled), nearest the first click
+    let c = null; try { c = contactBetween(contactContext([a.m, m]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) { c = null; }
+    if (c) {
+      const at = V().copy(c.centre || c.joint), dir = (c.nOut?.[0]?.lengthSq() > 1e-9 ? c.nOut[0].clone() : V(0, 0, 1)).normalize();      // out of the first part, toward the second
+      if (worldBox(m).getCenter(V()).sub(worldBox(a.m).getCenter(V())).dot(dir) < 0) dir.negate();       // from the first part toward the second
+      const surf = (part, from, d) => { const rc = new THREE.Raycaster(from, d, 0, 8); rc.firstHitOnly = true; return rc.intersectObject(part, false)[0]?.point || null; };
+      const pa = surf(a.m, at.clone().addScaledVector(dir, 3), dir.clone().negate()) || at, pb = surf(m, at.clone().addScaledVector(dir, -3), dir) || at;
+      addMagnet([{ m: a.m, o: pa, n: dir.clone() }, { m, o: pb, n: dir.clone().negate() }]); return;
+    }
+    addMagnet([a, { m, o: p, n }]); return;
+  }
+  // where it meets another part: look across the surface for the other part's face, within 2 mm (or a little overlap)
+  const others = liveParts().filter(x => x !== m && isVisibleChain(x) && !boxed(x));
+  const rc = new THREE.Raycaster(p.clone().addScaledVector(n, -0.6), n, 0, 2.6); rc.firstHitOnly = true;
+  const h2 = rc.intersectObjects(others, false)[0];
+  if (h2) addMagnet([{ m, o: p, n }, { m: h2.object, o: h2.point.clone(), n: n.clone().negate() }]);
+  else { magPending = { m, o: p, n }; updateStep(); $('step-text').textContent = `No part touches ${m.name} there. Click the spot on the part it fits against (Esc to cancel)`; rebuildMagnets(); }
+}
+function holeGeometry(mg, o, n, extraOut = 0.3) {      // a cylinder from just outside the surface down to the hole's depth
+  const r = (mg.d + mg.cd) / 2, depth = mg.t + mg.ct, len = depth + extraOut;
+  const g = new THREE.CylinderGeometry(r, r, len, Math.max(24, Math.min(64, Math.round(r * 20))), 1, false);
+  g.deleteAttribute('uv'); g.deleteAttribute('normal');
+  g.translate(0, (extraOut - depth) / 2, 0);                                         // its top sits extraOut above the surface
+  g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(V(0, 1, 0), n)); g.translate(o.x, o.y, o.z);
+  return g;
+}
+function rebuildMagnets() {
+  while (magnetFx.children.length) { const c = magnetFx.children.pop(); c.geometry?.dispose(); c.material?.dispose?.(); }
+  magnets = magnets.filter(mg => { mg.sides = mg.sides.filter(sd => partById(sd.part)); return mg.sides.length; });
+  const items = magnets.flatMap(mg => mg.sides.map(sd => ({ mg, sd })));
+  if (magPending) items.push({ mg: { ...magSize() }, sd: null, pend: magPending });
+  for (const { mg, sd, pend } of items) {
+    const w = pend || sideWorld(sd); if (!w || !isVisibleChain(w.m)) continue;
+    const body = new THREE.Mesh(holeGeometry(mg, w.o, w.n, 0.05), new THREE.MeshBasicMaterial({ color: pend ? '#d6a24a' : sd.pole === 'N' ? '#d2716c' : '#6fa3dd', transparent: true, opacity: 0.45, depthTest: false, depthWrite: false }));
+    body.name = 'magnet-hole'; body.renderOrder = 997; body.raycast = () => {}; magnetFx.add(body);
+    const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 40 }, (_, i) => { const a = i / 40 * Math.PI * 2; return V(Math.cos(a), Math.sin(a), 0).multiplyScalar((mg.d + mg.cd) / 2); })),
+      new THREE.LineBasicMaterial({ color: '#f1d08f', depthTest: false })); ring.position.copy(w.o).addScaledVector(w.n, 0.02); ring.quaternion.setFromUnitVectors(V(0, 0, 1), w.n);
+    ring.renderOrder = 998; ring.raycast = () => {}; magnetFx.add(ring);
+  }
+}
+/** Each part's magnet rows in its Properties: size, partner, resize, remove. */
+function magnetRows(p, el) {
+  const mine = magnets.filter(mg => mg.sides.some(sd => sd.part === p.uuid)); if (!mine.length) return;
+  const box = document.createElement('div'); box.className = 'mag-list';
+  const h = document.createElement('div'); h.className = 'opt-sub'; h.textContent = `Magnets (${mine.length})`; box.append(h);
+  for (const mg of mine) {
+    const other = mg.sides.find(sd => sd.part !== p.uuid), row = document.createElement('div'); row.className = 'mag-row';
+    const t = document.createElement('span'); t.textContent = `${magLabel(mg)} · hole ${(mg.d + mg.cd).toFixed(2)} × ${(mg.t + mg.ct).toFixed(2)}${other ? ` · ${partById(other.part)?.name}` : ''}`;
+    const bt = (txt, title, fn) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.title = title; x.addEventListener('click', fn); return x; };
+    row.append(t, bt('Use bar size', `Give this pair the size and fit set in the Magnet tool's bar`, () => { pushUndo(); Object.assign(mg, magSize()); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`That magnet is now ${magLabel(mg)}.`); }),
+               bt('Remove', 'Remove this pair of holes', () => { pushUndo(); magnets = magnets.filter(x => x !== mg); markDirty(); rebuildMagnets(); renderPartPanel(); toast('Removed the magnet.'); }));
+    box.append(row);
+  }
+  el.append(box);
+}
+/** At export: the holes cut into copies of the parts that carry magnets (meshes[i] is the export copy of parts[i]). */
+async function cutMagnetHoles(meshes, parts) {
+  const todo = parts.map((m, i) => ({ i, m, sides: magnets.flatMap(mg => mg.sides.filter(sd => sd.part === m.uuid).map(sd => ({ mg, sd }))) })).filter(x => x.sides.length);
+  if (!todo.length) return { meshes, note: '' };
+  let CSG; try { CSG = await import('three-bvh-csg'); } catch (e) { return { meshes, note: "Magnet holes weren't cut: the hole-cutting tool didn't load. Check your connection. " }; }
+  loading.show('Cutting magnet holes'); const out = meshes.slice(); let holes = 0, failed = [];
+  try {
+    const ev = new CSG.Evaluator(); ev.attributes = ['position']; ev.useGroups = false;
+    for (const [k, { i, m, sides }] of todo.entries()) {
+      loading.set(k / todo.length, `${m.name}: ${sides.length} hole${sides.length > 1 ? 's' : ''}`); await nextFrame();
+      try {
+        const src = meshes[i]; src.updateMatrixWorld(true);
+        const g0 = src.geometry, pos = g0.attributes.position, wpos = new Float32Array(pos.count * 3), v = V();
+        for (let j = 0; j < pos.count; j++) { v.fromBufferAttribute(pos, j).applyMatrix4(src.matrixWorld); wpos.set([v.x, v.y, v.z], 3 * j); }
+        let geom = new THREE.BufferGeometry(); geom.setAttribute('position', new THREE.BufferAttribute(wpos, 3));
+        const ix = Uint32Array.from(g0.index.array); if (src.matrixWorld.determinant() < 0) for (let t = 0; t < ix.length; t += 3) { const tmp = ix[t+1]; ix[t+1] = ix[t+2]; ix[t+2] = tmp; }
+        geom.setIndex(new THREE.BufferAttribute(ix, 1));
+        let brush = new CSG.Brush(geom); brush.updateMatrixWorld();
+        for (const { mg, sd } of sides) {
+          const w = sideWorld(sd); const hole = new CSG.Brush(mergeVertices(holeGeometry(mg, w.o, w.n))); hole.updateMatrixWorld();
+          brush = ev.evaluate(brush, hole, CSG.SUBTRACTION); holes++;
+        }
+        const res = new THREE.Mesh(brush.geometry); res.updateMatrixWorld(true); out[i] = res;
+      } catch (e) { console.warn(e); failed.push(m.name); }
+    }
+  } finally { loading.hide(); }
+  return { meshes: out, note: `Cut ${holes} magnet hole${holes === 1 ? '' : 's'}.` + (failed.length ? ` Couldn't cut into ${failed.join(', ')} (its mesh may not be closed); exported without.` : '') + ' ' };
+}
+function bindMagnets() {
+  const SIZE = () => $('mag-size').value;
+  $('mag-size').addEventListener('change', () => { if (SIZE() === 'custom') return; const [d, t] = SIZE().split('x').map(Number); $('mag-d').value = d; $('mag-t').value = t; rebuildMagnets(); });
+  ['mag-d', 'mag-t'].forEach(id => $(id).addEventListener('change', () => { const v = `${+$('mag-d').value}x${+$('mag-t').value}`; $('mag-size').value = [...$('mag-size').options].some(o => o.value === v) ? v : 'custom'; rebuildMagnets(); }));
+  $('mag-fit').addEventListener('change', () => { const f = { resin: 0.15, fdm: 0.3 }[$('mag-fit').value]; if (f != null) { $('mag-cd').value = f; $('mag-ct').value = f; } });
+  ['mag-cd', 'mag-ct'].forEach(id => $(id).addEventListener('change', () => { const a = +$('mag-cd').value, b = +$('mag-ct').value; $('mag-fit').value = a === b && a === 0.15 ? 'resin' : a === b && a === 0.3 ? 'fdm' : 'custom'; }));
+  $('mag-apply').addEventListener('click', () => { if (!magnets.length) { toast('No magnets yet. Click where two parts meet.'); return; }
+    pushUndo(); magnets.forEach(mg => Object.assign(mg, magSize())); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`All ${magnets.length} magnet${magnets.length > 1 ? 's are' : ' is'} now ${magLabel(magSize())}.`, 'ok'); });
+}
 
 // seam preview: amber where surfaces will be pushed, red where a gap is too wide to fill
 const seamFx = new THREE.Group(); scene.add(seamFx);
@@ -5491,15 +5897,18 @@ async function showSeamPreview() {
   $('exp-fill-note').textContent = (stats.moved ? `${stats.seams} seam${stats.seams === 1 ? '' : 's'}: ${stats.moved.toLocaleString()} corners (amber) pushed by up to ${stats.largest.toFixed(2)} mm. No slits left up to ${o.maxGap} mm.`
     : `No parts within ${o.maxGap} mm of each other.`) + (wide.open ? ` Red: ${wide.open} spot${wide.open > 1 ? 's' : ''} with a gap wider than ${o.maxGap} mm that won't be filled.` : '');
 }
+$('exp-pockets').addEventListener('change', () => { $('exp-pockets-f').hidden = !$('exp-pockets').checked; if (!$('exp-pockets').checked) clearPocketPreview(); markDirty(); });
+$('exp-pocket-show').addEventListener('click', () => { if ($('exp-pocket-show').getAttribute('aria-pressed') === 'true') clearPocketPreview(); else showPocketPreview(); });
+$('exp-pocket-res').addEventListener('change', () => { if (pocketFx.children.length) showPocketPreview(); });
 $('exp-fill').addEventListener('change', () => { $('exp-fill-f').hidden = !$('exp-fill').checked; if (!$('exp-fill').checked) clearSeamPreview(); markDirty(); });
 $('exp-sprue').addEventListener('click', () => exportSprues());
 $('exp-sprue-clear').addEventListener('click', () => { pushUndo(); sprues = null; afterHierarchyChange(); toast('Removed the sprue frames.'); });
 $('exp-preview').addEventListener('click', () => { if ($('exp-preview').getAttribute('aria-pressed') === 'true') clearSeamPreview(); else showSeamPreview(); });
 ['exp-gap', 'exp-overlap'].forEach(id => $(id).addEventListener('change', () => { if (seamFx.children.length) showSeamPreview(); markDirty(); }));
-$('exp-each').addEventListener('click', () => {
+$('exp-each').addEventListener('click', async () => {
   const ms = exportMeshes(); if (!ms.length) return;
-  const used = new Set();
-  const files = ms.map(m => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([m]) }; });
+  const used = new Set(), cut = await cutMagnetHoles(ms, ms); if (cut.note) $('exp-note').textContent = cut.note;
+  const files = ms.map((m, i) => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([cut.meshes[i]]) }; });
   deliver(files, 'parts-stl.zip');
 });
 
@@ -5517,6 +5926,7 @@ renderer.domElement.addEventListener('pointerup', e => {
     if (bh) { if (bh.kind === 'book' && tool === 'select') { openBook(); return; } selectBench(bh.kind, bh.k); return; }
   }
   const hit = raycast(e);
+  if (tool === 'MAGNET') { handleMagnetClick(hit); return; }
   if (SNAP_STEPS[tool]) {                          // measuring a big surface can take a moment: let the message paint first
     const ev = { shiftKey: e.shiftKey };
     if (hit && hit.object.userData.part.tris > 150000) { toast('Measuring surface…'); setTimeout(() => handlePick(ev, hit), 30); }
@@ -5607,6 +6017,62 @@ function fitClipPlanes() {                                        // near plane 
 }
 function markViewMoved() { orbit.dispatchEvent({ type: 'end' }); }
 
+// Colour tool: drag on a part to paint (a drag off the parts still turns the view), Alt-click picks up a colour
+const brushRing = new THREE.Mesh(new THREE.RingGeometry(0.86, 1, 48), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9, depthTest: false }));
+brushRing.renderOrder = 999; brushRing.visible = false; scene.add(brushRing);
+const paintMode = () => document.querySelector('#paint-mode [aria-pressed="true"]')?.dataset.v || 'brush';
+function showBrushRing(hit) {
+  if (!hit || tool !== 'paint' || paintMode() !== 'brush') { brushRing.visible = false; return; }
+  const n = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+  brushRing.position.copy(hit.point).addScaledVector(n, 0.02); brushRing.quaternion.setFromUnitVectors(V(0, 0, 1), n);
+  brushRing.scale.setScalar(Math.max(+$('paint-size').value / 2, 0.05)); brushRing.material.color.set($('paint-erase').checked ? '#ff8a8a' : '#ffffff'); brushRing.visible = true;
+}
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (tool !== 'paint' || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  const hit = raycast(e); if (!hit) return;                              // off the parts: the view turns as usual
+  e.stopImmediatePropagation(); e.preventDefault();
+  const m = hit.object, pt = m.userData.part;
+  if (e.altKey) { const c = colourAt(hit); setBrushColor(c); toast(`Picked up ${c}.`); return; }
+  if (paintMode() === 'fill') {
+    pushUndo();
+    if ($('paint-erase').checked) { pt.fill = null; pt.paint = null; } else pt.fill = brush.color;
+    pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(m); markDirty(); renderOutliner(); renderPartPanel(); return;
+  }
+  pushUndo(); brush.stroke = { touched: new Set(), last: hit.point.clone(), obj: m };
+  paintAt(m, hit.point, hit.faceIndex);
+  try { renderer.domElement.setPointerCapture(e.pointerId); } catch (err) {}
+}, { capture: true });
+let paintEv = null;
+renderer.domElement.addEventListener('pointermove', e => {
+  if (tool !== 'paint') { if (brushRing.visible) brushRing.visible = false; return; }
+  const first = !paintEv; paintEv = { clientX: e.clientX, clientY: e.clientY }; if (!first) return;
+  requestAnimationFrame(() => {
+    const ev = paintEv; paintEv = null; if (!ev) return;
+    const hit = raycast(ev); showBrushRing(hit);
+    const st = brush.stroke; if (!st || !hit) return;
+    const step = Math.max(+$('paint-size').value * 0.25, 0.02);
+    if (hit.object === st.obj) { const d = st.last.distanceTo(hit.point), n = Math.min(40, Math.floor(d / step));
+      for (let k = 1; k <= n; k++) paintAt(hit.object, st.last.clone().lerp(hit.point, k / (n + 1))); }
+    paintAt(hit.object, hit.point, hit.faceIndex); st.last.copy(hit.point); st.obj = hit.object;
+  });
+});
+renderer.domElement.addEventListener('pointerleave', () => { brushRing.visible = false; });
+window.addEventListener('pointerup', () => { if (!brush.stroke) return; brush.stroke = null; markDirty(); renderPartPanel(); });
+function bindPaint() {
+  const sw = $('paint-swatches');
+  for (const [name, hex] of PAINTS) { const b = document.createElement('button'); b.type = 'button'; b.className = 'swatch'; b.dataset.c = hex; b.style.background = hex;
+    b.title = name; b.setAttribute('role', 'radio'); b.setAttribute('aria-label', name); b.addEventListener('click', () => setBrushColor(hex)); sw.append(b); }
+  setBrushColor(brush.color);
+  $('paint-color').addEventListener('input', () => setBrushColor($('paint-color').value));
+  $('paint-mode').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
+    $('paint-mode').querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); $('paint-size-f').hidden = b.dataset.v !== 'brush'; brushRing.visible = false; });
+  const syncSize = from => { const v = Math.max(0.1, +from.value || 1.5); $('paint-size').value = v; $('paint-size-r').value = Math.min(v, 8); };
+  $('paint-size').addEventListener('change', () => syncSize($('paint-size'))); $('paint-size-r').addEventListener('input', () => syncSize($('paint-size-r')));
+  view.addEventListener('wheel', e => { if (tool !== 'paint' || !e.altKey) return; e.preventDefault(); e.stopImmediatePropagation();      // Alt-wheel: brush size
+    $('paint-size').value = Math.max(0.1, Math.min(30, +$('paint-size').value * (e.deltaY > 0 ? 0.9 : 1.1))).toFixed(2); syncSize($('paint-size')); }, { passive: false, capture: true });
+  $('set-plastic').addEventListener('change', applyPlastic);
+}
+
 // Ctrl-drag (Cmd on a Mac) on the viewport: box-select every part that shows inside the box
 let marq = null;
 renderer.domElement.addEventListener('pointerdown', e => {
@@ -5655,7 +6121,7 @@ renderer.domElement.addEventListener('pointermove', e => {
     let side = 'orient';
     if (tool === 'MATCH') {
       const { a, b } = matchSides(), m = hit.object;
-      side = !a || m === a ? 'move' : !b || m === b ? 'fixed' : null;
+      side = !a || m === a ? 'move' : 'fixed';
       if (!side) { clearHover(); $('step-hint').textContent = 'Areas go on two parts only. Clear to start over.'; return; }
       if (picks.some(q => q.mesh === m && q.region.includes(hit.faceIndex))) { clearHover(); $('step-hint').textContent = 'Click to drop this area'; return; }
     }
@@ -5731,9 +6197,11 @@ window.addEventListener('keydown', e => {
   const pad = { Numpad1: V(0, -1, 0), Numpad3: V(1, 0, 0), Numpad7: V(0, 0, 1) }[e.code];
   if (pad) { e.preventDefault(); navCube.goTo(e.ctrlKey || e.metaKey ? pad.negate() : pad); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const map = { '1': 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', b: 'BALL', h: 'PLANE', m: 'MID', t: 'THREE', j: 'MATCH' };
+  const map = { '1': 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', b: 'BALL', h: 'PLANE', m: 'MID', t: 'THREE', j: 'MATCH', c: 'paint', n: 'MAGNET' };
+  if (k === 'e' && tool === 'paint') { const c = $('paint-erase'); c.checked = !c.checked; toast(c.checked ? 'Erasing back to bare plastic.' : 'Painting.'); return; }
   if (map[k]) { setTool(map[k]); return; }
   if (k === 'escape' && benchSel) { select(null); syncGizmo(); renderPartPanel(); return; }
+  if (k === 'escape' && magPending) { magPending = null; rebuildMagnets(); updateStep(); toast('Cancelled that magnet.'); return; }
   if (k === 'escape') { if (!$('orient').hidden) { closeOrient(); return; } if (picks.length) cancelPick(); else if (tool === 'select' && selection.length) select(null); else setTool('select'); return; }
   if (k === 'enter' && tool === 'MATCH' && picks.length) { e.preventDefault(); applyMatch(); return; }
   if (k === 'backspace' && picks.length) { e.preventDefault(); picks.pop(); rebuildPickFx(); updateStep(); return; }
@@ -5754,7 +6222,7 @@ function rebuildPickFx() {
 // ---------------------------------------------------------------------------
 // Projects: autosave to this browser (IndexedDB) and project files (.zip)
 // ---------------------------------------------------------------------------
-const SETTING_IDS = ['set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'ar-tol', 'set-crease', 'exp-fill', 'exp-gap', 'exp-overlap'];
+const SETTING_IDS = ['set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res'];
 const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
 let idb = null;
 const idbReady = new Promise(res => {
@@ -5780,7 +6248,7 @@ function serializeProject() {
   const tr = o => ({ pos: o.position.toArray(), quat: o.quaternion.toArray(), scale: o.scale.toArray() });
   return {
     format: 'kitbash-bench', version: 1, id: project.id, name: project.name, updated: Date.now(),
-    parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible,
+    parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
       geom: m.userData.part.geomKey, tris: m.userData.part.tris, parent: parentId(m), ...tr(m) })),
     joints: joints.filter(j => j.parent).map(j => ({ id: j.uuid, parent: parentId(j), size: j.userData.joint.size, rest: j.userData.joint.rest.toArray(), ...tr(j) })),
     settings: Object.fromEntries(SETTING_IDS.map(id => [id, $(id).type === 'checkbox' ? $(id).checked : $(id).value])),
@@ -5788,6 +6256,7 @@ function serializeProject() {
     options: JSON.parse(JSON.stringify(options)),
     sprues: sprues ? JSON.parse(JSON.stringify(sprues)) : null,
     kit: kit ? JSON.parse(JSON.stringify(kit)) : null,
+    magnets: JSON.parse(JSON.stringify(magnets)),
   };
 }
 function geomBuffers(m) {
@@ -5802,20 +6271,23 @@ function geomFrom(rec) {
 }
 
 /** Replace the bench with a saved project. `geoms` maps geometry key -> {pos, idx} buffers. */
-function buildProject(data, geoms) {
+function buildProject(data, geoms, paints = new Map()) {
   project.loading = true;
   closeAutorig(); if (!$('orient').hidden) closeOrient();
   cancelPick(); select(null); tc.detach();
   [...parts, ...joints].forEach(o => o.parent && o.parent.remove(o));
   parts.length = 0; joints.length = 0; undoStack.length = 0; redoStack.length = 0; lastOp = null;
   for (const [id, v] of Object.entries(data.settings || {})) { const el = $(id); if (!el) continue; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; }
-  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked;
+  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked; $('exp-pockets-f').hidden = !$('exp-pockets').checked;
   const byId = new Map(), missing = [], shared = new Map();
   for (const p of data.parts) {
     const rec = geoms.get(p.geom); if (!rec) { missing.push(p.name); continue; }
     const g = shared.get(p.geom) || geomFrom(rec); shared.set(p.geom, g);
     const m = addPart(p.name, g, { welded: true, color: p.color, id: p.id, geomKey: p.geom });
     m.visible = p.visible !== false; byId.set(p.id, m);
+    const pt = m.userData.part, pb = paints.get(p.id); pt.fill = p.fill || null;
+    if (pb && pb.byteLength === g.attributes.position.count * 4) { pt.paint = new Uint8Array(pb.slice(0)); pt.paintVer = pt.paintSaved = 1; }
+    refreshPaint(m);
   }
   for (const j of data.joints || []) { const o = makeJoint(j.size || 0.5); o.uuid = j.id; o.userData.joint.rest.fromArray(j.rest); byId.set(j.id, o); }
   const place = (o, rec) => { (rec.parent && byId.get(rec.parent) || world).add(o); o.position.fromArray(rec.pos); o.quaternion.fromArray(rec.quat); o.scale.fromArray(rec.scale); };
@@ -5824,7 +6296,9 @@ function buildProject(data, geoms) {
   colorIx = parts.length;
   options = data.options ? JSON.parse(JSON.stringify(data.options)) : { slots: [], sets: [] }; applyOptions();
   sprues = data.sprues ? JSON.parse(JSON.stringify(data.sprues)) : null;
+  magnets = Array.isArray(data.magnets) ? JSON.parse(JSON.stringify(data.magnets)) : [];
   kit = data.kit ? JSON.parse(JSON.stringify(data.kit)) : null; book.doc = null; buildKit().then(() => fitMat(true));
+  applyPlastic();
   project.id = data.id; project.name = data.name || 'Untitled kit'; $('proj-name').value = project.name;
   project.saved = new Set(data.parts.map(p => p.geom));
   if (data.camera) { camera.position.fromArray(data.camera.pos); orbit.target.fromArray(data.camera.target); orbit.update(); }
@@ -5848,6 +6322,10 @@ async function saveToBrowser() {
     for (const m of liveParts()) {                         // meshes never change after import, so each is stored once
       const k = m.userData.part.geomKey; if (project.saved.has(k)) continue;
       await idbReq('geoms', 'readwrite', st => st.put(geomBuffers(m), k)); project.saved.add(k);
+    }
+    for (const m of liveParts()) {                         // brushed paint, saved again only after it changes
+      const pt = m.userData.part; if (!pt.paint || pt.paintSaved === pt.paintVer) continue;
+      await idbReq('geoms', 'readwrite', st => st.put(pt.paint.slice().buffer, 'paint:' + m.uuid)); pt.paintSaved = pt.paintVer;
     }
     for (const k of [kit?.image, kit?.pdf].filter(Boolean)) {   // box art and instructions, stored once like meshes
       if (project.saved.has(k) || !assets.has(k)) continue;
@@ -5874,7 +6352,9 @@ async function openSaved(id) {
     const geoms = new Map();
     for (const k of new Set(data.parts.map(p => p.geom))) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) geoms.set(k, rec); }
     for (const k of [data.kit?.image, data.kit?.pdf].filter(Boolean)) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) assets.set(k, rec); }
-    buildProject(data, geoms); frame(sceneBox());
+    const paints = new Map();
+    for (const p of data.parts) if (p.paint) { const rec = await idbReq('geoms', 'readonly', st => st.get('paint:' + p.id)); if (rec) paints.set(p.id, rec); }
+    buildProject(data, geoms, paints); frame(sceneBox());
     setProjStatus('saved', 'ok'); toast(`Opened ${data.name}.`, 'ok');
     try { localStorage.setItem('kitbash-last', id); } catch (e) {}
     return true;
@@ -5887,6 +6367,7 @@ async function deleteSaved(id) {
     if (id === project.id) liveParts().forEach(m => keep.add(m.userData.part.geomKey));
     await idbReq('projects', 'readwrite', st => st.delete(id));
     for (const k of new Set(gone.parts.map(q => q.geom))) if (!keep.has(k)) await idbReq('geoms', 'readwrite', st => st.delete(k));
+    for (const q of gone.parts) if (q.paint && id !== project.id) await idbReq('geoms', 'readwrite', st => st.delete('paint:' + q.id));
     if (id === project.id) project.saved.clear();
     toast(`Deleted ${gone.name} from this browser.`);
   } catch (e) { toast(`Couldn't delete it (${e.message}).`, 'bad'); }
@@ -5929,6 +6410,7 @@ async function saveProjectFile() {
     const { pos, idx } = geomBuffers(m), head = new Uint32Array([pos.byteLength, idx.byteLength]);
     files.push({ name: `meshes/${k}.bin`, data: new Blob([head, pos, idx]) }); }
   for (const k of [kit?.image, kit?.pdf].filter(Boolean)) { const a = assets.get(k); if (a) files.push({ name: `assets/${k.slice(6)}`, data: new Blob([a.data]) }); }
+  for (const m of liveParts()) if (m.userData.part.paint) files.push({ name: `paint/${m.uuid}.bin`, data: new Blob([m.userData.part.paint]) });
   await deliver(files, `${safe(project.name)}.kitbash.zip`);
 }
 async function openProjectFile(file) {
@@ -5952,7 +6434,9 @@ async function openProjectFile(file) {
     if (project.dirty) await saveToBrowser();
     const existing = (await listProjects()).some(p => p.id === data.id);
     if (existing && data.id !== project.id) data.id = THREE.MathUtils.generateUUID();   // never overwrite a different saved copy
-    buildProject(data, geoms); project.saved.clear(); frame(sceneBox());
+    const paints = new Map();
+    for (const p of data.parts) { const f = p.paint && zip.file(`paint/${p.id}.bin`); if (f) paints.set(p.id, await f.async('arraybuffer')); }
+    buildProject(data, geoms, paints); project.saved.clear(); liveParts().forEach(m => { m.userData.part.paintSaved = 0; }); frame(sceneBox());
     toast(`Opened ${data.name} from file.`, 'ok'); markDirty();
   } catch (e) { toast(`Couldn't open ${file.name}: ${e.message}.`, 'bad'); }
 }
@@ -5977,7 +6461,7 @@ function refreshMenus() {
   $('menu-undo').disabled = !undoStack.length; $('menu-redo').disabled = !redoStack.length;
   $('menu-selall').disabled = !any; $('menu-selnone').disabled = !selection.length && !selected; $('menu-delete').disabled = !selected && !benchSel;
   $('btn-arrange').disabled = $('btn-sprue').disabled = $('btn-autorig').disabled = !any; $('menu-unsprue').disabled = !sprues; $('menu-unbox').disabled = kit?.state !== 'sealed';
-  $('menu-slot').disabled = selection.length < 2; $('menu-export').disabled = !any; $('menu-frame').disabled = !any;
+  $('menu-slot').disabled = selection.length < 2; $('menu-pockets').disabled = !liveParts().length; $('menu-nomagnets').disabled = !magnets.length; $('menu-clearpaint').disabled = !liveParts().some(m => m.userData.part.paint || m.userData.part.fill); $('menu-export').disabled = !any; $('menu-frame').disabled = !any;
   $('menu-joints').setAttribute('aria-checked', String($('set-joints').checked));
   $('menu-seams').setAttribute('aria-checked', $('exp-preview').getAttribute('aria-pressed')); $('menu-seams').disabled = liveParts().length < 2;
 }
@@ -6010,6 +6494,7 @@ function bindChrome() {
   const on = (id, fn) => $(id).addEventListener('click', fn);
   on('menu-export', () => openDialog('dlg-export'));
   on('menu-prefs', () => openDialog('dlg-prefs'));
+  on('menu-clearpaint', () => { const n = clearPaint(liveParts()); toast(n ? `Cleared the paint on ${n} part${n > 1 ? 's' : ''}. Undo brings it back.` : 'Nothing is painted.'); });
   on('menu-undo', undo); on('menu-redo', redo);
   on('menu-selall', () => { selectMany(liveParts().filter(isVisibleChain)); });
   on('menu-selnone', () => { select(null); syncGizmo(); renderPartPanel(); });
@@ -6020,6 +6505,8 @@ function bindChrome() {
   });
   on('menu-unsprue', () => $('exp-sprue-clear').click());
   on('menu-unbox', openBox);
+  on('menu-nomagnets', () => { if (!magnets.length) return; pushUndo(); const n = magnets.length; magnets = []; afterHierarchyChange(); toast(`Removed ${n} magnet${n > 1 ? 's' : ''}. Undo brings them back.`); });
+  on('menu-pockets', () => { openDialog('dlg-export'); if (!$('exp-pockets').checked) { $('exp-pockets').checked = true; $('exp-pockets').dispatchEvent(new Event('change')); } showPocketPreview(); });
   on('menu-slot', () => { showDockTab('tab-opts'); $('opt-new').click(); });
   on('menu-home', () => $('nav-home').click());
   on('menu-front', () => navCube.goTo(V(0, -1, 0))); on('menu-right', () => navCube.goTo(V(1, 0, 0))); on('menu-top', () => navCube.goTo(V(0, 0, 1)));
@@ -6079,7 +6566,7 @@ bindProject();
 bindAutorig();
 bindOrient();
 bindOptions();
-bindKit(); bindLinkAsk(); bindChrome();
+bindKit(); bindLinkAsk(); bindChrome(); bindPaint(); bindMagnets();
 $('set-loadas').addEventListener('change', () => { try { localStorage.setItem('kitbash-loadas', $('set-loadas').value); } catch (e) {} });
 try { const v = localStorage.getItem('kitbash-loadas'); if (['ask', 'kit', 'spread', 'asis', 'auto'].includes(v)) $('set-loadas').value = v; } catch (e) {}
 $('set-linkmove').addEventListener('change', () => { try { localStorage.setItem('kitbash-linkmove', $('set-linkmove').value); } catch (e) {} });
@@ -6104,5 +6591,5 @@ $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   
 })();
 renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
 // automated tests only (a query string never reaches the page inside claude.ai)
-if (new URLSearchParams(location.search).has('kbtest')) window.__kb = { THREE, camera, orbit, scene, liveParts, renderer, tc, proxy, get sprues() { return sprues; }, get kit() { return kit; } };
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, camera, orbit, scene, liveParts, renderer, tc, proxy, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles }; }
 </script>
