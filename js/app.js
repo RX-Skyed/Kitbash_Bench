@@ -87,6 +87,7 @@ import {
   sprueGeometry,
   goldenPack,
 } from './math.js';
+import * as Lucky from './lucky.js';
 const BVH = { INTERSECTED, NOT_INTERSECTED };
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -103,15 +104,20 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 view.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#121518');
-const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 5000);
-camera.up.set(0, 0, 1);
+// two cameras: perspective (the default) and orthographic (no perspective, for lining up against references);
+// `camera` is whichever is in use, and everything that looks through it follows the switch
+const perspCam = new THREE.PerspectiveCamera(40, 1, 0.1, 5000);
+const ORTHO_H = 50;                  // the orthographic camera's half-height at zoom 1 (its zoom does the rest)
+const orthoCam = new THREE.OrthographicCamera(-ORTHO_H, ORTHO_H, ORTHO_H, -ORTHO_H, 0.1, 5000);
+let camera = perspCam;
+perspCam.up.set(0, 0, 1); orthoCam.up.set(0, 0, 1);
 camera.position.set(90, -110, 80);
 const orbit = new OrbitControls(camera, renderer.domElement);
 orbit.enableDamping = true; orbit.dampingFactor = 0.15;
 orbit.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.ROTATE, RIGHT: THREE.MOUSE.PAN };
 orbit.enableRotate = false; orbit.enableZoom = false;         // turning and zooming are done by the viewport code below; OrbitControls keeps panning
 scene.add(new THREE.HemisphereLight('#dfe6ee', '#2a2622', 1.6));
-const sun = new THREE.DirectionalLight('#fff4e4', 1.8); sun.position.set(60, -80, 120); camera.add(sun); scene.add(camera);
+const sun = new THREE.DirectionalLight('#fff4e4', 1.8); sun.position.set(60, -80, 120); camera.add(sun); scene.add(perspCam, orthoCam);
 const fill = new THREE.DirectionalLight('#9fb7d6', 0.6); fill.position.set(-80, 60, 30); scene.add(fill);
 const grid = new THREE.GridHelper(300, 30, '#4a535c', '#262c32'); grid.rotateX(Math.PI / 2); scene.add(grid);
 const fine = new THREE.GridHelper(100, 100, '#1f2429', '#1c2126'); fine.rotateX(Math.PI / 2); fine.position.z = -0.01; scene.add(fine);
@@ -439,7 +445,7 @@ function detach(part) {
 }
 
 function makeJoint(size) {
-  const j = new THREE.Object3D(); j.userData.joint = { rest: new THREE.Quaternion(), size };
+  const j = new THREE.Object3D(); j.userData.joint = { rest: new THREE.Quaternion(), restPos: new THREE.Vector3(), size, type: 'pinned', min: null, max: null };
   const h = new THREE.Group(); h.name = 'joint-helper';
   const ball = new THREE.Mesh(new THREE.SphereGeometry(size, 16, 10), new THREE.MeshBasicMaterial({ color: '#d6a24a', depthTest: false, transparent: true, opacity: .9 }));
   const axis = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), V(0, 0, size * 5)]), new THREE.LineBasicMaterial({ color: '#f1d08f', depthTest: false }));
@@ -461,10 +467,194 @@ function attach(child, fixed, how, jointPos, axis) {
   j.quaternion.setFromUnitVectors(V(0, 0, 1), axis.clone().normalize());
   j.updateMatrixWorld(true);
   fixed.attach(j);
-  j.userData.joint.rest.copy(j.quaternion);
+  j.userData.joint.rest.copy(j.quaternion); j.userData.joint.restPos.copy(j.position);
   j.attach(child);
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Connection types and linkages
+// ---------------------------------------------------------------------------
+/*
+ * Every link in the tree has a type:
+ *   pinned  turns any way about its point (a ball, or a pin in a socket): the default
+ *   hinge   turns about one axis only (its joint's Z), optionally between min and max degrees
+ *   roller  slides along one axis only (its joint's Z), optionally between min and max mm
+ *   fixed   doesn't move (no joint at all: the part sits straight on its parent)
+ * Hinges and rollers have their joint turned so its Z is the chosen axis, so the gizmo shows just that ring or arrow.
+ *
+ * Linkages (pistons, levers) close loops the tree can't: an extra connection between two parts that already
+ * have parents. kind 'pin': a point on A stays on a point on B. kind 'rail': a point on A stays on a line
+ * along one of B's own axes (a roller on a rail), optionally between min and max mm.
+ * While you pose, solveLinks() turns and slides the other joints in each loop so every connection holds.
+ */
+const TYPE_LABEL = { pinned: 'Pinned', hinge: 'Hinge', roller: 'Roller', fixed: 'Fixed' };
+const TYPE_ICON = { pinned: '◆', hinge: '◐', roller: '⇕', fixed: '└' };
+let links = [];                    // { id, a, b (part ids), pa, pb (points in each part's own frame), kind: 'pin' | 'rail', axis: 'x' | 'y' | 'z', min, max }
+const linkTypeOf = part => { const j = jointOf(part); return j ? j.userData.joint.type || 'pinned' : parentPart(part) ? 'fixed' : null; };
+const AXIS_V = { x: V(1, 0, 0), y: V(0, 1, 0), z: V(0, 0, 1) };
+/** One of a part's own axes, in world space. */
+function partAxis(part, ax) { part.updateMatrixWorld(true); return AXIS_V[ax].clone().transformDirection(part.matrixWorld); }
+/** Turn a joint so its Z points along `dir` (world), without moving anything hanging off it; that becomes its rest. */
+function reframeJoint(j, dir) {
+  const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
+  j.updateMatrixWorld(true);
+  const z = dir.clone().normalize(), ref = Math.abs(z.x) < 0.9 ? V(1, 0, 0) : V(0, 1, 0), x = ref.clone().sub(z.clone().multiplyScalar(ref.dot(z))).normalize(), y = z.clone().cross(x);
+  const W = new THREE.Matrix4().makeBasis(x, y, z).setPosition(V().setFromMatrixPosition(j.matrixWorld));
+  setWorld(j, W); kids.forEach(k => j.attach(k));
+  const jd = j.userData.joint; jd.rest.copy(j.quaternion); jd.restPos.copy(j.position);
+}
+/** Where a part could pivot on its parent: the middle of where they touch, or else the point of the part nearest its parent. */
+function pivotPoint(part, par) {
+  let c = null; try { c = contactBetween(contactContext([par, part]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) {}
+  if (c) return { point: V().copy(c.centre || c.joint), axis: (c.nOut?.[0]?.lengthSq() > 1e-9 ? c.nOut[0].clone() : V(0, 0, 1)).normalize() };
+  return { point: closestBetween(part, par), axis: worldBox(part).getCenter(V()).sub(worldBox(par).getCenter(V())).normalize() };
+}
+/** Roughly where two parts come closest: the middle of the nearest points on each. */
+function closestBetween(a, b) {
+  a.updateMatrixWorld(true); b.updateMatrixWorld(true);
+  const onB = (m, p) => { const inv = m.matrixWorld.clone().invert(), h = m.geometry.boundsTree.closestPointToPoint(p.clone().applyMatrix4(inv)); return h.point.clone().applyMatrix4(m.matrixWorld); };
+  let p = worldBox(a).getCenter(V());
+  for (let i = 0; i < 3; i++) { const q = onB(b, p); p = onB(a, q); }
+  return p.clone().add(onB(b, p)).multiplyScalar(0.5);
+}
+/** Change how a part is connected to its parent. axis: 'x' | 'y' | 'z' (the part's own) or 'joint' (keep the joint's axis). */
+function setLinkType(part, type, axis = null) {
+  const par = parentPart(part); if (!par) return 'It isn\'t attached to anything.';
+  let j = jointOf(part);
+  if (type === 'fixed') { if (j) { detach(part); par.attach(part); } return null; }
+  if (!j) { const pv = pivotPoint(part, par); detach(part); attach(part, par, 'joint', pv.point, pv.axis); j = jointOf(part); }
+  const jd = j.userData.joint, was = jd.type || 'pinned';
+  jd.type = type;
+  if (type === 'pinned') { if (was !== 'pinned') { jd.min = jd.max = null; } return null; }
+  if (was !== type) { jd.min = jd.max = null; }
+  const ax = axis || jd.axis || (type === 'roller' ? 'z' : 'joint');
+  jd.axis = ax;
+  if (ax !== 'joint') reframeJoint(j, partAxis(part, ax));
+  else { const kids = j.children.filter(isPart); jd.rest.copy(j.quaternion); jd.restPos.copy(j.position); }
+  return null;
+}
+/** Hinge angle (degrees) about the joint's Z from its rest, or roller travel (mm) along it. */
+function jointValue(j) {
+  const jd = j.userData.joint;
+  if (jd.type === 'roller') return j.position.clone().sub(jd.restPos).dot(V(0, 0, 1).applyQuaternion(jd.rest));
+  if (jd.type === 'hinge') { const d = jd.rest.clone().invert().multiply(j.quaternion); return 2 * Math.atan2(d.z, d.w) * 180 / Math.PI; }
+  return 0;
+}
+/** Set a hinge's angle or a roller's travel, within its limits. */
+function setJointValue(j, v) {
+  const jd = j.userData.joint;
+  if (jd.min != null) v = Math.max(v, jd.min); if (jd.max != null) v = Math.min(v, jd.max);
+  if (jd.type === 'roller') { j.position.copy(jd.restPos).addScaledVector(V(0, 0, 1).applyQuaternion(jd.rest), v); j.quaternion.copy(jd.rest); }
+  else if (jd.type === 'hinge') { let a = ((v + 180) % 360 + 360) % 360 - 180; j.quaternion.copy(jd.rest).multiply(new THREE.Quaternion().setFromAxisAngle(V(0, 0, 1), a * Math.PI / 180)); j.position.copy(jd.restPos); }
+  j.updateMatrixWorld(true);
+}
+/** After a drag: keep a joint to what its type allows (a hinge only turns about Z, a roller only slides along Z). */
+function constrainJoint(j) {
+  const jd = j.userData.joint;
+  if (jd.type === 'hinge' || jd.type === 'roller') setJointValue(j, jointValue(j));
+  else j.position.copy(jd.restPos);
+}
+const partByUuid = id => liveParts().find(p => p.uuid === id) || null;
+function tidyLinks() { links = links.filter(l => partByUuid(l.a) && partByUuid(l.b)); }
+/** Every link's error in world mm: a pin's ends apart, or a rail's point off its line (or past its ends). */
+function linkResiduals(list, out = []) {
+  for (const l of list) {
+    const a = l._a, b = l._b, pa = l._pa.clone().applyMatrix4(a.matrixWorld), pb = l._pb.clone().applyMatrix4(b.matrixWorld), d = pa.sub(pb);
+    if (l.kind === 'rail') { const ax = AXIS_V[l.axis].clone().transformDirection(b.matrixWorld); let t = d.dot(ax);
+      if (l.min != null) t = Math.max(t, l.min); if (l.max != null) t = Math.min(t, l.max); d.addScaledVector(ax, -t); }
+    out.push(d.x, d.y, d.z);
+  }
+  return out;
+}
+/** The joints on the tree path between two parts (each one's own link up to where their branches meet). */
+function jointsBetween(a, b) {
+  const up = p => { const out = []; for (let c = p; c; c = parentPart(c)) out.push(c); return out; };
+  const ua = up(a), ub = up(b), meet = ua.find(x => ub.includes(x));
+  const path = meet ? [...ua.slice(0, ua.indexOf(meet)), ...ub.slice(0, ub.indexOf(meet))] : [...ua, ...ub];   // separate groups: every joint in both
+  return path.map(jointOf).filter(Boolean);
+}
+/**
+ * Keep every linkage closed: turn and slide the joints in each loop (never `driven`, the one being posed)
+ * until every pin meets and every rail point sits on its rail. Damped least squares; joints carrying more
+ * parts are stiffer, so the pistons move before the leg does. Returns the worst error left (mm).
+ */
+function solveLinks(driven = null, iters = 30) {
+  tidyLinks(); if (!links.length) return 0;
+  const list = links.map(l => ({ ...l, _a: partByUuid(l.a), _b: partByUuid(l.b), _pa: V(...l.pa), _pb: V(...l.pb) })).filter(l => l._a && l._b);
+  const js = [...new Set(list.flatMap(l => jointsBetween(l._a, l._b)))].filter(j => j !== driven);
+  const dofs = [];
+  for (const j of js) {
+    const jd = j.userData.joint, w = 1 + subtreeParts(j).length * 0.5;
+    if (jd.type === 'hinge' || jd.type === 'roller') dofs.push({ j, k: 'v', w: jd.type === 'roller' ? w * 0.2 : w });
+    else for (const ax of ['x', 'y', 'z']) dofs.push({ j, k: ax, w });
+  }
+  if (!dofs.length) return Math.max(0, ...linkResiduals(list).map(Math.abs));
+  const save = () => dofs.map(d => [d.j.position.clone(), d.j.quaternion.clone()]);
+  const load = st => { dofs.forEach((d, i) => { d.j.position.copy(st[i][0]); d.j.quaternion.copy(st[i][1]); }); js.forEach(j => j.updateMatrixWorld(true)); };
+  const nudge = (d, h) => {
+    if (d.k === 'v') { setJointValue(d.j, jointValue(d.j) + (d.j.userData.joint.type === 'hinge' ? h * 180 / Math.PI : h)); return; }
+    d.j.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(AXIS_V[d.k], h)); d.j.updateMatrixWorld(true);
+  };
+  const cost = r => r.reduce((s, v) => s + v * v, 0);
+  scene.updateMatrixWorld(true);
+  let r = linkResiduals(list), c = cost(r), lambda = 1e-3;
+  const n = dofs.length, m = r.length;
+  for (let it = 0; it < iters && c > 1e-8; it++) {
+    const st = save(), J = dofs.map((d, k) => { const h = 1e-4; nudge(d, h); const r2 = linkResiduals(list); load(st); return r2.map((v, i) => (v - r[i]) / h); });
+    const A = Array.from({ length: n }, () => new Array(n).fill(0)), g = new Array(n).fill(0);
+    for (let a = 0; a < n; a++) { for (let i = 0; i < m; i++) g[a] -= J[a][i] * r[i]; for (let b = a; b < n; b++) { let v = 0; for (let i = 0; i < m; i++) v += J[a][i] * J[b][i]; A[a][b] = A[b][a] = v; } }
+    let improved = false;
+    for (let tries = 0; tries < 6 && !improved; tries++) {
+      const M = A.map((row, a) => row.map((v, b) => v + (a === b ? lambda * dofs[a].w * (1 + A[a][a]) + 1e-9 : 0)));
+      const x = solveLinear(M, g); if (!x) { lambda *= 10; continue; }
+      dofs.forEach((d, k) => nudge(d, Math.max(-0.3, Math.min(0.3, x[k]))));
+      const r2 = linkResiduals(list), c2 = cost(r2);
+      if (c2 < c) { r = r2; c = c2; lambda = Math.max(lambda / 3, 1e-6); improved = true; } else { load(st); lambda *= 10; }
+    }
+    if (!improved) break;
+  }
+  return Math.sqrt(Math.max(0, ...Array.from({ length: r.length / 3 }, (_, i) => r[3 * i] ** 2 + r[3 * i + 1] ** 2 + r[3 * i + 2] ** 2)));
+}
+/** Every joint a linkage solve might move, plus `j`: their positions and turns, to put back later. */
+function linkedState(j) {
+  const set = new Set(j ? [j] : []);
+  for (const l of links) { const a = partByUuid(l.a), b = partByUuid(l.b); if (a && b) jointsBetween(a, b).forEach(x => set.add(x)); }
+  return [...set].map(o => [o, o.position.clone(), o.quaternion.clone()]);
+}
+function applyState(st) { for (const [o, p, q] of st) { o.position.copy(p); o.quaternion.copy(q); } scene.updateMatrixWorld(true); }
+/**
+ * `j` has just been moved (from the pose `prev`). Close every linkage around it; if they can't close (a rigid
+ * piston can't reach, a rail runs out), stop `j` at the furthest point they still can, like the real model jams.
+ * Returns { ok, frac }: frac is how far toward the requested pose it got.
+ */
+function poseWithLinks(j, prev) {
+  if (!links.length) return { ok: true, frac: 1 };
+  const tol = 0.01, want = [j.position.clone(), j.quaternion.clone()];
+  if (solveLinks(j) <= tol) return { ok: true, frac: 1 };
+  const now = linkedState(j);
+  applyState(prev); if (solveLinks(j, 0) > tol) { applyState(now); return { ok: true, frac: 1 }; }   // it didn't hold before either: just do our best
+  const p0 = prev.find(e => e[0] === j); let lo = 0, hi = 1, best = linkedState(j);
+  for (let i = 0; i < 10; i++) {
+    const mid = (lo + hi) / 2; applyState(prev);
+    j.position.lerpVectors(p0[1], want[0], mid); j.quaternion.slerpQuaternions(p0[2], want[1], mid); j.updateMatrixWorld(true);
+    if (solveLinks(j) <= tol) { lo = mid; best = linkedState(j); } else hi = mid;
+  }
+  applyState(best); return { ok: false, frac: lo };
+}
+/** Connect two parts that both keep their parents: a pin (or a rail along one of `to`'s axes) where they meet. */
+function addLink(part, to, kind = 'pin', axis = 'z') {
+  if (part === to) return null;
+  const pt = closestOrContact(part, to);
+  part.updateMatrixWorld(true); to.updateMatrixWorld(true);
+  const l = { id: uid(), a: part.uuid, b: to.uuid, pa: pt.clone().applyMatrix4(part.matrixWorld.clone().invert()).toArray(), pb: pt.clone().applyMatrix4(to.matrixWorld.clone().invert()).toArray(), kind, axis, min: null, max: null };
+  links.push(l); return l;
+}
+function closestOrContact(a, b) {
+  let c = null; try { c = contactBetween(contactContext([b, a]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) {}
+  return c ? V().copy(c.centre || c.joint) : closestBetween(a, b);
+}
+
 
 /**
  * Make `part` the base of its linked group: every link between it and the old base turns round,
@@ -528,7 +718,7 @@ function reroot(part) {
   for (const e of path) { home.attach(e.c); if (e.j) home.attach(e.j); }
   // hook it back the other way round: child → joint → old parent
   for (const e of path) {
-    if (e.j) { e.c.attach(e.j); e.j.attach(e.p); e.j.userData.joint.rest.copy(e.j.quaternion).multiply(e.delta); }
+    if (e.j) { e.c.attach(e.j); e.j.attach(e.p); e.j.userData.joint.rest.copy(e.j.quaternion).multiply(e.delta); e.j.userData.joint.restPos.copy(e.j.position); }
     else e.c.attach(e.p);
   }
   scene.updateMatrixWorld(true);
@@ -542,12 +732,14 @@ const undoStack = [], redoStack = [];
 function snapshot() {
   const snap = [...parts, ...joints].filter(o => o.parent).map(o => ({
     o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name,
-    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, off: !!o.userData.optOff,
+    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null } : null, off: !!o.userData.optOff,
     paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null }));
   snap.options = JSON.parse(JSON.stringify(options));
   snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
   snap.kit = kit ? JSON.parse(JSON.stringify(kit)) : null;
   snap.magnets = JSON.parse(JSON.stringify(magnets));
+  snap.links = JSON.parse(JSON.stringify(links));
+  snap.refs = JSON.parse(JSON.stringify(refs));
   return snap;
 }
 function restore(snap) {
@@ -555,12 +747,15 @@ function restore(snap) {
   for (const e of snap) {
     e.p.add(e.o); e.o.position.copy(e.pos); e.o.quaternion.copy(e.q); e.o.scale.copy(e.s); e.o.visible = e.vis; e.o.name = e.name;
     if (e.rest) e.o.userData.joint.rest.copy(e.rest);
+    if (e.jd) Object.assign(e.o.userData.joint, { ...e.jd, restPos: e.jd.restPos.clone() });
     if (e.o.userData.part) { e.o.userData.optOff = e.off;
       const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); } }
   }
   if (snap.options) options = JSON.parse(JSON.stringify(snap.options));
   if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
   if (snap.magnets) { magnets = JSON.parse(JSON.stringify(snap.magnets)); }
+  if (snap.links) links = JSON.parse(JSON.stringify(snap.links));
+  if (snap.refs && JSON.stringify(snap.refs) !== JSON.stringify(refs)) { refs = JSON.parse(JSON.stringify(snap.refs)); rebuildRefs(); if (benchSel?.kind === 'ref' && !refById(benchSel.k)) { benchSel = null; benchMark.visible = false; } }
   if ('kit' in snap && JSON.stringify(snap.kit) !== JSON.stringify(kit)) { kit = snap.kit ? JSON.parse(JSON.stringify(snap.kit)) : null; buildKit(); }
   scene.updateMatrixWorld(true);
 }
@@ -587,12 +782,13 @@ const SNAP_STEPS = {
   MATCH: ["Click the mating areas on the part that moves", "Click the areas it fits against"],
 };
 const PER_SIDE = { BALL: 1, PLANE: 1, MID: 2, THREE: 3, MATCH: 1 };
-const TOOL_NAMES = { BALL: "Ball & socket", PLANE: "Face to face", MID: "Midpoint of gap", THREE: "3-point align", MATCH: "Surface match" };
-let tool = 'select', picks = [], lastOp = null;
+const TOOL_NAMES = { BALL: "Ball & socket", PLANE: "Face to face", MID: "Midpoint of gap", THREE: "3-point align", MATCH: "Surface match", LUCKY: "Do ya feel lucky?" };
+let tool = 'select', picks = [], lastOp = null, luckyFirst = null, luckyStop = null;
 const settings = () => ({ smoothDeg: +$('set-smooth').value, maxRadius: +$('set-radius').value || 0, flatTol: +$('set-flat').value || 0.02, ballTol: +$('set-balltol').value || 3, creaseDeg: +$('set-crease').value || 30 });
 
 function setTool(t) {
   cancelPick(); if (typeof magPending !== 'undefined' && magPending) { magPending = null; rebuildMagnets(); } if (typeof clearHover === 'function') clearHover();
+  luckyFirst = null;
   if (t !== 'ORIENT' && typeof closeOrient === 'function' && !$('orient').hidden) closeOrient();
   tool = t;
   document.querySelectorAll('.tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === t ? 'true' : 'false'));
@@ -600,7 +796,7 @@ function setTool(t) {
 }
 /** The bar under the menus shows only the current tool's settings, like Photoshop's options bar. */
 function syncOptbar() {
-  const btn = document.querySelector(`.tool[data-tool="${tool}"]`); $('opt-tool').textContent = btn ? [...btn.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim() : tool;
+  const btn = document.querySelector(`.tool[data-tool="${tool}"]`); $('opt-tool').textContent = tool === 'LUCKY' ? TOOL_NAMES.LUCKY : btn ? [...btn.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim() : tool;
   let any = false;
   document.querySelectorAll('#optbar .ogroup').forEach(g => { const on = g.dataset.tools.split(' ').includes(tool); g.hidden = !on; any ||= on; });
   $('opt-none').hidden = any;
@@ -615,6 +811,7 @@ function updateStep() {
                    pose: "Click a jointed part, then drag the rings to pose it around its joint",
                    ORIENT: "Click a face to lay it flat or square it to the X, Y, Z planes",
                    MAGNET: "Click where two parts meet to set a pair of magnet holes, one in each. Not touching yet? Click one part, then the other",
+                   LUCKY: luckyFirst ? `Now click the part ${luckyFirst.name} fits onto` : selection.length === 2 ? `Click the part that moves, then the part it fits onto. Enter: fit ${selection[0].name} onto ${selection[1].name}` : "Click the part that moves, then the part it fits onto. The bench works out how they go together",
                    paint: "Drag on a part to paint it. Alt-click picks up a colour; drag off the parts to turn the view" };
     el.hidden = false; $('step-count').textContent = ''; $('step-side').style.background = 'var(--muted)';
     $('step-text').textContent = msgs[tool]; $('step-hint').textContent = ''; return;
@@ -870,6 +1067,8 @@ function finishMatch(op, results, keepChoice) {
   toast(matchVerdict(b).good ? `Fitted: ${matchVerdict(b).text}` : `Best fit is loose: ${matchVerdict(b).text}. Check the other fits in Adjust.`, matchVerdict(b).good ? 'ok' : 'bad');
 }
 function matchVerdict(r) {
+  if (r.lucky) { const { contact, sunk } = r.lucky;
+    return { text: `${contact.toFixed(1)} mm² sitting flush` + (sunk >= 0.05 ? `, ${sunk.toFixed(1)} mm² overlapping` : ', nothing overlapping'), good: contact >= 2 && sunk < Math.max(0.3, contact * 0.05) }; }
   if (r.seated) return { text: `seated: ${seatSummary(r.seated)}`, good: seatGood(r.seated, r.seatArea || 0) };
   const parts = [`typical gap ${r.gap.toFixed(2)} mm`, `${Math.round(r.coverage * 100)}% within ${r.covTol.toFixed(2)} mm`];
   if (r.ringErr != null) parts.push(`${r.rings > 1 ? 'pegs and holes' : 'peg and hole'} within ${r.ringErr.toFixed(2)} mm`);
@@ -917,6 +1116,126 @@ async function searchAllFaces() {
   try { const more = await searchFits(op, t => toast(t)); finishMatch(op, [...op.match.results, ...more]); }
   catch (err) { console.error(err); toast("The search didn't finish. Try clicking the mating faces instead.", 'bad'); }
   $('adj-search').disabled = false;
+}
+
+// ---------------------------------------------------------------------------
+// Do ya feel lucky?: click two parts and the bench works out how they fit
+// ---------------------------------------------------------------------------
+const LUCKY_EFFORT = { quick: 0.5, normal: 1, thorough: 2 };
+/** A part's triangles in world millimetres (mirrored parts get their winding flipped so faces still point out). */
+function worldCopy(m) {
+  m.updateMatrixWorld(true);
+  const g = m.geometry, p = g.attributes.position.array, e = m.matrixWorld.elements, out = new Float32Array(p.length);
+  for (let i = 0; i < p.length; i += 3) { const x = p[i], y = p[i + 1], z = p[i + 2];
+    out[i] = e[0] * x + e[4] * y + e[8] * z + e[12]; out[i + 1] = e[1] * x + e[5] * y + e[9] * z + e[13]; out[i + 2] = e[2] * x + e[6] * y + e[10] * z + e[14]; }
+  let idx = g.index ? g.index.array.slice() : null;
+  if (m.matrixWorld.determinant() < 0) {
+    const src = idx || Uint32Array.from({ length: p.length / 3 }, (_, i) => i); idx = new Uint32Array(src.length);
+    for (let t = 0; t < src.length; t += 3) { idx[t] = src[t]; idx[t + 1] = src[t + 2]; idx[t + 2] = src[t + 1]; }
+  }
+  return { pos: out, idx };
+}
+/**
+ * Every way `child` could sit on `fixed`, best first. The work is split between background helpers, one per
+ * spare processor core; if the browser won't start them, it runs here in small steps instead.
+ */
+async function luckySearch(child, fixed, effort, progress) {
+  const A = worldCopy(child), B = worldCopy(fixed), opts = { effort };
+  let stopped = false, stopNow; const stopP = new Promise((_, rej) => { stopNow = () => rej(new Error('stopped')); });
+  const phase = pr => Promise.race([pr, stopP]);
+  const n = Math.max(1, Math.min((navigator.hardwareConcurrency || 4) - 1, navigator.deviceMemory && navigator.deviceMemory <= 4 ? 2 : 6));
+  let workers = [];
+  try { for (let i = 0; i < n; i++) workers.push(new Worker(new URL('./lucky-worker.js', import.meta.url), { type: 'module' })); }
+  catch (e) { workers.forEach(w => w.terminate()); workers = []; }
+  luckyStop = () => { stopped = true; workers.forEach(w => w.terminate()); stopNow(); };
+  try {
+    if (!workers.length) return await phase(luckyHere(A, B, opts, progress, () => stopped));
+    const ask = (w, msg, until, onMsg) => new Promise((res, rej) => {
+      w.onmessage = e => { const d = e.data; if (d.type === 'error') rej(new Error(d.message)); else if (d.type === until) res(d); else onMsg?.(d); };
+      w.onerror = ev => { ev.preventDefault?.(); rej(new Error(ev.message || 'A search helper failed to start.')); };
+      w.postMessage(msg);
+    });
+    progress(0.01, `Measuring ${fixed.name}…`);
+    let ctx;
+    try { ({ ctx } = await phase(ask(workers[0], { type: 'prepare', A, B, opts }, 'ctx', d => { if (d.type === 'tick') progress(0.08 * d.f, `Measuring ${fixed.name}…`); }))); }
+    catch (e) { if (stopped) throw e; console.warn('Search helpers unavailable, searching on the page instead:', e); workers.forEach(w => w.terminate()); workers = []; return await phase(luckyHere(A, B, opts, progress, () => stopped)); }
+    await phase(Promise.all(workers.slice(1).map(w => ask(w, { type: 'ctx', ctx }, 'ready'))));
+    const lists = workers.map((_, i) => [...ctx.anchors.keys()].filter(a => a % workers.length === i)), done = workers.map(() => 0);
+    const found = await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'search', list: lists[i] }, 'found', d => {
+      if (d.type === 'progress') { done[i] = d.f; progress(0.1 + 0.72 * done.reduce((a, b) => a + b, 0) / workers.length, `Trying every way ${child.name} could sit on ${fixed.name}…`); } }))));
+    progress(0.83, 'Settling the best few into place…');
+    const starts = Lucky.pickStarts(ctx, found.flatMap(f => f.mine), found.flatMap(f => f.best), Math.round(900 * Math.sqrt(effort)));
+    const chunks = workers.map((_, i) => starts.filter((s2, k) => k % workers.length === i));
+    const refined = (await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'refine', starts: chunks[i] }, 'refined'))))).flatMap(r => r.out);
+    progress(0.93, 'Settling the best few into place…');
+    const { fits } = await phase(ask(workers[0], { type: 'rank', refined, max: 6 }, 'ranked'));
+    progress(0.97, 'Marking where they touch…');
+    const { res } = await phase(ask(workers[0], { type: 'contact', fits: fits.map(f => ({ R: f.R, t: f.t })) }, 'contact'));
+    fits.forEach((f, k) => Object.assign(f, res[k]));
+    return fits;
+  } finally { workers.forEach(w => w.terminate()); luckyStop = null; }
+}
+/** The same search on the page itself, a little at a time so the page keeps drawing. */
+async function luckyHere(A, B, opts, progress, stopped) {
+  progress(0.02, 'Measuring…'); await nextFrame();
+  const ctx = Lucky.prepare(A, B, opts), mine = [], best = [], all = [...ctx.anchors.keys()];
+  for (let i = 0; i < all.length; i++) {
+    if (stopped()) throw new Error('stopped');
+    const r = Lucky.searchAnchors(ctx, [all[i]]); mine.push(...r.mine); best.push(...r.best);
+    best.sort((x, y) => y.score - x.score); best.length = Math.min(best.length, ctx.params.keep);
+    progress(0.1 + 0.72 * i / all.length, 'Trying every way they could fit…'); await nextFrame();
+  }
+  const starts = Lucky.pickStarts(ctx, mine, best, Math.round(900 * Math.sqrt(opts.effort || 1))), refined = [];
+  for (let i = 0; i < starts.length; i += 25) {
+    if (stopped()) throw new Error('stopped');
+    refined.push(...Lucky.refineAll(ctx, starts.slice(i, i + 25))); progress(0.83 + 0.13 * i / starts.length, 'Settling the best few into place…'); await nextFrame();
+  }
+  const fits = Lucky.rankFits(ctx, refined, 6);
+  fits.forEach(f => Object.assign(f, Lucky.contactOf(ctx, f, A, B)));
+  return fits;
+}
+function luckyResult(f, k) {
+  const R = f.R, t = f.t;
+  const T = new THREE.Matrix4().set(R[0], R[1], R[2], t[0], R[3], R[4], R[5], t[1], R[6], R[7], R[8], t[2], 0, 0, 0, 1);
+  return { T, joint: V(...f.joint), axis: V(...f.axis).normalize(), label: k ? `guess ${k + 1}` : 'best guess', regionA: f.regionA, regionB: f.regionB,
+           sig: 'lucky' + k, lucky: { contact: f.contact, sunk: f.sunk }, coverage: 1, covTol: 0, gap: 0, size: 1, inside: 0, score: -f.score };
+}
+function handleLuckyClick(hit) {
+  if (!hit) { toast(luckyFirst ? `Missed. Click the part ${luckyFirst.name} fits onto.` : 'Missed. Click the part that moves.'); return; }
+  const m = hit.object;
+  if (!luckyFirst) { luckyFirst = m; select(m); updateStep(); return; }
+  if (m === luckyFirst) { toast(`That's ${m.name} again. Click the part it fits onto.`, 'bad'); return; }
+  const a = luckyFirst; luckyFirst = null; updateStep(); feelLucky(a, m);
+}
+async function feelLucky(child, fixed) {
+  if (luckyStop) { toast('Already searching. Wait for it, or Stop it first.', 'bad'); return; }
+  const how = await askLink(child, 'Fit', { fixed });
+  if (!how) { toast('Cancelled. Nothing moved.'); updateStep(); return; }
+  scene.updateMatrixWorld(true);
+  const op = { mode: 'MATCH', child, fixed, a: [{ point: worldBox(child).getCenter(V()), normal: V(0, 0, 1) }], b: [{ point: worldBox(fixed).getCenter(V()), normal: V(0, 0, 1) }],
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: lastAttach, centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat }, before: snapshot() };
+  op.reroot = how === 'group';
+  op.match = { lucky: true, regionA: [], regionB: [], groupsA: [], groupsB: [], Ma: child.matrixWorld.clone(), Mb: fixed.matrixWorld.clone(), results: [], chosen: 0, flat: false };
+  await startLucky(op);
+}
+async function startLucky(op) {
+  const effort = LUCKY_EFFORT[$('lucky-effort').value] || 1;
+  loading.show('Do ya feel lucky?'); loading.onStop(() => luckyStop?.());
+  let fits = null;
+  try { fits = await luckySearch(op.child, op.fixed, effort, (f, text) => loading.set(f, text)); }
+  catch (e) { loading.hide(); if (e.message === 'stopped') toast('Stopped. Nothing moved.'); else { console.error(e); toast("The search didn't finish. Try Quick in the options bar, or fit them with Match.", 'bad'); } return; }
+  loading.hide();
+  if (!fits.length) { toast(`Couldn't find a way ${op.child.name} sits on ${op.fixed.name}. Do they touch when assembled?`, 'bad'); return; }
+  const results = fits.map(luckyResult), b0 = results[0];
+  op.match.results = results; op.match.chosen = 0; op.match.regionA = b0.regionA; op.match.regionB = b0.regionB;
+  op.a = [{ point: b0.joint.clone().applyMatrix4(b0.T.clone().invert()), normal: b0.axis.clone().negate() }]; op.b = [{ point: b0.joint.clone(), normal: b0.axis.clone() }];
+  if (lastOp === op) rerunLast();
+  else { if (!runOp(op)) return; pushUndo(op.before); lastOp = op; select(op.child); }
+  showAdjust(); flashMatch();
+  const lead = results[1] ? results[0].lucky.contact - 5 * results[0].lucky.sunk - (results[1].lucky.contact - 5 * results[1].lucky.sunk) : Infinity;
+  const v = matchVerdict(b0);
+  toast(!v.good ? `Best guess is loose: ${v.text}. Check the other guesses in Adjust.`
+    : lead < 2 ? `Lucky? Maybe: ${v.text}, but guess 2 is close behind. Compare them in Adjust.` : `Feeling lucky: ${v.text}.`, v.good && lead >= 2 ? 'ok' : v.good ? '' : 'bad');
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,7 +1411,7 @@ function runOp(op) {
   { const sl = slotOf(op.child); if (sl && parentPart(op.child)) shareSlotJoint(sl, op.child); }   // the other options follow onto this joint
   op.seam = { n: axis.clone().normalize(), c: joint.clone(), long: null };
   if (op.mode === 'MATCH' && op.match?.results.length) {      // the seam line's own direction, from the matched face
-    const m = op.match.results[op.match.chosen]; op.seam.long = faceLongAxis(topoOf(op.fixed), op.match.Mb, m.regionB, op.seam.n);
+    const m = op.match.results[op.match.chosen]; if (m.regionB?.length) op.seam.long = faceLongAxis(topoOf(op.fixed), op.match.Mb, m.regionB, op.seam.n);
   }
   const j = jointOf(op.child); if (j && op.seam.long) j.userData.joint.long = op.seam.long.clone().applyQuaternion(j.getWorldQuaternion(new THREE.Quaternion()).invert());
   afterHierarchyChange();
@@ -1217,7 +1536,8 @@ function showAdjust() {
   showFit();
   if (!op) { el.hidden = true; return; }
   el.hidden = false;
-  $('adjust-title').textContent = `Adjust: ${TOOL_NAMES[op.mode]}`;
+  $('adjust-title').textContent = `Adjust: ${op.match?.lucky ? TOOL_NAMES.LUCKY : TOOL_NAMES[op.mode]}`;
+  $('adj-search').hidden = !!op.match?.lucky;
   $('adj-chain').innerHTML = '';
   const mk = (txt, col, bold) => { const s = document.createElement('span'); if (col) { const d = document.createElement('i'); d.className = 'dot'; d.style.background = col; s.append(d, ' '); }
     const t = document.createElement(bold ? 'b' : 'span'); t.textContent = txt; s.append(t); return s; };
@@ -1230,8 +1550,8 @@ function showAdjust() {
     const box = $('adj-matches'); box.innerHTML = '';
     op.match.results.forEach((r, k) => {
       const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.setAttribute('aria-pressed', k === op.match.chosen ? 'true' : 'false');
-      const t = document.createElement('span'); t.textContent = r.seated ? `Fit ${k + 1}: ${r.seated.contact.toFixed(1)} mm² touching` : `Fit ${k + 1}: ${Math.round(r.coverage * 100)}% contact`;
-      const sm = document.createElement('small'); sm.textContent = r.seated ? `${r.label}` : `gap ${r.gap.toFixed(2)} mm · ${r.label}`;
+      const t = document.createElement('span'); t.textContent = r.lucky ? `Guess ${k + 1}: ${r.lucky.contact.toFixed(1)} mm² flush` : r.seated ? `Fit ${k + 1}: ${r.seated.contact.toFixed(1)} mm² touching` : `Fit ${k + 1}: ${Math.round(r.coverage * 100)}% contact`;
+      const sm = document.createElement('small'); sm.textContent = r.lucky ? (r.lucky.sunk >= 0.05 ? `${r.lucky.sunk.toFixed(1)} mm² overlapping` : 'nothing overlapping') : r.seated ? `${r.label}` : `gap ${r.gap.toFixed(2)} mm · ${r.label}`;
       b.append(t, sm); b.addEventListener('click', () => { op.match.chosen = k; rerunLast(); showAdjust(); flashMatch(); });
       box.append(b);
     });
@@ -1346,7 +1666,8 @@ function bindAdjust() {
     op.p.offset = [0, 0, 0]; op.p.spin = 0;
     if (op.mode === 'MATCH') {
       const m = op.match; Object.assign(m, { regionA: m.regionB, regionB: m.regionA, Ma: m.Mb, Mb: m.Ma, results: [], chosen: 0 });
-      startMatch(op); return;
+      if (m.lucky) startLucky(op); else startMatch(op);
+      return;
     }
     if (runOp(op)) { select(op.child); showAdjust(); toast(`Swapped: ${op.child.name} now moves and attaches to ${op.fixed.name}.`, 'ok'); }
   });
@@ -1389,15 +1710,19 @@ function syncGizmo() {
     proxy.position.copy(c); proxy.quaternion.identity(); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
     const turn = tool === 'rotate' && benchSel.kind !== 'sprue';
     tc.setMode(turn ? 'rotate' : 'translate'); tc.setSpace('world');
-    if (turn) { tc.showX = tc.showY = false; }                 // a box on the mat only turns about the up axis
+    if (turn && benchSel.kind !== 'ref') { tc.showX = tc.showY = false; }                 // a box on the mat only turns about the up axis
+    if (benchSel.kind === 'ref') { proxy.quaternion.copy(o.quaternion); tc.setSpace('local'); }   // a picture moves and turns in its own frame
     tc.attach(proxy); return;
   }
   if (!selected || !['move', 'rotate'].includes(tool)) { linkAsk.gizmoFor = null; if (linkAsk.soft) closeLinkAsk(null); }
   if (!selected || !['move', 'rotate', 'pose'].includes(tool)) return;      // only these tools have a gizmo
   if (tool === 'pose') {
     const j = jointOf(selected);
-    if (!j) { toast(`${selected.name} has no joint yet. Snap it onto a parent first.`); return; }
-    tc.setMode('rotate'); tc.setSpace('local'); tc.attach(j); return;
+    if (!j) { toast(parentPart(selected) ? `${selected.name} is fixed to ${parentPart(selected).name}. Make it Pinned, Hinge or Roller in Properties to pose it.` : `${selected.name} has no joint yet. Snap it onto a parent first.`); return; }
+    const t = j.userData.joint.type || 'pinned';
+    tc.setMode(t === 'roller' ? 'translate' : 'rotate'); tc.setSpace('local');
+    if (t !== 'pinned') { tc.showX = tc.showY = false; }          // a hinge turns, and a roller slides, about its Z only
+    tc.attach(j); return;
   }
   const c = sceneBox(selection.length ? selection : [selected]).getCenter(V());
   proxy.position.copy(c); proxy.quaternion.identity(); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
@@ -1417,7 +1742,9 @@ function gizmoLinkAsk() {
   askLink(part, tool === 'move' ? 'Move' : 'Turn').then(a => { if (a === 'group' && part.parent && selected === part) makeBase(part); });
   linkAsk.soft = true;
 }
+let poseHeld = null;                // while posing with linkages: the last pose where every connection held
 tc.addEventListener('mouseDown', () => {
+  poseHeld = tc.object?.userData.joint && links.length ? linkedState(tc.object) : null;
   if (linkAsk.soft && linkAsk.resolve) closeLinkAsk('alone');        // dragged without answering: just this part
   lastOp = null; $('adjust').hidden = true; showFit();
   pushUndo();
@@ -1433,6 +1760,14 @@ tc.addEventListener('mouseDown', () => {
   }
 });
 tc.addEventListener('objectChange', () => {
+  if (tc.object?.userData.joint) {
+    const j = tc.object; constrainJoint(j);
+    if (links.length) {
+      const r = poseWithLinks(j, poseHeld || linkedState(j)); poseHeld = linkedState(j);
+      if (!r.ok && performance.now() - (poseHeld.t || 0) > 1500) { toast("That's as far as the linkage goes: a piston or rail won't reach any further.", 'bad'); poseHeld.t = performance.now(); }
+    }
+    if (tool === 'pose') posePanelLive();
+  }
   if (tc.object !== proxy && magnets.length) rebuildMagnets();       // posing a joint carries its magnets
   if (tc.object === proxy && gizmoBase) {
     proxy.updateMatrixWorld(true);
@@ -1448,6 +1783,7 @@ tc.addEventListener('mouseUp', () => {
     const o = bb.o;
     if (bb.sel.kind === 'box') { kit.at = o.position.toArray(); kit.rot = o.rotation.z; }
     else if (bb.sel.kind === 'book') { kit.bookAt = o.position.toArray(); kit.bookRot = o.rotation.z; }
+    else if (bb.sel.kind === 'ref') { const r = refById(bb.sel.k); if (r) { r.pos = o.position.toArray(); r.quat = o.quaternion.toArray(); } }
     else if (sprues?.frames[bb.sel.k]) { shiftSprue(bb.sel.k, o.position.clone()); }
   }
   gizmoBase = null; renderPartPanel(); markDirty(); if (sprues) rebuildSprues();
@@ -1460,15 +1796,17 @@ function renderOutliner() {
   const box = $('outliner'); box.innerHTML = '';
   const roots = liveParts().filter(p => !parentPart(p));
   $('part-count').textContent = liveParts().length ? `${liveParts().length} parts` : '';
-  if (!roots.length) { box.innerHTML = '<div class="empty">No parts yet. Import STL files or load the sample kit.</div>'; return; }
+  if (!roots.length && !refs.length) { box.innerHTML = '<div class="empty">No parts yet. Import STL files or load the sample kit.</div>'; return; }
   const kids = p => liveParts().filter(c => parentPart(c) === p);
   const row = (p, depth) => {
     const sl = slotOf(p);
-    const r = document.createElement('div'); r.className = 'orow' + (p.userData.optOff ? ' opt-off' : p.visible ? '' : ' hidden-part');
+    const r = document.createElement('div'); r.className = 'orow dnd-row' + (p.userData.optOff ? ' opt-off' : p.visible ? '' : ' hidden-part'); r.draggable = true; r._key = p;
+    r.title = 'Drag onto another part: on its name to attach, on its right end to make it an option, onto empty space to set it loose';
     r.setAttribute('role', 'treeitem'); r.setAttribute('aria-selected', isSel(p) ? 'true' : 'false'); if (p === selected) r.classList.add('active');
     r.style.paddingLeft = (12 + depth * 14) + 'px';
     const link = document.createElement('span'); link.className = 'link';
-    link.textContent = depth ? (jointOf(p) ? '◆' : '└') : ''; link.title = jointOf(p) ? 'Jointed (pose with P)' : 'Fixed to parent';
+    const lt = linkTypeOf(p); link.textContent = depth ? TYPE_ICON[lt] : ''; link.title = lt === 'fixed' ? 'Fixed to its parent' : `${TYPE_LABEL[lt]} (pose with P)`;
+    if (links.some(l => l.a === p.uuid || l.b === p.uuid)) { link.textContent += '⛓'; link.title += ' · also connected to another part'; }
     const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = baseColor(p);
     const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = p.name;
     const eye = document.createElement('button'); eye.className = 'eye'; eye.type = 'button'; eye.title = p.visible ? 'Hide' : 'Show';
@@ -1495,6 +1833,13 @@ function renderOutliner() {
     kids(p).forEach(k => row(k, depth + 1));
   };
   roots.forEach(p => row(p, 0));
+  for (const r of refs) {
+    const el = document.createElement('div'); el.className = 'orow ref-row' + (benchSel?.kind === 'ref' && benchSel.k === r.id ? ' active' : '') + (r.visible === false ? ' hidden-part' : '');
+    el.setAttribute('aria-selected', benchSel?.kind === 'ref' && benchSel.k === r.id ? 'true' : 'false');
+    const ic = document.createElement('span'); ic.className = 'link'; ic.textContent = '▣'; ic.title = 'Reference image' + (r.locked ? ' (locked)' : '');
+    const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = r.name;
+    el.append(ic, nm); el.addEventListener('click', () => selectBench('ref', r.id)); box.append(el);
+  }
 }
 function renderPartPanel() {
   const el = $('part-panel'); el.innerHTML = '';
@@ -1508,13 +1853,13 @@ function renderPartPanel() {
   const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
   add('Size', `${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} mm`);
   add('Triangles', p.userData.part.tris.toLocaleString());
-  add('Attached to', par ? `${par.name} (${j ? 'joint' : 'fixed'})` : '—');
+  add('Attached to', par ? `${par.name} (${TYPE_LABEL[linkTypeOf(p)]})` : '—');
   add('Carries', subtreeParts(p).length - 1 + ' parts');
   if (p.userData.part.paint || p.userData.part.fill) add('Paint', [p.userData.part.fill ? 'filled ' + p.userData.part.fill : '', p.userData.part.paint ? 'brushed' : ''].filter(Boolean).join(', '));
   { const sl = slotOf(p); if (sl) add('Option', `${sl.name}: ${sl.members.indexOf(p.uuid) + 1} of ${sl.members.length}${p.userData.optOff ? ' (not chosen)' : ' (chosen)'}`); }
   const row = document.createElement('div'); row.className = 'btnrow';
   const b = (txt, fn, dis) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.disabled = !!dis; x.addEventListener('click', fn); row.append(x); };
-  b('Reset pose', () => { pushUndo(); j.quaternion.copy(j.userData.joint.rest); afterHierarchyChange(); }, !j);
+  b('Reset pose', () => { pushUndo(); j.quaternion.copy(j.userData.joint.rest); j.position.copy(j.userData.joint.restPos); j.updateMatrixWorld(true); if (links.length) solveLinks(j); afterHierarchyChange(); }, !j);
   b('Detach', () => { pushUndo(); detach(p); afterHierarchyChange(); }, !par);
   if (par) {     // turn the link round: the parent hangs off this part instead
     const swap = !parentPart(par);
@@ -1530,8 +1875,77 @@ function renderPartPanel() {
   if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
   b('Delete', () => deleteSelected());
   el.append(name, dl, row);
+  connectionRows(p, el);
   magnetRows(p, el);
 }
+/** How the selected part is connected: its link type to its parent, and any extra connections (pistons, levers). */
+function connectionRows(p, el) {
+  const par = parentPart(p), sec = document.createElement('div'); sec.className = 'conn';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = par ? `Connection to ${par.name}` : 'Connections'; sec.append(h);
+  const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); sec.append(f); return f; };
+  const num = (v, ph, step, onCh, aria) => { const i = document.createElement('input'); i.type = 'number'; i.className = 'num'; i.step = step; i.placeholder = ph; i.value = v == null ? '' : +(+v).toFixed(2); i.setAttribute('aria-label', aria);
+    i.addEventListener('change', () => onCh(i.value === '' ? null : +i.value)); return i; };
+  const sel = (opts, v, onCh, aria) => { const s2 = document.createElement('select'); s2.className = 'num osel'; s2.setAttribute('aria-label', aria);
+    for (const [k, t] of opts) { const o = document.createElement('option'); o.value = k; o.textContent = t; s2.append(o); } s2.value = v; s2.addEventListener('change', () => onCh(s2.value)); return s2; };
+  const change = (fn, msg) => { pushUndo(); lastOp = null; const err = fn(); scene.updateMatrixWorld(true); if (links.length) solveLinks(jointOf(p)); afterHierarchyChange(); if (err) toast(err, 'bad'); else if (msg) toast(msg, 'ok'); };
+  if (par) {
+    const type = linkTypeOf(p), seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${p.name} connects to ${par.name}`);
+    for (const [t, tip] of [['pinned', 'Turns any way about its point, like a ball or a pin in a socket'], ['hinge', 'Turns about one axis only, like a knee'], ['roller', 'Slides along one axis only, like a piston rod'], ['fixed', "Doesn't move"]]) {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = TYPE_LABEL[t]; b.title = tip; b.setAttribute('aria-pressed', type === t ? 'true' : 'false');
+      b.addEventListener('click', () => { if (type !== t) change(() => setLinkType(p, t), `${p.name} is now ${TYPE_LABEL[t].toLowerCase()} to ${par.name}.`); });
+      seg.append(b);
+    }
+    sec.append(seg);
+    const j = jointOf(p), jd = j?.userData.joint;
+    if (jd && (jd.type === 'hinge' || jd.type === 'roller')) {
+      const isH = jd.type === 'hinge', unit = isH ? '°' : 'mm';
+      field(isH ? 'Turns about' : 'Slides along', sel([...(isH ? [['joint', 'Joint axis']] : []), ['x', `${p.name}'s X`], ['y', `${p.name}'s Y`], ['z', `${p.name}'s Z`]], jd.axis || (isH ? 'joint' : 'z'),
+        v => change(() => setLinkType(p, jd.type, v)), isH ? 'Hinge axis' : 'Roller axis'));
+      const val = num(jointValue(j), '0', isH ? 1 : 0.1, v => { pushUndo(); lastOp = null; const prev = linkedState(j); setJointValue(j, v || 0); const r = poseWithLinks(j, prev); afterHierarchyChange();
+        if (!r.ok) toast(`The linkage stops it at ${jointValue(j).toFixed(isH ? 1 : 2)}${isH ? '°' : ' mm'}: a piston or rail won't reach any further.`, 'bad'); }, isH ? 'Hinge angle in degrees' : 'Roller travel in mm'); val.id = 'conn-value';
+      field(isH ? `Angle ${unit}` : `Travel ${unit}`, val);
+      field(`Limits ${unit}`, num(jd.min, 'none', isH ? 1 : 0.1, v => change(() => { jd.min = v; constrainJoint(j); }), 'Lower limit'), document.createTextNode('to'),
+        num(jd.max, 'none', isH ? 1 : 0.1, v => change(() => { jd.max = v; constrainJoint(j); }), 'Upper limit'));
+    }
+  }
+  // extra connections that close loops: pistons, levers
+  const mine = links.filter(l => l.a === p.uuid || l.b === p.uuid);
+  for (const l of mine) {
+    const other = partByUuid(l.a === p.uuid ? l.b : l.a); if (!other) continue;
+    const railOn = partByUuid(l.b), f = document.createElement('div'); f.className = 'conn-link';
+    const t = document.createElement('span');
+    t.textContent = l.kind !== 'rail' ? `Also pinned to ${other.name}` : railOn === p ? `${other.name} rides a rail on it (its ${l.axis.toUpperCase()})` : `Rides a rail on ${railOn.name} (its ${l.axis.toUpperCase()})`;
+    // seen from this part, a rail is on the other part: the rail side is b
+    const kind = sel([['pin', 'Pin'], ['rail-x', `Rail along ${other.name}'s X`], ['rail-y', `Rail along ${other.name}'s Y`], ['rail-z', `Rail along ${other.name}'s Z`]],
+      l.kind === 'rail' && railOn === other ? 'rail-' + l.axis : l.kind === 'rail' ? '' : 'pin', v => change(() => {
+        const A = partByUuid(l.a), B = partByUuid(l.b); A.updateMatrixWorld(true); B.updateMatrixWorld(true);
+        const at = V(...l.pa).applyMatrix4(A.matrixWorld);                  // where the moving end is now: the pin or the rail starts there
+        if (v !== 'pin' && l.b === p.uuid) { Object.assign(l, { a: B.uuid, b: A.uuid }); }
+        const a2 = partByUuid(l.a), b2 = partByUuid(l.b);
+        l.pa = at.clone().applyMatrix4(a2.matrixWorld.clone().invert()).toArray(); l.pb = at.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray();
+        if (v === 'pin') l.kind = 'pin'; else { l.kind = 'rail'; l.axis = v.slice(5); l.min = l.max = null; } }), 'Connection kind');
+    if (l.kind === 'rail' && railOn === p) { const o = document.createElement('option'); o.value = ''; o.textContent = `Rail on ${p.name}`; o.disabled = true; kind.prepend(o); kind.value = ''; }
+    const del = document.createElement('button'); del.type = 'button'; del.className = 'mini'; del.textContent = '✕'; del.title = 'Remove this connection';
+    del.addEventListener('click', () => change(() => { links = links.filter(x => x !== l); }, 'Removed that connection.'));
+    f.append(t, kind, del); sec.append(f);
+    if (l.kind === 'rail') field('Rail ends mm', num(l.min, 'none', 0.1, v => change(() => { l.min = v; }), 'Rail start'), document.createTextNode('to'), num(l.max, 'none', 0.1, v => change(() => { l.max = v; }), 'Rail end'));
+  }
+  const others = liveParts().filter(o => o !== p && !mine.some(l => l.a === o.uuid || l.b === o.uuid) && o !== par);
+  if (others.length) {
+    const who = sel([['', 'Connect also to…'], ...others.map(o => [o.uuid, o.name])], '', () => {}, 'Part to connect to');
+    const kind = sel([['pin', 'with a pin'], ['rail-x', 'on a rail (its X)'], ['rail-y', 'on a rail (its Y)'], ['rail-z', 'on a rail (its Z)']], 'pin', () => {}, 'Connection kind');
+    const go = document.createElement('button'); go.type = 'button'; go.className = 'btn'; go.textContent = 'Connect';
+    go.title = 'For pistons and linkages: keeps its own parent and also stays connected to this part where they meet. Posing then moves both to keep it together.';
+    go.addEventListener('click', () => { const o = partByUuid(who.value); if (!o) { toast('Pick the part to connect to first.', 'bad'); return; }
+      toast(`Finding where ${p.name} meets ${o.name}…`);
+      setTimeout(() => change(() => { const k = kind.value; addLink(p, o, k === 'pin' ? 'pin' : 'rail', k === 'pin' ? 'z' : k.slice(5)); },
+        `${p.name} is now also ${kind.value === 'pin' ? 'pinned to' : 'on a rail on'} ${o.name}. Pose the joints around it and it moves to stay connected.`), 30); });
+    const f = document.createElement('div'); f.className = 'conn-add'; f.append(who, kind, go); sec.append(f);
+  }
+  el.append(sec);
+}
+/** While posing: keep the angle or travel box showing where the joint is. */
+function posePanelLive() { const i = $('conn-value'), j = selected && jointOf(selected); if (i && j && document.activeElement !== i) i.value = +jointValue(j).toFixed(2); }
 function renderMultiPanel(el) {
   const list = selection, roots = selectionRoots(), box = new THREE.Box3(); list.forEach(m => box.union(exactBox(m)));
   const size = box.getSize(V()), tris = list.reduce((a, m) => a + m.userData.part.tris, 0);
@@ -1576,11 +1990,83 @@ function afterHierarchyChange() {
   if (typeof seamFx !== 'undefined' && seamFx.children.length) clearSeamPreview();
   if (typeof pocketFx !== 'undefined' && pocketFx.children.length) clearPocketPreview();      // the parts moved: the pockets may have too
   if (typeof renderFolderStatus === 'function') renderFolderStatus();
-  selection = selection.filter(m => m.parent);
+  selection = selection.filter(m => m.parent); tidyLinks();
   if (selected && !selected.parent) selected = selection[selection.length - 1] || null;
   paintSelection();
   renderOutliner(); renderPartPanel(); renderOptions(); rebuildSprues(); rebuildMagnets(); showAdjust(); updateButtons(); updateStats(); syncGizmo();
 }
+// ---------------------------------------------------------------------------
+// Rearranging by drag and drop: in the parts list and in the auto-assemble review
+// ---------------------------------------------------------------------------
+/**
+ * Rows (class dnd-row, with a _key) can be dragged onto each other. Dropping on a row's name attaches the
+ * dragged part to it; on its right end, makes it an option of it; on empty space, sets it loose.
+ * can(src, dst, zone) says what's allowed; drop(src, dst, zone) does it; hint(src, dst, zone) describes it.
+ */
+function treeDnD(box, { can, drop, hint }) {
+  let src = null;
+  const clear = () => { box.querySelectorAll('[data-drop]').forEach(r => { delete r.dataset.drop; delete r.dataset.hint; }); box.classList.remove('drop-loose'); delete box.dataset.hint; };
+  const where = e => { const row = e.target.closest('.dnd-row'); if (!row || !box.contains(row)) return { row: null, dst: null, zone: 'loose' };
+    const r = row.getBoundingClientRect(); return { row, dst: row._key, zone: e.clientX > r.left + r.width * 0.62 ? 'option' : 'attach' }; };
+  box.addEventListener('dragstart', e => { const row = e.target.closest?.('.dnd-row'); if (!row || e.target.closest('select, button, input')) return;
+    src = row._key; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('application/x-kitbash-part', '1'); row.classList.add('dragging');
+    box.dataset.loose = can(src, null, 'loose') ? 'Drop here to set it loose' : ''; box.classList.add('dnd-on'); });
+  box.addEventListener('dragend', () => { src = null; clear(); box.classList.remove('dnd-on'); box.querySelectorAll('.dragging').forEach(r => r.classList.remove('dragging')); });
+  box.addEventListener('dragover', e => {
+    if (src == null) return; const { row, dst, zone } = where(e); clear();
+    if (!can(src, dst, zone)) { e.dataTransfer.dropEffect = 'none'; return; }
+    e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+    if (row) { row.dataset.drop = zone; row.dataset.hint = hint(src, dst, zone); } else { box.classList.add('drop-loose'); box.dataset.hint = hint(src, dst, zone); }
+  });
+  box.addEventListener('dragleave', e => { if (!box.contains(e.relatedTarget)) clear(); });
+  box.addEventListener('drop', e => { if (src == null) return; e.preventDefault(); e.stopPropagation(); const { dst, zone } = where(e), s2 = src; src = null; clear(); if (can(s2, dst, zone)) drop(s2, dst, zone); });
+}
+/** Attach `part` to `to`: with a joint where they touch, or fixed if they don't. Its options come along. */
+function attachSmart(part, to) {
+  toast(`Checking where ${part.name} touches ${to.name}…`);
+  setTimeout(() => {
+    let c = null; try { c = contactBetween(contactContext([to, part]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) { console.warn(e); }
+    pushUndo(); lastOp = null;
+    let e = null; if (c) e = planRig([to, part], [c], 0).edges[0];
+    const how = e ? e.how : 'plain', w = e ? attach(part, to, how, e.joint, e.axis) : attach(part, to, 'plain');
+    const sl = slotOf(part); if (sl && !w) shareSlotJoint(sl, part);
+    afterHierarchyChange(); select(part);
+    toast(w || (e ? `Attached ${part.name} to ${to.name}${how === 'joint' ? ` with a ${KIND_LABEL[e.kind] || 'joint'} where they touch` : ', fixed'}.` : `Attached ${part.name} to ${to.name}, fixed: they don't touch, so there's no joint.`) + (sl && !w ? ` Its other options came too.` : ''), w ? 'bad' : 'ok');
+  }, 30);
+}
+/** Make `part` an alternative for `to` in the same spot: they join one option slot and hang where `to` hangs. */
+function makeOptionOf(part, to) {
+  pushUndo(); lastOp = null;
+  for (const o of options.slots) o.members = o.members.filter(id => id !== part.uuid);
+  let sl = slotOf(to);
+  if (!sl) { const cn = commonName([to.name, part.name]); sl = { id: uid(), name: /^Slot \d+$/.test(cn) ? `${to.name} options` : cn, members: [to.uuid], active: to.uuid }; options.slots.push(sl); }
+  sl.members.push(part.uuid);
+  if (parentPart(to)) shareSlotJoint(sl, to); else if (parentPart(part)) detach(part);
+  applyOptions(); afterHierarchyChange(); select(to);
+  toast(`${part.name} is now an option for ${to.name} in "${sl.name}" (${sl.members.length} options). ${partById(sl.active)?.name} shows; switch in the Options tab or with the eye in the list.`, 'ok');
+}
+function setLoose(part) {
+  pushUndo(); lastOp = null;
+  const sl = slotOf(part);
+  if (sl) { sl.members = sl.members.filter(id => id !== part.uuid); part.userData.optOff = false; part.visible = true; }
+  if (parentPart(part)) detach(part);
+  applyOptions(); afterHierarchyChange(); select(part);
+  toast(`${part.name} is on its own now${sl ? `, no longer an option in "${sl.name}"` : ''}. Nothing moved.`);
+}
+function bindTreeDnD() {
+  treeDnD($('outliner'), {
+    can: (p, q, zone) => zone === 'loose' ? !!(parentPart(p) || slotOf(p))
+      : q && q !== p && !subtreeParts(p).includes(q) && (zone === 'attach' ? parentPart(p) !== q : !(slotOf(p) && slotOf(p) === slotOf(q))),
+    hint: (p, q, zone) => zone === 'loose' ? `Set ${p.name} loose` : zone === 'attach' ? `Attach to ${q.name}` : `Option of ${q.name}`,
+    drop: (p, q, zone) => zone === 'loose' ? setLoose(p) : zone === 'attach' ? attachSmart(p, q) : makeOptionOf(p, q),
+  });
+  treeDnD($('ar-list'), {
+    can: arCan,
+    hint: (k, j, zone) => zone === 'loose' ? `Leave ${ar.meshes[k].name} loose` : zone === 'attach' ? `Attach to ${ar.meshes[j].name}` : `Option of ${ar.meshes[j].name}`,
+    drop: arSet,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Options: interchangeable parts for one spot (heads, weapons…), sets of choices, export per set
 // ---------------------------------------------------------------------------
@@ -2090,11 +2576,13 @@ function stopLoadPreview() { lp.gen++; cancelAnimationFrame(lp.raf); clearPrevie
 /** A popup that covers the bench while a kit gets ready, with a progress bar. */
 const loading = {
   depth: 0,
-  show(title) { this.depth++; $('ls-title').textContent = title; $('ls-text').textContent = 'Getting started…'; this.set(0); $('loadscreen').hidden = false; },
+  show(title) { this.depth++; $('ls-title').textContent = title; $('ls-text').textContent = 'Getting started…'; this.set(0); $('ls-stop').hidden = true; this.stop = null; $('loadscreen').hidden = false; },
+  onStop(fn) { this.stop = fn; $('ls-stop').hidden = !fn; },
   set(frac, text) { const p = Math.round(Math.max(0, Math.min(1, frac)) * 100); $('ls-fill').style.width = p + '%'; $('loadscreen').querySelector('.ls-bar').setAttribute('aria-valuenow', String(p)); if (text) $('ls-text').textContent = text; },
-  hide() { this.depth = Math.max(0, this.depth - 1); if (!this.depth) $('loadscreen').hidden = true; },
+  hide() { this.depth = Math.max(0, this.depth - 1); if (!this.depth) { $('loadscreen').hidden = true; $('ls-stop').hidden = true; this.stop = null; } },
   get on() { return !$('loadscreen').hidden; },
 };
+$('ls-stop').addEventListener('click', () => { $('ls-text').textContent = 'Stopping…'; loading.stop?.(); });
 /** Sealed: the sprues, their pieces and the booklet are inside the box, out of sight and out of reach. */
 function boxed(m) { return kit?.state === 'sealed' && !!sprues && !!sprues.poses[m.uuid] && onSprue(m); }
 function applySeal() {
@@ -2115,6 +2603,10 @@ async function openBox() {
   if (kit?.state !== 'sealed' || kit.opening) return;
   kit.opening = true;
   const grp = kitFx.getObjectByName('kit-box'), wrap = grp?.getObjectByName('kit-wrap'), lid = grp?.getObjectByName('kit-lid');
+  if (!grp) {                                  // the box hasn't been built yet (unboxed straight after loading): open it without the show
+    kit.state = 'open'; kit.opening = false; applySeal(); markDirty(); await buildKit(); renderPartPanel();
+    toast(`Unboxed ${kit.name}.`, 'ok'); return;
+  }
   try {
     if (wrap) await tween(450, e => { wrap.scale.setScalar(1 + 0.08 * e); wrap.material.opacity = 1 - e; });
     if (wrap) { grp.remove(wrap); wrap.geometry.dispose(); wrap.material.map?.dispose(); wrap.material.dispose(); }
@@ -2462,6 +2954,7 @@ const navCube = (() => {
   });
   cv.addEventListener('contextmenu', e => e.preventDefault());
   $('nav-home').addEventListener('click', () => { goTo(V(1, -1.2, 0.85)); setTimeout(() => frame(benchBox()), 400); });
+  $('nav-proj').addEventListener('click', () => setOrtho(!camera.isOrthographicCamera));
   // keyboard: number-pad style views, like Blender
   return { render, goTo, NAMES };
 })();
@@ -2484,6 +2977,7 @@ function benchObj(sel = benchSel) {
   if (!sel) return null;
   if (sel.kind === 'box') return kitFx.getObjectByName('kit-box') || null;
   if (sel.kind === 'book') return kitFx.getObjectByName('kit-book') || null;
+  if (sel.kind === 'ref') return refFx.children.find(c => c.userData.ref === sel.k) || null;
   return sprueFx.children.find(c => c.userData.frame === sel.k) || null;
 }
 function markBench() {
@@ -2498,10 +2992,12 @@ function selectBench(kind, k = 0) {
 function benchHit(ev) {
   const r = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster();
   rc.setFromCamera(new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1), camera);
-  const h = rc.intersectObjects([...kitFx.children, ...sprueFx.children], true)[0]; if (!h) return null;
-  const part = raycast(ev); if (part && part.distance < h.distance) return null;
-  let o = h.object; while (o && o.userData.kit === undefined && o.userData.frame === undefined) o = o.parent;
+  const pickRefs = refFx.children.filter(m => m.visible && !refById(m.userData.ref)?.locked);
+  const h = rc.intersectObjects([...kitFx.children, ...sprueFx.children, ...pickRefs], true)[0]; if (!h) return null;
+  const part = raycast(ev); if (part && (part.distance < h.distance || h.object.userData.ref !== undefined)) return null;    // a part in front (or anywhere over a picture) wins
+  let o = h.object; while (o && o.userData.kit === undefined && o.userData.frame === undefined && o.userData.ref === undefined) o = o.parent;
   if (!o) return null;
+  if (o.userData.ref !== undefined) return { kind: 'ref', k: o.userData.ref };
   return o.userData.frame !== undefined ? { kind: 'sprue', k: o.userData.frame } : { kind: o.userData.kit };
 }
 /** The pieces still held on sprue k. */
@@ -2524,6 +3020,7 @@ function removeSprue(k) {
 }
 function renderBenchPanel(el) {
   const o = benchObj(); if (!o) { benchSel = null; el.innerHTML = '<p class="note">Select a part to see its size and attachments.</p>'; return; }
+  if (benchSel.kind === 'ref') return refPanel(el, o);
   const head = document.createElement('div'); head.className = 'multi-head';
   const dl = document.createElement('dl'); dl.className = 'props';
   const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
@@ -2548,6 +3045,251 @@ function renderBenchPanel(el) {
   const sm = document.createElement('small'); sm.textContent = 'Move (G) slides it' + (benchSel.kind === 'sprue' ? ', pieces and all.' : '; Rotate (R) turns it.') + ' Delete removes it.'; head.append(sm);
   el.append(head, dl, row);
 }
+// ---------------------------------------------------------------------------
+// Reference images: a picture on a plane in the scene, to line parts up and pose against
+// ---------------------------------------------------------------------------
+let refs = [];                       // { id, asset, name, aspect (h/w), pos, quat, w (mm), opacity, behind, locked, visible, flip }
+const refFx = new THREE.Group(); scene.add(refFx);
+const refTex = new Map();            // asset key -> texture (with .image a bitmap)
+async function refTexture(key) {
+  if (refTex.has(key)) return refTex.get(key);
+  const blob = assetBlob(key); if (!blob) return null;
+  const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+  const t = new THREE.Texture(bmp); t.colorSpace = THREE.SRGBColorSpace; t.flipY = false; t.needsUpdate = true; t.anisotropy = 4;
+  refTex.set(key, t); return t;
+}
+let refGen = 0;
+async function rebuildRefs() {
+  const gen = ++refGen;
+  const meshes = [];
+  for (const r of refs) {
+    const tex = await refTexture(r.asset); if (gen !== refGen) return;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: tex, color: tex ? '#ffffff' : '#555b61', transparent: true, opacity: r.opacity, side: THREE.DoubleSide, depthWrite: false, depthTest: !r.behind, toneMapped: false }));
+    m.renderOrder = r.behind ? -10 : 1; m.userData.ref = r.id; m.name = 'ref-' + r.id;
+    m.position.fromArray(r.pos); m.quaternion.fromArray(r.quat); m.scale.set(r.w * (r.flip ? -1 : 1), r.w * r.aspect, 1); m.visible = r.visible !== false;
+    meshes.push(m);
+  }
+  while (refFx.children.length) { const c = refFx.children.pop(); c.geometry.dispose(); c.material.dispose(); }
+  meshes.forEach(m => refFx.add(m));
+  if (benchSel?.kind === 'ref') markBench();
+}
+const refById = id => refs.find(r => r.id === id) || null;
+/** Add a picture: it faces the current view, through the middle of the view, sized to the parts and set behind them. */
+async function addRefImage(file) {
+  if (!/^image\//.test(file.type) && !/\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)) { toast(`${file.name} isn't a picture.`, 'bad'); return; }
+  const key = await addAsset(file); let aspect = 1;
+  try { const bmp = await createImageBitmap(assetBlob(key)); aspect = bmp.height / bmp.width; bmp.close?.(); } catch (e) { assets.delete(key); toast(`Couldn't read ${file.name} as a picture.`, 'bad'); return; }
+  scene.updateMatrixWorld(true);
+  const box = liveParts().length ? sceneBox() : null, f = fwd();
+  const h = box ? Math.max(box.getSize(V()).length() * 0.8, 10) : 80, w = h / aspect;
+  const c = box ? box.getCenter(V()).addScaledVector(f, box.getSize(V()).length() * 0.6) : orbit.target.clone();
+  pushUndo();
+  const r = { id: uid(), asset: key, name: file.name.replace(/\.[^.]+$/, ''), aspect, pos: c.toArray(), quat: camera.quaternion.toArray(), w, opacity: 0.6, behind: true, locked: false, visible: true, flip: false };
+  refs.push(r); await rebuildRefs(); markDirty(); renderOutliner(); selectBench('ref', r.id);
+  toast(`Added ${r.name} facing this view, behind the parts. Move (G) and Rotate (R) place it; set its size and see-through in Properties.`, 'ok');
+}
+function removeRef(id) { pushUndo(); refs = refs.filter(r => r.id !== id); if (benchSel?.kind === 'ref' && benchSel.k === id) { benchSel = null; benchMark.visible = false; tc.detach(); } rebuildRefs(); markDirty(); renderOutliner(); renderPartPanel(); }
+function refPanel(el, o) {
+  const r = refById(benchSel.k); if (!r) return;
+  const head = document.createElement('div'); head.className = 'multi-head';
+  const nm = document.createElement('input'); nm.className = 'name-input'; nm.value = r.name; nm.setAttribute('aria-label', 'Reference image name');
+  nm.addEventListener('change', () => { r.name = nm.value.trim() || r.name; markDirty(); renderOutliner(); });
+  const sec = document.createElement('div'); sec.className = 'conn';
+  const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); sec.append(f); return f; };
+  const upd = (fn, undo = true) => { if (undo) pushUndo(); fn(); rebuildRefs(); markDirty(); };
+  const wIn = document.createElement('input'); wIn.type = 'number'; wIn.className = 'num'; wIn.step = '1'; wIn.min = '1'; wIn.value = r.w.toFixed(1); wIn.setAttribute('aria-label', 'Width in mm');
+  const hOut = document.createElement('span'); hOut.textContent = `× ${(r.w * r.aspect).toFixed(1)} mm`;
+  wIn.addEventListener('change', () => { const v = +wIn.value; if (v > 0) upd(() => { r.w = v; }); hOut.textContent = `× ${(r.w * r.aspect).toFixed(1)} mm`; });
+  field('Size', wIn, hOut);
+  const op = document.createElement('input'); op.type = 'range'; op.min = '0.05'; op.max = '1'; op.step = '0.05'; op.value = r.opacity; op.setAttribute('aria-label', 'See-through');
+  op.addEventListener('input', () => { r.opacity = +op.value; const m = benchObj(); if (m) m.material.opacity = r.opacity; markDirty(); });
+  field('Solid', op);
+  const chk = (label, key, tip) => { const l = document.createElement('label'); l.className = 'check'; l.title = tip; const c = document.createElement('input'); c.type = 'checkbox'; c.checked = !!r[key];
+    c.addEventListener('change', () => upd(() => { r[key] = c.checked; })); l.append(c, ' ' + label); sec.append(l); };
+  chk('Always behind the parts', 'behind', 'Drawn behind everything, like a backdrop, wherever it is');
+  chk('Locked (clicks go through it)', 'locked', 'Stops clicks on empty space picking it. Select it again from the Parts list.');
+  chk('Mirrored', 'flip', 'Flip the picture left to right');
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, tip, primary) => { const x = document.createElement('button'); x.className = 'btn' + (primary ? ' primary' : ''); x.type = 'button'; x.textContent = txt; if (tip) x.title = tip; x.addEventListener('click', fn); row.append(x); };
+  b('Face this view', () => upd(() => { r.quat = camera.quaternion.toArray(); }), 'Turn it to face the camera, about its middle');
+  b('Look straight at it', () => lookAtRef(r), 'Turn the view to face it square on, in orthographic, framed');
+  b(r.visible === false ? 'Show' : 'Hide', () => upd(() => { r.visible = r.visible === false; }));
+  b('Delete', () => removeRef(r.id));
+  const ap = document.createElement('div'); ap.className = 'conn'; ap.id = 'autopose-box';
+  head.append(nm); const sm = document.createElement('small'); sm.textContent = 'Reference image. Move (G) slides it, Rotate (R) turns it.'; head.append(sm);
+  el.append(head, sec, row, ap);
+  autoPoseRows(r, ap);
+}
+// ---- Auto-pose (experimental): bend the joints until the model's outline covers the figure in the picture ----
+const SIL_LAYER = 5;
+let silRT = null, silCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000); silCam.layers.set(SIL_LAYER);
+const silMat = new THREE.MeshBasicMaterial({ color: '#ffffff', side: THREE.DoubleSide });
+/** The picture's frame: centre, right, up, out (unit), and its size in mm. */
+function refFrame(r) {
+  const q = new THREE.Quaternion().fromArray(r.quat);
+  return { c: V(...r.pos), x: V(r.flip ? -1 : 1, 0, 0).applyQuaternion(q), y: V(0, 1, 0).applyQuaternion(q), n: V(0, 0, 1).applyQuaternion(q), w: r.w, h: r.w * r.aspect };
+}
+/** Where the figure is in the picture: a W×H mask cut out by transparency, or by distance from the background colour. */
+async function refMask(r, W, tol) {
+  const bmp = await createImageBitmap(assetBlob(r.asset)), H = Math.max(8, Math.round(W * r.aspect));
+  const cv = new OffscreenCanvas(W, H), g = cv.getContext('2d', { willReadFrequently: true }); g.drawImage(bmp, 0, 0, W, H);
+  const d = g.getImageData(0, 0, W, H).data, n = W * H, m = new Uint8Array(n);
+  let clear = 0; for (let i = 0; i < n; i++) if (d[4 * i + 3] < 128) clear++;
+  if (clear > n * 0.05) { for (let i = 0; i < n; i++) m[i] = d[4 * i + 3] >= 128 ? 1 : 0; return { m, W, H, how: 'transparency' }; }
+  const border = []; for (let x = 0; x < W; x++) border.push(x, x + (H - 1) * W); for (let y = 0; y < H; y++) border.push(y * W, y * W + W - 1);
+  const med = k => { const v = border.map(i => d[4 * i + k]).sort((a, b) => a - b); return v[v.length >> 1]; }, bg = [med(0), med(1), med(2)];
+  const t2 = (tol * 4.4) ** 2;
+  for (let i = 0; i < n; i++) { const dr = d[4 * i] - bg[0], dg = d[4 * i + 1] - bg[1], db = d[4 * i + 2] - bg[2]; m[i] = dr * dr + dg * dg + db * db > t2 ? 1 : 0; }
+  return { m, W, H, how: 'background', bg };
+}
+/** The figure's outline seen square-on to the picture, as a W×H mask in the picture's own pixels. */
+function silhouette(r, parts, W, H) {
+  if (!silRT || silRT.width !== W || silRT.height !== H) { silRT?.dispose(); silRT = new THREE.WebGLRenderTarget(W, H); silRT.buf = new Uint8Array(W * H * 4); }
+  const F = refFrame(r), D = sceneScale() * 4 + F.w;
+  silCam.left = -F.w / 2; silCam.right = F.w / 2; silCam.top = F.h / 2; silCam.bottom = -F.h / 2; silCam.near = 0.01; silCam.far = D * 3;
+  silCam.position.copy(F.c).addScaledVector(F.n, D); silCam.up.copy(F.y); silCam.lookAt(F.c); silCam.updateProjectionMatrix(); silCam.updateMatrixWorld(true);
+  if (r.flip) silCam.projectionMatrix.elements[0] *= -1;                 // a mirrored picture: mirror the outline to match
+  parts.forEach(m => m.layers.enable(SIL_LAYER));
+  const bg = scene.background, ov = scene.overrideMaterial, cc = renderer.getClearColor(new THREE.Color()), ca = renderer.getClearAlpha();
+  scene.background = null; scene.overrideMaterial = silMat; renderer.setClearColor(0x000000, 1);
+  renderer.setRenderTarget(silRT); renderer.clear(); renderer.render(scene, silCam); renderer.setRenderTarget(null);
+  scene.background = bg; scene.overrideMaterial = ov; renderer.setClearColor(cc, ca);
+  parts.forEach(m => m.layers.disable(SIL_LAYER));
+  renderer.readRenderTargetPixels(silRT, 0, 0, W, H, silRT.buf);
+  const m = new Uint8Array(W * H), b = silRT.buf;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) m[(H - 1 - y) * W + x] = b[4 * (y * W + x)] > 127 ? 1 : 0;   // GL rows run bottom up
+  return m;
+}
+const overlap = (a, b) => { let i = 0, u = 0; for (let k = 0; k < a.length; k++) { if (a[k] & b[k]) i++; if (a[k] | b[k]) u++; } return u ? i / u : 0; };
+/** The figures that could be posed: each assembly with joints, biggest first. */
+const poseFigures = () => liveParts().filter(p => !parentPart(p) && p.visible).map(p => ({ root: p, parts: subtreeParts(p).filter(m => m.visible && !m.userData.optOff) }))
+  .filter(f => f.parts.length > 1).sort((a, b) => b.parts.length - a.parts.length);
+let autoPose = { tol: 12, whole: true, busy: false, stop: false, fig: null, preview: false };
+function autoPoseRows(r, box) {
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = 'Match a pose to it (experimental)'; box.append(h);
+  const figs = poseFigures();
+  const note = document.createElement('p'); note.className = 'note';
+  note.textContent = figs.length ? 'Line the picture up with the figure first (size and place it so they overlap), ideally square on. Then it bends the joints until the outline covers the figure in the picture. Works best on a plain background or a cut-out.'
+    : 'Build a rig first: the figure needs jointed parts to pose.';
+  box.append(note); if (!figs.length) return;
+  const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); box.append(f); return f; };
+  const fs = document.createElement('select'); fs.className = 'num osel'; fs.setAttribute('aria-label', 'Figure to pose');
+  figs.forEach((f, k) => { const o = document.createElement('option'); o.value = f.root.uuid; o.textContent = `${f.root.name} (${f.parts.length} parts)`; fs.append(o); });
+  if (autoPose.fig && figs.some(f => f.root.uuid === autoPose.fig)) fs.value = autoPose.fig; fs.addEventListener('change', () => { autoPose.fig = fs.value; });
+  field('Figure', fs);
+  const tl = document.createElement('input'); tl.type = 'range'; tl.min = '2'; tl.max = '60'; tl.step = '1'; tl.value = autoPose.tol; tl.setAttribute('aria-label', 'Background tolerance');
+  tl.addEventListener('input', () => { autoPose.tol = +tl.value; if (autoPose.preview) showMaskPreview(r); });
+  field('Background', tl);
+  const pv = document.createElement('label'); pv.className = 'check'; const pc = document.createElement('input'); pc.type = 'checkbox'; pc.checked = autoPose.preview;
+  pc.addEventListener('change', () => { autoPose.preview = pc.checked; if (pc.checked) showMaskPreview(r); else rebuildRefs(); }); pv.append(pc, ' Show what it sees as the figure'); box.append(pv);
+  const wh = document.createElement('label'); wh.className = 'check'; const wc = document.createElement('input'); wc.type = 'checkbox'; wc.checked = autoPose.whole;
+  wc.addEventListener('change', () => { autoPose.whole = wc.checked; }); wh.append(wc, ' Also slide and turn the whole figure in the picture'); box.append(wh);
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const go = document.createElement('button'); go.type = 'button'; go.className = 'btn primary'; go.textContent = 'Match pose'; go.addEventListener('click', () => runAutoPose(r, figs.find(f => f.root.uuid === fs.value) || figs[0]));
+  row.append(go); box.append(row);
+  const out = document.createElement('p'); out.className = 'note'; out.id = 'autopose-out'; box.append(out);
+}
+/** Paint the cut-out on the picture: the figure as it reads it in colour, the rest dimmed. */
+async function showMaskPreview(r) {
+  const mk = await refMask(r, 320, autoPose.tol), cv = document.createElement('canvas'); cv.width = mk.W; cv.height = mk.H;
+  const g = cv.getContext('2d'), im = g.createImageData(mk.W, mk.H);
+  for (let i = 0; i < mk.m.length; i++) { const on = mk.m[i]; im.data.set(on ? [255, 160, 60, 255] : [20, 24, 28, 200], 4 * i); }
+  g.putImageData(im, 0, 0);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const m = refFx.children.find(c => c.userData.ref === r.id); if (m) { m.material.map = t; m.material.needsUpdate = true; }
+}
+/** The things auto-pose may change: the whole figure in the picture's plane, then each joint, big limbs first. */
+function poseDofs(fig, F, whole) {
+  const out = [], size = sceneBox(fig.parts).getSize(V()).length();
+  if (whole) {
+    const root = fig.root, c = sceneBox(fig.parts).getCenter(V());
+    const mv = d => () => { applyWorld(root, Tr(d)); };
+    out.push({ name: 'slide across', step: size * 0.06, min: size * 0.004, apply: (h) => applyWorld(root, Tr(F.x.clone().multiplyScalar(h))) });
+    out.push({ name: 'slide up', step: size * 0.06, min: size * 0.004, apply: (h) => applyWorld(root, Tr(F.y.clone().multiplyScalar(h))) });
+    out.push({ name: 'turn', step: 0.2, min: 0.01, apply: (h) => { const p = sceneBox(fig.parts).getCenter(V()); applyWorld(root, Tr(p).multiply(new THREE.Matrix4().makeRotationAxis(F.n, h)).multiply(Tr(p.clone().negate()))); } });
+  }
+  const js = [...new Set(fig.parts.map(jointOf).filter(Boolean))].sort((a, b) => subtreeParts(b).length - subtreeParts(a).length);
+  for (const j of js) {
+    const jd = j.userData.joint, t = jd.type || 'pinned';
+    if (t === 'hinge') out.push({ j, name: 'hinge', sweep: true, step: 0.35, min: 0.01, apply: h => setJointValue(j, jointValue(j) + h * 180 / Math.PI) });
+    else if (t === 'roller') out.push({ j, name: 'roller', step: size * 0.04, min: size * 0.002, apply: h => setJointValue(j, jointValue(j) + h) });
+    else {
+      // pinned: turn in the picture's plane (what the outline shows best), and tilt toward or away from it (foreshortening),
+      // both about the joint's point; a turn about the limb's own length doesn't change its outline, so that's left alone
+      const turnWorld = (axis, h) => { const pw = j.parent.getWorldQuaternion(new THREE.Quaternion()); j.quaternion.premultiply(pw.clone().invert().multiply(new THREE.Quaternion().setFromAxisAngle(axis, h)).multiply(pw)); j.updateMatrixWorld(true); };
+      out.push({ j, name: 'swing', sweep: true, step: 0.35, min: 0.01, apply: h => turnWorld(F.n, h) });
+      out.push({ j, name: 'tilt', late: true, step: 0.2, min: 0.01, apply: h => {
+        const a = V().setFromMatrixPosition(j.matrixWorld), kid = j.children.find(isPart), tip = kid ? sceneBox(subtreeParts(kid)).getCenter(V()) : a.clone().add(F.x);
+        const limb = tip.sub(a); limb.addScaledVector(F.n, -limb.dot(F.n)); if (limb.lengthSq() < 1e-9) limb.copy(F.x);
+        turnWorld(limb.normalize().cross(F.n).normalize(), h); } });
+    }
+  }
+  return out;
+}
+async function runAutoPose(r, fig) {
+  if (autoPose.busy) return;
+  autoPose.busy = true; autoPose.stop = false;
+  const W = 140, mk = await refMask(r, W, autoPose.tol), H = mk.H, target = mk.m;
+  const tgtN = target.reduce((a, v) => a + v, 0);
+  if (tgtN < W * H * 0.01 || tgtN > W * H * 0.95) { autoPose.busy = false; toast(tgtN < W * H * 0.01 ? "It can't find a figure in the picture: raise Background, or use a picture with a plainer background." : "Almost all of the picture reads as figure: lower Background.", 'bad'); return; }
+  pushUndo(); lastOp = null;
+  const F = refFrame(r), dofs = poseDofs(fig, F, autoPose.whole);
+  const all = () => [...fig.parts, ...dofs.filter(d => d.j).map(d => d.j)];
+  const save = () => [fig.root, ...dofs.filter(d => d.j).map(d => d.j)].map(o => [o, o.position.clone(), o.quaternion.clone()]);
+  const load = st => { for (const [o, p, q] of st) { o.position.copy(p); o.quaternion.copy(q); } scene.updateMatrixWorld(true); };
+  const score = () => { scene.updateMatrixWorld(true); if (links.length) solveLinks(null, 8); return overlap(silhouette(r, fig.parts, W, H), target); };
+  let best = score(); const start = best;
+  loading.show('Matching the pose…'); loading.onStop(() => { autoPose.stop = true; });
+  let evals = 0, t0 = performance.now(), pass = 0;
+  const breathe = async (frac, what) => { if (performance.now() - t0 > 60) { loading.set(frac, `${what}: ${Math.round(best * 100)}% covered (from ${Math.round(start * 100)}%) · ${evals} tries`); await nextFrame(); t0 = performance.now(); } };
+  try {
+    // 1. each turning joint, biggest first, swept right round in the picture's plane (gets out of poses that are far off)
+    const sweeps = dofs.filter(d => d.sweep);
+    for (let k = 0; k < sweeps.length && !autoPose.stop; k++) {
+      const d = sweeps[k], st0 = save(); let bestA = 0;
+      for (let a = 15; a < 360; a += 15) {
+        load(st0); d.apply(a * Math.PI / 180); const sc = score(); evals++;
+        if (sc > best + 1e-4) { best = sc; bestA = a; }
+        await breathe(0.3 * (k + a / 360) / sweeps.length, 'Swinging each joint round');
+      }
+      load(st0); if (bestA) d.apply(bestA * Math.PI / 180); scene.updateMatrixWorld(true);
+    }
+    // 2. fine steps, in the plane first; the tilts join once that settles
+    let late = false;
+    for (; pass < 60 && !autoPose.stop; pass++) {
+      let moved = false;
+      for (const d of dofs) {
+        if (d.step < d.min || autoPose.stop || (d.late && !late)) continue;
+        for (const sgn of [1, -1]) {
+          const st = save(); d.apply(sgn * d.step); const sc = score(); evals++;
+          if (sc > best + 1e-4) { best = sc; moved = true; d.lastGood = sgn; break; }
+          load(st);
+        }
+        await breathe(Math.min(0.98, 0.3 + pass / 20), late ? 'Fine-tuning, with tilts' : 'Fine-tuning');
+      }
+      if (!moved) {
+        let any = false; for (const d of dofs) { if (d.late && !late) continue; d.step /= 2; if (d.step >= d.min) any = true; }
+        if (!any) { if (late) break; late = true; }            // the plane has settled: now let limbs tilt toward or away
+      }
+    }
+  } finally {
+    loading.hide(); autoPose.busy = false;
+    if (links.length) solveLinks(null);
+    afterHierarchyChange(); markDirty();
+    const out = $('autopose-out'); if (out) out.textContent = `Outline covers ${Math.round(best * 100)}% of the figure (was ${Math.round(start * 100)}%). Undo puts the old pose back.`;
+    toast(best > start + 0.01 ? `Matched: the outline now covers ${Math.round(best * 100)}% of the figure in the picture (was ${Math.round(start * 100)}%). Check it from the side too.` : "Couldn't improve on this pose. Line the picture up with the figure more closely and try again.", best > start + 0.01 ? 'ok' : 'bad');
+  }
+}
+/** Turn the view square on to a reference (orthographic, framed on it). */
+function lookAtRef(r) {
+  const n = V(0, 0, 1).applyQuaternion(new THREE.Quaternion().fromArray(r.quat)), c = V(...r.pos);
+  setOrtho(true); nav.glide = null;
+  const up = V(0, 1, 0).applyQuaternion(new THREE.Quaternion().fromArray(r.quat));
+  camera.up.copy(Math.abs(up.z) > 0.2 ? V(0, 0, 1) : up); orbit.target.copy(c);
+  camera.position.copy(c).addScaledVector(n, Math.max(sceneScale(), r.w) * 4); camera.lookAt(c); orbit.update();
+  camera.zoom = ORTHO_H * Math.min(1, (camera.right - camera.left) / (camera.top - camera.bottom)) / (Math.max(r.w, r.w * r.aspect) / 2 * 1.08); camera.updateProjectionMatrix();
+  fitClipPlanes(); markViewMoved();
+}
 function updateButtons() {
   $('btn-undo').disabled = !undoStack.length; $('btn-redo').disabled = !redoStack.length;
   const any = liveParts().length > 0;
@@ -2560,6 +3302,8 @@ function updateStats() {
 }
 
 // skeleton: joint to joint lines, drawn every frame
+const linkLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: '#7fd3c4', depthTest: false, transparent: true, opacity: .95 }));
+linkLines.renderOrder = 999; linkLines.frustumCulled = false; scene.add(linkLines);
 function updateSkeleton() {
   const show = $('set-joints').checked, pts = [];
   if (show) for (const j of joints) {
@@ -2570,6 +3314,15 @@ function updateSkeleton() {
     pts.push(b, a);
   }
   skeleton.geometry.setFromPoints(pts);
+  const lp = [];
+  if (show) for (const l of links) {
+    const a = partByUuid(l.a), b = partByUuid(l.b); if (!a || !b || !isVisibleChain(a) || !isVisibleChain(b)) continue;
+    const pa = V(...l.pa).applyMatrix4(a.matrixWorld), pb = V(...l.pb).applyMatrix4(b.matrixWorld), s2 = markerSize() * 1.2;
+    for (const d of [V(s2, 0, 0), V(0, s2, 0), V(0, 0, s2)]) lp.push(pa.clone().sub(d), pa.clone().add(d));
+    if (l.kind === 'rail') { const ax = AXIS_V[l.axis].clone().transformDirection(b.matrixWorld), lo = l.min ?? -s2 * 8, hi = l.max ?? s2 * 8; lp.push(pb.clone().addScaledVector(ax, lo), pb.clone().addScaledVector(ax, hi)); }
+    else if (pa.distanceTo(pb) > 1e-3) lp.push(pa, pb);
+  }
+  linkLines.geometry.setFromPoints(lp);
 }
 
 // ---------------------------------------------------------------------------
@@ -2579,6 +3332,11 @@ function frame(box) {
   if (box.isEmpty()) return;
   const c = box.getCenter(V()), r = Math.max(box.getSize(V()).length() / 2, 5);
   const dir = camera.position.clone().sub(orbit.target).normalize();
+  if (camera.isOrthographicCamera) {                     // no perspective: back off well clear, and zoom so it fits
+    orbit.target.copy(c); camera.position.copy(c).addScaledVector(dir, r * 4);
+    camera.zoom = ORTHO_H * Math.min(1, (camera.right - camera.left) / (camera.top - camera.bottom)) / (r * 1.05);
+    camera.near = r / 100; camera.far = r * 200; camera.updateProjectionMatrix(); orbit.update(); markViewMoved(); return;
+  }
   orbit.target.copy(c); camera.position.copy(c).addScaledVector(dir, r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05);
   camera.near = r / 100; camera.far = r * 200; camera.updateProjectionMatrix();
 }
@@ -2893,97 +3651,185 @@ function openAutorig(opts = {}) {
   const sel = $('ar-root'); sel.innerHTML = '';
   meshes.forEach((m, k) => { const o = document.createElement('option'); o.value = k; o.textContent = m.name; sel.append(o); });
   sel.value = plan.root;
-  const joints = plan.edges.length;
   $('ar-sum').textContent = `${meshes.length} parts · ${pairs.length} contact${pairs.length === 1 ? '' : 's'}`;
   $('ar-note').textContent = !pairs.length
     ? `The files kept their own positions, but no two parts are within ${(+$('ar-tol').value).toFixed(2)} mm of each other. If they should fit together, raise the contact tolerance and detect again.`
-    : `${opts.auto ? 'These files are already in their assembled places, so they kept their positions. ' : ''}Each part hangs off the neighbour it touches most. Check the connections, then build the rig.`;
-  renderAutorigList();
+    : `${opts.auto ? 'These files are already in their assembled places, so they kept their positions. ' : ''}Each part hangs off the neighbour it touches most. Change what anything hangs off, or make parts options of each other (heads, weapons that swap in the same spot): use the menus, or drag a part by its ⋮⋮ onto another part's name to attach it, or onto its right end to make it an option. Then build the rig.`;
+  rowsFromPlan(); renderAutorigList();
   showRigPreview();
-  $('ar-build').disabled = !joints;
   if (opts.auto && pairs.length) toast(`Found ${pairs.length} contact${pairs.length === 1 ? '' : 's'} between ${meshes.length} parts. Review them in Auto-assemble.`, 'ok');
 }
+/* The review is a tree the user can rearrange before anything is built: per part, what it connects to (and how),
+   or which part it's an option of. ar.rows[k] = { parent: index | -1, how: 'joint' | 'plain', optionOf: index | -1, edge } */
+function rowsFromPlan() {
+  ar.rows = ar.meshes.map(() => ({ parent: -1, how: 'joint', optionOf: -1, edge: null }));
+  for (const e of ar.plan.edges) ar.rows[e.child] = { parent: e.parent, how: e.how === 'skip' ? 'joint' : e.how, optionOf: -1, edge: e };
+}
+/** The contact between two parts as a joint (point, axis pointing from parent to child), or null if they don't touch. */
+function edgeBetween(child, parent) {
+  const p = ar.pairs.find(q => (q.i === child && q.j === parent) || (q.j === child && q.i === parent)); if (!p) return null;
+  const pl = planRig([ar.meshes[parent], ar.meshes[child]], [{ ...p, i: p.i === parent ? 0 : 1, j: p.j === parent ? 0 : 1,
+    nOut: { 0: p.nOut[parent], 1: p.nOut[child] }, nCnt: { 0: p.nCnt[parent], 1: p.nCnt[child] } }], 0);
+  const e = pl.edges[0]; return e ? { pair: p, joint: e.joint, axis: e.axis, kind: e.kind, how: e.how } : null;
+}
+const arTarget = k => { let t = k, n = 0; while (ar.rows[t].optionOf >= 0 && n++ < 64) t = ar.rows[t].optionOf; return t; };     // the part an option stands in for
+/** Where a part really hangs: an option hangs wherever the part it stands in for does. */
+const arParent = k => ar.rows[arTarget(k)].parent;
+function arBelow(k, anc) { let p = arParent(k), n = 0; while (p >= 0 && n++ < 64) { if (p === anc) return true; p = arParent(p); } return false; }
+function arCan(src, dst, zone) {
+  if (src === dst) return false;
+  if (zone === 'loose') return ar.rows[src].parent >= 0 || ar.rows[src].optionOf >= 0;
+  if (dst < 0 || arBelow(dst, src)) return false;                      // never under its own branch
+  if (zone === 'attach') return !(ar.rows[src].parent === dst && ar.rows[src].optionOf < 0) && arTarget(dst) !== src;
+  return arTarget(dst) !== arTarget(src) || ar.rows[src].optionOf < 0 && arTarget(dst) !== src;
+}
+function arSet(src, dst, zone) {
+  const r = ar.rows[src];
+  if (zone === 'loose') Object.assign(r, { parent: -1, optionOf: -1, edge: null });
+  else if (zone === 'attach') { const e = edgeBetween(src, dst); Object.assign(r, { parent: dst, optionOf: -1, edge: e, how: e ? e.how : 'plain' }); }
+  else { r.optionOf = arTarget(dst); for (const o of ar.rows) if (o.optionOf === src) o.optionOf = r.optionOf; }   // its own options join the same group
+  renderAutorigList(); showRigPreview();
+}
+/** The links the review will build, for the preview and for Build. */
+function arEdges() {
+  return ar.rows.map((r, k) => {
+    if (r.optionOf >= 0 || r.parent < 0) return null;
+    const e = r.edge || edgeBetween(k, r.parent);
+    return { child: k, parent: r.parent, how: e ? r.how : 'plain', joint: e ? e.joint : partBox(ar.meshes[k]).getCenter(V()), axis: e ? e.axis : V(0, 0, 1), kind: e ? e.kind : 'none', pair: e?.pair || null };
+  }).filter(Boolean);
+}
 function renderAutorigList() {
-  const { meshes, plan } = ar, box = $('ar-list'); box.innerHTML = '';
-  for (const [k, e] of plan.edges.entries()) {
-    const row = document.createElement('div'); row.className = 'ar-row' + (e.how === 'skip' ? ' skip' : ''); row.setAttribute('role', 'listitem');
+  const { meshes, rows } = ar, box = $('ar-list'); box.innerHTML = '';
+  const names = meshes.map(m => m.name);
+  const pick = (label, value, opts, onChange, title) => {
+    const s = document.createElement('select'); s.className = 'num ar-pick'; s.setAttribute('aria-label', label); s.title = title;
+    for (const [v, t, dis] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; o.disabled = !!dis; s.append(o); }
+    s.value = String(value); s.addEventListener('change', () => onChange(+s.value)); return s;
+  };
+  const draw = (k, depth, asOption) => {
+    const r = rows[k], m = meshes[k], e = r.optionOf < 0 && r.parent >= 0 ? (r.edge || edgeBetween(k, r.parent)) : null;
+    const row = document.createElement('div'); row.className = 'ar-row dnd-row' + (asOption ? ' is-option' : '') + (r.parent < 0 && r.optionOf < 0 ? ' is-root' : '');
+    row.setAttribute('role', 'treeitem'); row.setAttribute('aria-level', String(depth + 1)); row.draggable = true; row._key = k; row.style.paddingLeft = (6 + depth * 14) + 'px';
     const who = document.createElement('div'); who.className = 'who';
-    const c = document.createElement('b'), arw = document.createElement('span'), pr = document.createElement('b');
-    c.textContent = meshes[e.child].name; arw.className = 'arrow'; arw.textContent = '→'; pr.textContent = meshes[e.parent].name;
-    who.append(c, arw, pr); who.title = `${meshes[e.child].name} attaches to ${meshes[e.parent].name}`;
-    const meta = document.createElement('div'); meta.className = 'meta';
-    const kd = document.createElement('span'); kd.className = 'kind ' + e.kind; kd.textContent = KIND_LABEL[e.kind] || e.kind;
-    const info = document.createElement('span');
-    info.textContent = e.kind === 'ball' && e.pair.radius ? `⌀${(e.pair.radius * 2).toFixed(2)} mm` : `≈${e.pair.area.toFixed(e.pair.area < 10 ? 1 : 0)} mm² contact`;
-    meta.append(kd, info);
-    const seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${meshes[e.child].name} attaches`);
-    for (const [v, t, tip] of [['joint', 'Joint', 'Rotates around this point in Pose'], ['plain', 'Fixed', 'Follows its parent, no joint'], ['skip', 'Skip', 'Leave it unattached']]) {
-      const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.title = tip; b.setAttribute('aria-pressed', e.how === v ? 'true' : 'false');
-      b.addEventListener('click', () => { e.how = v; renderAutorigList(); showRigPreview(); });
-      seg.append(b);
+    const grip = document.createElement('span'); grip.className = 'grip'; grip.textContent = '⋮⋮'; grip.title = 'Drag onto another part: on its name to attach, on its right end to make it an option';
+    const nm = document.createElement('b'); nm.textContent = m.name;
+    who.append(grip, ...(asOption ? [Object.assign(document.createElement('span'), { className: 'opt-mark', textContent: '⇄', title: `An option for ${names[r.optionOf]}` })] : depth ? [Object.assign(document.createElement('span'), { className: 'arrow', textContent: e && r.how === 'joint' ? '◆' : '└' })] : []), nm);
+    row.append(who);
+    if (!asOption && r.parent >= 0) {           // how it attaches
+      const seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${m.name} attaches`);
+      for (const [v, t, tip] of [['joint', 'Pinned', 'Turns any way about where they touch (set Hinge or Roller in Properties after building)'], ['plain', 'Fixed', 'Follows its parent, no joint']]) {
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.title = v === 'joint' && !e ? `${m.name} doesn't touch ${names[r.parent]}, so there's nowhere to put a joint` : tip;
+        b.disabled = v === 'joint' && !e; b.setAttribute('aria-pressed', (e ? r.how : 'plain') === v ? 'true' : 'false');
+        b.addEventListener('click', () => { r.how = v; renderAutorigList(); showRigPreview(); }); seg.append(b);
+      }
+      row.append(seg);
     }
-    row.append(who, seg, meta);
-    row.addEventListener('mouseenter', () => showRigPreview(k));
-    row.addEventListener('mouseleave', () => showRigPreview());
-    row.addEventListener('dblclick', () => { const b = sceneBox([meshes[e.child], meshes[e.parent]]); frame(b); });
+    const meta = document.createElement('div'); meta.className = 'meta';
+    if (asOption) {
+      meta.append('option of', pick(`What ${m.name} is an option of`, r.optionOf, [[-1, '— not an option'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => arSet(k, v, v < 0 ? 'loose' : 'option'), 'Options swap for each other in the same spot'));
+    } else {
+      meta.append(depth ? 'on' : 'base', pick(`What ${m.name} attaches to`, r.parent, [[-1, depth ? '— nothing (leave loose)' : '— nothing'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'attach') && r.parent !== j])], v => arSet(k, v, v < 0 ? 'loose' : 'attach'), 'The part it hangs off'));
+      meta.append(pick(`Make ${m.name} an option of another part`, -1, [[-1, '⇄ option of…'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => { if (v >= 0) arSet(k, v, 'option'); }, 'Make it an alternative for another part in the same spot (a head, a weapon…)'));
+      if (r.parent >= 0) { const kd = document.createElement('span'); kd.className = 'kind ' + (e ? e.kind : 'none');
+        kd.textContent = e ? (KIND_LABEL[e.kind] || e.kind) + (e.kind === 'ball' && e.pair.radius ? ` ⌀${(e.pair.radius * 2).toFixed(2)}` : ` ≈${e.pair.area.toFixed(e.pair.area < 10 ? 1 : 0)} mm²`) : 'not touching'; meta.append(kd); }
+    }
+    row.append(meta);
+    row.addEventListener('mouseenter', () => showRigPreview(k)); row.addEventListener('mouseleave', () => showRigPreview());
+    row.addEventListener('dblclick', ev => { if (ev.target.closest('select, button')) return; frame(sceneBox([m, ...(r.parent >= 0 ? [meshes[r.parent]] : [])])); });
     box.append(row);
-  }
-  if (!plan.edges.length) box.innerHTML = '<div class="empty">No connections found.</div>';
+    rows.forEach((o, j) => { if (o.optionOf === k) draw(j, depth + 1, true); });
+    rows.forEach((o, j) => { if (o.optionOf < 0 && o.parent === k) draw(j, depth + 1, false); });
+  };
+  rows.forEach((r, k) => { if (r.parent < 0 && r.optionOf < 0) draw(k, 0, false); });
+  const edges = arEdges(), nOpt = rows.filter(r => r.optionOf >= 0).length, roots = rows.filter(r => r.parent < 0 && r.optionOf < 0).length;
   const extra = [];
-  if (plan.loose.length) extra.push(`Not touching anything: ${plan.loose.map(k => meshes[k].name).join(', ')}.`);
-  if (plan.roots.length - plan.loose.length > 1) extra.push(`${plan.roots.length - plan.loose.length} separate groups; each gets its own root.`);
-  if (plan.loops.length) extra.push(`${plan.loops.length} weaker contact${plan.loops.length > 1 ? 's' : ''} left out, since each part has one parent.`);
+  if (roots > 1) extra.push(`${roots} separate bases: drag one onto another part to join them up.`);
   $('ar-extra').textContent = extra.join(' ');
-  const n = plan.edges.filter(e => e.how !== 'skip').length;
-  $('ar-build').textContent = n ? `Build rig (${n} link${n > 1 ? 's' : ''})` : 'Build rig';
-  $('ar-build').disabled = !n;
+  // contacts the tree leaves out (each part has one parent): a piston's far end, a linkage. Tick to pin them too.
+  const used = new Set(edges.map(e => e.pair).filter(Boolean)), isOpt = k => rows[k].optionOf >= 0 || rows.some(o => o.optionOf === k);
+  const loops = ar.pairs.filter(q => !used.has(q) && !isOpt(q.i) && !isOpt(q.j));
+  ar.loopOn ||= new Set(); for (const q of [...ar.loopOn]) if (!loops.includes(q)) ar.loopOn.delete(q);
+  if (loops.length) {
+    const hd = document.createElement('div'); hd.className = 'ar-loops-h'; hd.textContent = 'Also connect (pistons, linkages)';
+    hd.title = 'These parts touch, but each part has only one parent, so the tree leaves the contact out. Tick it to pin them together as well: posing then moves the pistons to keep it connected.';
+    box.append(hd);
+    for (const q of loops) {
+      const lab = document.createElement('label'); lab.className = 'ar-loop';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = ar.loopOn.has(q);
+      cb.addEventListener('change', () => { if (cb.checked) ar.loopOn.add(q); else ar.loopOn.delete(q); renderAutorigList(); });
+      lab.append(cb, ` ${meshes[q.i].name} ↔ ${meshes[q.j].name}`, Object.assign(document.createElement('small'), { textContent: ` · ${KIND_LABEL[q.kind] || q.kind} ≈${q.area.toFixed(q.area < 10 ? 1 : 0)} mm²` }));
+      lab.addEventListener('mouseenter', () => { paintSelection(); meshes[q.i].material.emissive.set('#0d2f3d'); meshes[q.j].material.emissive.set('#3d200f'); });
+      lab.addEventListener('mouseleave', () => paintSelection());
+      box.append(lab);
+    }
+  }
+  const n = edges.length;
+  $('ar-build').textContent = n || nOpt ? `Build rig (${[n ? `${n} link${n > 1 ? 's' : ''}` : '', nOpt ? `${nOpt} option${nOpt > 1 ? 's' : ''}` : ''].filter(Boolean).join(', ')})` : 'Build rig';
+  $('ar-build').disabled = !n && !nOpt;
 }
 function showRigPreview(hot = -1) {
   while (rigPreview.children.length) { const c = rigPreview.children.pop(); c.geometry?.dispose(); }
-  if ($('autorig').hidden || !ar.plan) return;
-  const { meshes, plan } = ar, sz = markerSize() * 1.6, pts = [], hotPts = [];
-  plan.edges.forEach((e, k) => {
-    if (e.how === 'skip') return;
-    const pc = partBox(meshes[e.parent]).getCenter(V()), cc = partBox(meshes[e.child]).getCenter(V());
-    (k === hot ? hotPts : pts).push(pc, e.joint, e.joint, cc);
-    const m = new THREE.Mesh(new THREE.SphereGeometry(sz * (k === hot ? 1.6 : 1), 16, 10),
+  if ($('autorig').hidden || !ar.rows) return;
+  const { meshes } = ar, sz = markerSize() * 1.6, pts = [], hotPts = [], optPts = [];
+  for (const e of arEdges()) {
+    const pc = partBox(meshes[e.parent]).getCenter(V()), cc = partBox(meshes[e.child]).getCenter(V()), isHot = e.child === hot || e.parent === hot && false;
+    (isHot ? hotPts : pts).push(pc, e.joint, e.joint, cc);
+    if (e.kind === 'none') continue;
+    const m = new THREE.Mesh(new THREE.SphereGeometry(sz * (isHot ? 1.6 : 1), 16, 10),
       new THREE.MeshBasicMaterial({ color: e.how === 'plain' ? '#8d969e' : '#d6a24a', depthTest: false, transparent: true, opacity: .95 }));
     m.position.copy(e.joint); m.renderOrder = 999; rigPreview.add(m);
     const ax = new THREE.Line(new THREE.BufferGeometry().setFromPoints([e.joint, e.joint.clone().addScaledVector(e.axis, sz * 6)]),
       new THREE.LineBasicMaterial({ color: '#f1d08f', depthTest: false })); ax.renderOrder = 999; rigPreview.add(ax);
-  });
-  for (const [list, color, op] of [[pts, '#d6a24a', .55], [hotPts, '#ffe066', 1]]) {
+  }
+  ar.rows.forEach((r, k) => { if (r.optionOf >= 0) optPts.push(partBox(meshes[k]).getCenter(V()), partBox(meshes[r.optionOf]).getCenter(V())); });
+  for (const [list, color, op] of [[pts, '#d6a24a', .55], [hotPts, '#ffe066', 1], [optPts, '#7fb6d6', .9]]) {
     if (!list.length) continue;
     const l = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(list), new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: op }));
     l.renderOrder = 998; rigPreview.add(l);
   }
   paintSelection();
-  if (hot >= 0) { const e = plan.edges[hot]; meshes[e.child].material.emissive.set('#0d2f3d'); meshes[e.parent].material.emissive.set('#3d200f'); }
+  if (hot >= 0) { meshes[hot].material.emissive.set('#0d2f3d'); const r = ar.rows[hot], p = r.optionOf >= 0 ? r.optionOf : r.parent; if (p >= 0) meshes[p].material.emissive.set('#3d200f'); }
 }
 function closeAutorig(clear = true) {
   $('autorig').hidden = true; showRigPreview();
   paintSelection();
-  if (clear) { ar.plan = null; ar.meshes = []; ar.pairs = []; }
+  if (clear) { ar.plan = null; ar.meshes = []; ar.pairs = []; ar.rows = null; ar.loopOn = null; }
 }
 function buildRig() {
-  const { meshes, plan } = ar; if (!plan) return;
+  const { meshes, rows } = ar; if (!rows) return;
   pushUndo(); lastOp = null;
-  let joints = 0, fixed = 0; const warns = [];
-  for (const e of plan.edges) {
-    if (e.how === 'skip') continue;
+  let joints = 0, fixed = 0, nOpt = 0; const warns = [];
+  for (const e of arEdges()) {
     const w = attach(meshes[e.child], meshes[e.parent], e.how, e.joint, e.axis);
     if (w) warns.push(w); else if (e.how === 'joint') joints++; else fixed++;
   }
-  const root = meshes[plan.root];
-  closeAutorig(); afterHierarchyChange(); select(root);
+  // options: each part an option stands in for, with its alternatives, becomes a slot; they share its joint
+  const groups = new Map(); rows.forEach((r, k) => { if (r.optionOf >= 0) { const t = arTarget(k); if (!groups.has(t)) groups.set(t, []); groups.get(t).push(k); } });
+  for (const [t, ks] of groups) {
+    const main = meshes[t], alts = ks.map(k => meshes[k]);
+    for (const sl of options.slots) sl.members = sl.members.filter(id => !alts.some(m => m.uuid === id));
+    let sl = slotOf(main);
+    if (!sl) { const cn = commonName([main.name, ...alts.map(m => m.name)]); sl = { id: uid(), name: /^Slot \d+$/.test(cn) ? `${main.name} options` : cn, members: [main.uuid], active: main.uuid }; options.slots.push(sl); }
+    sl.members.push(...alts.map(m => m.uuid)); nOpt += alts.length;
+    shareSlotJoint(sl, main);
+  }
+  if (groups.size) applyOptions();
+  let nLinks = 0;
+  for (const q of ar.loopOn || []) {                   // extra pins where the tree left a contact out
+    const a = meshes[q.i], b2 = meshes[q.j], pt = V().copy(q.centre || q.joint); a.updateMatrixWorld(true); b2.updateMatrixWorld(true);
+    links.push({ id: uid(), a: a.uuid, b: b2.uuid, pa: pt.clone().applyMatrix4(a.matrixWorld.clone().invert()).toArray(), pb: pt.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray(), kind: 'pin', axis: 'z', min: null, max: null });
+    nLinks++;
+  }
+  const base = meshes[rows.findIndex(r => r.parent < 0 && r.optionOf < 0)] || meshes[0];
+  closeAutorig(); afterHierarchyChange(); select(base);
   if (warns.length) toast(warns[0], 'bad');
-  else toast(`Built the rig from ${root.name}: ${joints} joint${joints === 1 ? '' : 's'}${fixed ? `, ${fixed} fixed` : ''}. Press P to pose.`, 'ok');
+  else toast(`Built the rig from ${base.name}: ${joints} joint${joints === 1 ? '' : 's'}${fixed ? `, ${fixed} fixed` : ''}${nOpt ? `, ${groups.size} option slot${groups.size > 1 ? 's' : ''}` : ''}${nLinks ? `, ${nLinks} extra pin${nLinks > 1 ? 's' : ''}` : ''}. Press P to pose.`, 'ok');
 }
 function bindAutorig() {
   $('ar-root').addEventListener('change', () => {
-    const keep = new Map(ar.plan.edges.map(e => [e.pair, e.how]));
-    ar.plan = planRig(ar.meshes, ar.pairs, +$('ar-root').value);
-    ar.plan.edges.forEach(e => { if (keep.has(e.pair) && keep.get(e.pair) === 'skip') e.how = 'skip'; });
+    const opts = ar.rows.map(r => r.optionOf);                     // keep the options; re-plan the links from the new base
+    ar.plan = planRig(ar.meshes, ar.pairs, +$('ar-root').value); rowsFromPlan();
+    opts.forEach((o, k) => { if (o >= 0) ar.rows[k].optionOf = o; });
     renderAutorigList(); showRigPreview();
   });
   $('ar-detect').addEventListener('click', () => runAutorig(ar.meshes.filter(m => m.parent)));
@@ -3368,6 +4214,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   }
   const hit = raycast(e);
   if (tool === 'MAGNET') { handleMagnetClick(hit); return; }
+  if (tool === 'LUCKY') { handleLuckyClick(hit); return; }
   if (SNAP_STEPS[tool]) {                          // measuring a big surface can take a moment: let the message paint first
     const ev = { shiftKey: e.shiftKey };
     if (hit && hit.object.userData.part.tris > 150000) { toast('Measuring surface…'); setTimeout(() => handlePick(ev, hit), 30); }
@@ -3398,6 +4245,13 @@ renderer.domElement.addEventListener('wheel', e => {
   let dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
   dy = Math.max(-200, Math.min(200, dy));
   if (!dy) return;
+  if (camera.isOrthographicCamera) {                              // orthographic: zoom is a scale; keep the spot under the cursor still
+    const r = renderer.domElement.getBoundingClientRect(), nx = ((e.clientX - r.left) / r.width) * 2 - 1, ny = -((e.clientY - r.top) / r.height) * 2 + 1;
+    const z0 = camera.zoom, z1 = Math.min(Math.max(z0 * Math.exp(-dy * 0.0018), 1e-3), 1e5), k = 1 / z0 - 1 / z1;
+    const right = V(1, 0, 0).applyQuaternion(camera.quaternion), upv = V(0, 1, 0).applyQuaternion(camera.quaternion);
+    const shift = right.multiplyScalar(nx * (camera.right - camera.left) / 2 * k).add(upv.multiplyScalar(ny * (camera.top - camera.bottom) / 2 * k));
+    camera.position.add(shift); orbit.target.add(shift); camera.zoom = z1; camera.updateProjectionMatrix(); orbit.update(); markViewMoved(); return;
+  }
   const hit = raycast(e), dir = raycaster.ray.direction.clone(), f = fwd();
   const S = sceneScale(), minD = S * 0.002, airD = S * 0.03;     // over empty space never crawl slower than this
   const d = hit ? hit.distance : Math.max(camera.position.distanceTo(orbit.target), airD);
@@ -3452,11 +4306,33 @@ function stepGlide() {                                            // called ever
   if (g.to.length() < sceneScale() * 1e-4) { nav.glide = null; markViewMoved(); }
 }
 function fitClipPlanes() {                                        // near plane follows the camera so close-ups don't get cut away
+  if (camera.isOrthographicCamera) {
+    const S = Math.max(sceneScale(), mat.children.length ? Math.hypot(MAT.w, MAT.h) : 0), d0 = camera.position.distanceTo(orbit.target);
+    if (d0 < S * 2) camera.position.copy(orbit.target).addScaledVector(fwd(), -S * 3);
+    const d = camera.position.distanceTo(orbit.target), near = Math.max(0.01, d - S * 2.5), far = d + S * 20;
+    if (Math.abs(near - camera.near) > near * 0.05 || Math.abs(far - camera.far) > far * 0.05) { camera.near = near; camera.far = far; camera.updateProjectionMatrix(); }
+    return;
+  }
   const d = camera.position.distanceTo(orbit.target), S = Math.max(sceneScale(), mat.children.length ? Math.hypot(MAT.w, MAT.h) : 0);
   const near = Math.max(0.005, Math.min(d * 0.02, S * 0.01)), far = Math.max(S * 20, d * 20, 500);
   if (Math.abs(near - camera.near) > near * 0.05 || Math.abs(far - camera.far) > far * 0.05) { camera.near = near; camera.far = far; camera.updateProjectionMatrix(); }
 }
 function markViewMoved() { orbit.dispatchEvent({ type: 'end' }); }
+/** Switch between perspective and orthographic, keeping the view the same size. */
+function setOrtho(on) {
+  if (!!on === camera.isOrthographicCamera) return;
+  const t = orbit.target.clone(), f = fwd(), d = camera.position.distanceTo(t), halfFov = perspCam.fov * Math.PI / 360;
+  if (on) {
+    orthoCam.quaternion.copy(perspCam.quaternion); orthoCam.position.copy(t).addScaledVector(f, -Math.max(d, sceneScale() * 3));
+    orthoCam.zoom = ORTHO_H / Math.max(d * Math.tan(halfFov), 1e-3); camera = orthoCam;
+  } else {
+    perspCam.quaternion.copy(orthoCam.quaternion); perspCam.position.copy(t).addScaledVector(f, -(ORTHO_H / orthoCam.zoom) / Math.tan(halfFov)); camera = perspCam;
+  }
+  camera.add(sun); orbit.object = camera; tc.camera = camera;
+  resize(); camera.updateProjectionMatrix(); fitClipPlanes(); orbit.update(); markViewMoved();
+  $('nav-proj').textContent = on ? 'Ortho' : 'Persp'; $('nav-proj').setAttribute('aria-pressed', String(!!on));
+  $('menu-ortho')?.setAttribute('aria-checked', String(!!on));
+}
 
 // Colour tool: drag on a part to paint (a drag off the parts still turns the view), Alt-click picks up a colour
 const brushRing = new THREE.Mesh(new THREE.RingGeometry(0.86, 1, 48), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9, depthTest: false }));
@@ -3618,12 +4494,15 @@ view.addEventListener('drop', e => { e.preventDefault(); hideDrop(); const fs = 
   const dir = entries.find(en => en.isDirectory);
   if (dir) { readDropped(entries).then(list => openFolder(list, dir.name)).catch(() => toast("Couldn't read that folder.", 'bad')); return; }
   const proj = fs.find(f => /\.zip$/i.test(f.name)); if (proj) { openProjectFile(proj); return; }
-  if (fs.length) importFiles(fs); });
+  const pics = fs.filter(f => /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name));
+  (async () => { for (const f of pics) await addRefImage(f); })();
+  const rest = fs.filter(f => !pics.includes(f)); if (rest.length) importFiles(rest); });
 ['drop', 'dragend'].forEach(t => window.addEventListener(t, hideDrop));
 window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });   // stop the browser opening a missed drop as a file
 
 window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && document.querySelector('.mtop[aria-expanded="true"]')) { e.preventDefault(); closeMenus(); return; }
+  if (loading.on) { if (e.key === 'Escape' && loading.stop) { e.preventDefault(); loading.stop(); } return; }     // nothing else while it works
   if (e.key === 'Escape' && closeDialogs()) { e.preventDefault(); return; }
   if (!$('linkask').hidden) {            // the "bring the group?" question is up: its buttons take Enter, Esc dismisses it
     if (e.key === 'Escape') { e.preventDefault(); closeLinkAsk(null); return; }
@@ -3635,19 +4514,23 @@ window.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && k === 'y') { e.preventDefault(); redo(); return; }
   if ((e.ctrlKey || e.metaKey) && k === 'a') { e.preventDefault(); selectMany(liveParts().filter(isVisibleChain)); toast(`Selected all ${selection.length} parts.`); return; }
   // number pad views, like Blender: 1 front, 3 right, 7 top; with Ctrl the opposite side
+  if (e.code === 'Numpad5') { e.preventDefault(); setOrtho(!camera.isOrthographicCamera); toast(camera.isOrthographicCamera ? 'Orthographic view: no perspective, so things line up with references.' : 'Perspective view.'); return; }
   const pad = { Numpad1: V(0, -1, 0), Numpad3: V(1, 0, 0), Numpad7: V(0, 0, 1) }[e.code];
   if (pad) { e.preventDefault(); navCube.goTo(e.ctrlKey || e.metaKey ? pad.negate() : pad); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const map = { '1': 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', b: 'BALL', h: 'PLANE', m: 'MID', t: 'THREE', j: 'MATCH', c: 'paint', n: 'MAGNET' };
+  const map = { '1': 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', b: 'BALL', h: 'PLANE', m: 'MID', t: 'THREE', j: 'MATCH', c: 'paint', n: 'MAGNET', l: 'LUCKY' };
   if (k === 'e' && tool === 'paint') { const c = $('paint-erase'); c.checked = !c.checked; toast(c.checked ? 'Erasing back to bare plastic.' : 'Painting.'); return; }
   if (map[k]) { setTool(map[k]); return; }
   if (k === 'escape' && benchSel) { select(null); syncGizmo(); renderPartPanel(); return; }
   if (k === 'escape' && magPending) { magPending = null; rebuildMagnets(); updateStep(); toast('Cancelled that magnet.'); return; }
   if (k === 'escape') { if (!$('orient').hidden) { closeOrient(); return; } if (picks.length) cancelPick(); else if (tool === 'select' && selection.length) select(null); else setTool('select'); return; }
   if (k === 'enter' && tool === 'MATCH' && picks.length) { e.preventDefault(); applyMatch(); return; }
+  if (k === 'enter' && tool === 'LUCKY' && !luckyFirst && selection.length === 2) { e.preventDefault(); feelLucky(selection[0], selection[1]); return; }
+  if (k === 'escape' && luckyFirst) { luckyFirst = null; updateStep(); toast('Cancelled.'); return; }
   if (k === 'backspace' && picks.length) { e.preventDefault(); picks.pop(); rebuildPickFx(); updateStep(); return; }
   if ((k === 'delete' || k === 'x') && benchSel) {
-    if (benchSel.kind === 'sprue') removeSprue(benchSel.k);
+    if (benchSel.kind === 'ref') removeRef(benchSel.k);
+    else if (benchSel.kind === 'sprue') removeSprue(benchSel.k);
     else putAway(benchSel.kind === 'book' ? 'book' : 'box');
     return;
   }
@@ -3663,7 +4546,7 @@ function rebuildPickFx() {
 // ---------------------------------------------------------------------------
 // Projects: autosave to this browser (IndexedDB) and project files (.zip)
 // ---------------------------------------------------------------------------
-const SETTING_IDS = ['set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
+const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
 const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
 let idb = null;
 const idbReady = new Promise(res => {
@@ -3691,9 +4574,12 @@ function serializeProject() {
     format: 'kitbash-bench', version: 1, id: project.id, name: project.name, updated: Date.now(),
     parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
       geom: m.userData.part.geomKey, tris: m.userData.part.tris, parent: parentId(m), ...tr(m) })),
-    joints: joints.filter(j => j.parent).map(j => ({ id: j.uuid, parent: parentId(j), size: j.userData.joint.size, rest: j.userData.joint.rest.toArray(), ...tr(j) })),
+    joints: joints.filter(j => j.parent).map(j => { const jd = j.userData.joint; return { id: j.uuid, parent: parentId(j), size: jd.size, rest: jd.rest.toArray(),
+      type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, ...tr(j) }; }),
+    links: JSON.parse(JSON.stringify(links)),
+    refs: JSON.parse(JSON.stringify(refs)),
     settings: Object.fromEntries(SETTING_IDS.map(id => [id, $(id).type === 'checkbox' ? $(id).checked : $(id).value])),
-    camera: { pos: camera.position.toArray(), target: orbit.target.toArray() },
+    camera: { pos: camera.position.toArray(), target: orbit.target.toArray(), ortho: camera.isOrthographicCamera, zoom: camera.zoom },
     options: JSON.parse(JSON.stringify(options)),
     sprues: sprues ? JSON.parse(JSON.stringify(sprues)) : null,
     kit: kit ? JSON.parse(JSON.stringify(kit)) : null,
@@ -3730,7 +4616,8 @@ function buildProject(data, geoms, paints = new Map()) {
     if (pb && pb.byteLength === g.attributes.position.count * 4) { pt.paint = new Uint8Array(pb.slice(0)); pt.paintVer = pt.paintSaved = 1; }
     refreshPaint(m);
   }
-  for (const j of data.joints || []) { const o = makeJoint(j.size || 0.5); o.uuid = j.id; o.userData.joint.rest.fromArray(j.rest); byId.set(j.id, o); }
+  for (const j of data.joints || []) { const o = makeJoint(j.size || 0.5); o.uuid = j.id; const jd = o.userData.joint; jd.rest.fromArray(j.rest);
+    Object.assign(jd, { type: j.type || 'pinned', min: j.min ?? null, max: j.max ?? null, axis: j.axis || null }); jd.restPos.fromArray(j.restPos || j.pos); byId.set(j.id, o); }
   const place = (o, rec) => { (rec.parent && byId.get(rec.parent) || world).add(o); o.position.fromArray(rec.pos); o.quaternion.fromArray(rec.quat); o.scale.fromArray(rec.scale); };
   for (const j of data.joints || []) place(byId.get(j.id), j);
   for (const p of data.parts) if (byId.has(p.id)) place(byId.get(p.id), p);
@@ -3738,11 +4625,14 @@ function buildProject(data, geoms, paints = new Map()) {
   options = data.options ? JSON.parse(JSON.stringify(data.options)) : { slots: [], sets: [] }; applyOptions();
   sprues = data.sprues ? JSON.parse(JSON.stringify(data.sprues)) : null;
   magnets = Array.isArray(data.magnets) ? JSON.parse(JSON.stringify(data.magnets)) : [];
+  links = Array.isArray(data.links) ? JSON.parse(JSON.stringify(data.links)) : [];
+  refs = Array.isArray(data.refs) ? JSON.parse(JSON.stringify(data.refs)) : []; rebuildRefs();
   kit = data.kit ? JSON.parse(JSON.stringify(data.kit)) : null; book.doc = null; buildKit().then(() => fitMat(true));
   applyPlastic();
   project.id = data.id; project.name = data.name || 'Untitled kit'; $('proj-name').value = project.name;
   project.saved = new Set(data.parts.map(p => p.geom));
-  if (data.camera) { camera.position.fromArray(data.camera.pos); orbit.target.fromArray(data.camera.target); orbit.update(); }
+  if (data.camera) { setOrtho(false); camera.position.fromArray(data.camera.pos); orbit.target.fromArray(data.camera.target); orbit.update();
+    if (data.camera.ortho) { setOrtho(true); if (data.camera.zoom) { camera.zoom = data.camera.zoom; camera.updateProjectionMatrix(); } } }
   afterHierarchyChange(); updateButtons();
   project.loading = false; project.dirty = false; project.pristine = false;
   if (missing.length) toast(`Couldn't find the mesh for ${missing.join(', ')}.`, 'bad');
@@ -3751,13 +4641,15 @@ function buildProject(data, geoms, paints = new Map()) {
 function markDirty() {
   if (project.loading) return;
   project.pristine = false;
-  project.dirty = true; setProjStatus('unsaved', 'busy');
+  project.dirty = true; project.ver = (project.ver || 0) + 1; setProjStatus('unsaved', 'busy');
   clearTimeout(project.timer); project.timer = setTimeout(saveToBrowser, 1200);
 }
 async function saveToBrowser() {
-  if (project.saving) { project.timer = setTimeout(saveToBrowser, 600); return; }
+  // a save already running: wait for it, then save whatever changed while it ran (switching projects relies on this)
+  if (project.saving) { await project.saving; if (project.dirty) return saveToBrowser(); return; }
   if (!(await idbReady)) { setProjStatus('not saved', 'bad'); $('proj-note').textContent = "This browser isn't letting the page store data (a private window, or site data blocked). Use Save project file to keep your work."; return; }
-  project.saving = true; setProjStatus('saving…', 'busy');
+  let finished; project.saving = new Promise(r => { finished = r; }); setProjStatus('saving…', 'busy');
+  const ver = project.ver || 0;
   try {
     const data = serializeProject();
     for (const m of liveParts()) {                         // meshes never change after import, so each is stored once
@@ -3768,19 +4660,20 @@ async function saveToBrowser() {
       const pt = m.userData.part; if (!pt.paint || pt.paintSaved === pt.paintVer) continue;
       await idbReq('geoms', 'readwrite', st => st.put(pt.paint.slice().buffer, 'paint:' + m.uuid)); pt.paintSaved = pt.paintVer;
     }
-    for (const k of [kit?.image, kit?.pdf].filter(Boolean)) {   // box art and instructions, stored once like meshes
+    for (const k of [kit?.image, kit?.pdf, ...refs.map(r => r.asset)].filter(Boolean)) {   // box art, instructions and reference pictures, stored once like meshes
       if (project.saved.has(k) || !assets.has(k)) continue;
       await idbReq('geoms', 'readwrite', st => st.put(assets.get(k), k)); project.saved.add(k);
     }
     await idbReq('projects', 'readwrite', st => st.put(data));
-    project.dirty = false;
-    setProjStatus(`saved ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`, 'ok');
+    if ((project.ver || 0) === ver) project.dirty = false;            // changed while saving: the timer saves again
+    else { clearTimeout(project.timer); project.timer = setTimeout(saveToBrowser, 400); }
+    if (!project.dirty) setProjStatus(`saved ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`, 'ok');
     try { localStorage.setItem('kitbash-last', project.id); } catch (e) {}
     if (!$('dlg-projects').hidden) renderProjectList();
   } catch (e) {
     setProjStatus('not saved', 'bad');
     $('proj-note').textContent = /quota/i.test(e?.name || e?.message || '') ? "Browser storage is full. Delete old saved projects, or use Save project file." : `Couldn't save in this browser (${e?.message || 'storage error'}). Use Save project file to keep your work.`;
-  } finally { project.saving = false; }
+  } finally { project.saving = null; finished(); }
 }
 async function listProjects() {
   if (!(await idbReady)) return [];
@@ -3792,7 +4685,7 @@ async function openSaved(id) {
     const data = await idbReq('projects', 'readonly', st => st.get(id)); if (!data) throw new Error('not found');
     const geoms = new Map();
     for (const k of new Set(data.parts.map(p => p.geom))) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) geoms.set(k, rec); }
-    for (const k of [data.kit?.image, data.kit?.pdf].filter(Boolean)) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) assets.set(k, rec); }
+    for (const k of [data.kit?.image, data.kit?.pdf, ...(data.refs || []).map(r => r.asset)].filter(Boolean)) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) assets.set(k, rec); }
     const paints = new Map();
     for (const p of data.parts) if (p.paint) { const rec = await idbReq('geoms', 'readonly', st => st.get('paint:' + p.id)); if (rec) paints.set(p.id, rec); }
     buildProject(data, geoms, paints); frame(sceneBox());
@@ -3850,7 +4743,7 @@ async function saveProjectFile() {
   for (const m of liveParts()) { const k = m.userData.part.geomKey; if (seen.has(k)) continue; seen.add(k);
     const { pos, idx } = geomBuffers(m), head = new Uint32Array([pos.byteLength, idx.byteLength]);
     files.push({ name: `meshes/${k}.bin`, data: new Blob([head, pos, idx]) }); }
-  for (const k of [kit?.image, kit?.pdf].filter(Boolean)) { const a = assets.get(k); if (a) files.push({ name: `assets/${k.slice(6)}`, data: new Blob([a.data]) }); }
+  for (const k of [kit?.image, kit?.pdf, ...refs.map(r => r.asset)].filter(Boolean)) { const a = assets.get(k); if (a) files.push({ name: `assets/${k.slice(6)}`, data: new Blob([a.data]) }); }
   for (const m of liveParts()) if (m.userData.part.paint) files.push({ name: `paint/${m.uuid}.bin`, data: new Blob([m.userData.part.paint]) });
   await deliver(files, `${safe(project.name)}.kitbash.zip`);
 }
@@ -3867,7 +4760,7 @@ async function openProjectFile(file) {
       const buf = await f.async('arraybuffer'), [pl, il] = new Uint32Array(buf, 0, 2);
       geoms.set(k, { pos: buf.slice(8, 8 + pl), idx: buf.slice(8 + pl, 8 + pl + il) });
     }
-    for (const [k, type, name] of [[data.kit?.image, 'image', data.kit?.artName], [data.kit?.pdf, 'application/pdf', data.kit?.pdfName]]) {
+    for (const [k, type, name] of [[data.kit?.image, 'image', data.kit?.artName], [data.kit?.pdf, 'application/pdf', data.kit?.pdfName], ...(data.refs || []).map(r => [r.asset, 'image', r.name + '.png'])]) {
       const f = k && zip.file(`assets/${k.slice(6)}`); if (!f) continue;
       const nm = name || ''; const t = type === 'image' ? (/\.png$/i.test(nm) ? 'image/png' : /\.webp$/i.test(nm) ? 'image/webp' : /\.gif$/i.test(nm) ? 'image/gif' : 'image/jpeg') : type;
       assets.set(k, { type: t, name: nm, data: await f.async('arraybuffer') });
@@ -3952,6 +4845,9 @@ function bindChrome() {
   on('menu-home', () => $('nav-home').click());
   on('menu-front', () => navCube.goTo(V(0, -1, 0))); on('menu-right', () => navCube.goTo(V(1, 0, 0))); on('menu-top', () => navCube.goTo(V(0, 0, 1)));
   on('menu-frame', () => frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox()));
+  on('menu-ortho', () => setOrtho(!camera.isOrthographicCamera));
+  on('menu-addref', () => $('ref-input').click());
+  $('ref-input').addEventListener('change', async () => { for (const f of [...$('ref-input').files]) await addRefImage(f); $('ref-input').value = ''; });
   on('menu-joints', () => { const c = $('set-joints'); c.checked = !c.checked; c.dispatchEvent(new Event('change', { bubbles: true })); });
   on('menu-seams', () => $('exp-preview').click());
   // dialogs
@@ -3998,13 +4894,14 @@ function bindProject() {
 // ---------------------------------------------------------------------------
 function resize() {
   const w = view.clientWidth, h = view.clientHeight; if (!w || !h) return;
-  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  renderer.setSize(w, h, false); perspCam.aspect = w / h; perspCam.updateProjectionMatrix();
+  orthoCam.left = -ORTHO_H * w / h; orthoCam.right = ORTHO_H * w / h; orthoCam.top = ORTHO_H; orthoCam.bottom = -ORTHO_H; orthoCam.updateProjectionMatrix();
 }
 new ResizeObserver(resize).observe(view);
 bindAdjust();
 bindFit();
 bindProject();
-bindAutorig();
+bindAutorig(); bindTreeDnD();
 bindOrient();
 bindOptions();
 bindKit(); bindLinkAsk(); bindChrome(); bindPaint(); bindMagnets();
@@ -4032,4 +4929,4 @@ $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   
 })();
 renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
 // automated tests only (a query string never reaches the page inside claude.ai)
-if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, camera, orbit, scene, liveParts, renderer, tc, proxy, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles }; }
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles }; }

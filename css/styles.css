@@ -272,7 +272,23 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
 .ar-tolrow { display: flex; gap: 6px; align-items: center; }
 .ar-tolrow .btn { font-size: 11.5px; padding: 3px 8px; }
 .ar-list { display: grid; gap: 2px; }
-.ar-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; padding: 6px; border-radius: 3px; border: 1px solid transparent; }
+.ar-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; padding: 6px; border-radius: 3px; border: 1px solid transparent; position: relative; }
+.ar-row .meta { grid-column: 1 / -1 !important; }
+.ar-row.is-root .who b { color: var(--accent); }
+.ar-row.is-option { background: color-mix(in srgb, #7fb6d6 7%, transparent); }
+.ar-row .opt-mark { color: #7fb6d6; padding: 0 4px 0 0; }
+.ar-row select.ar-pick { font-size: 11px; padding: 1px 4px; width: auto; min-width: 0; max-width: 150px; text-align: left; }
+.ar-row .kind.none { color: var(--muted); border-color: var(--line); }
+.grip { cursor: grab; color: var(--muted); padding-right: 5px; letter-spacing: -2px; font-size: 11px; user-select: none; }
+/* drag and drop: where it lands, and what it will do */
+.dnd-row { position: relative; }
+.dnd-row.dragging { opacity: .45; }
+.dnd-row[data-drop="attach"] { outline: 1px solid var(--accent); outline-offset: -1px; background: color-mix(in srgb, var(--accent) 14%, var(--panel)); }
+.dnd-row[data-drop="option"] { outline: 1px dashed #7fb6d6; outline-offset: -1px; background: color-mix(in srgb, #7fb6d6 16%, var(--panel)); }
+.dnd-row[data-hint]::after { content: attr(data-hint); position: absolute; right: 6px; top: 50%; transform: translateY(-50%); font-size: 10.5px; padding: 1px 6px; border-radius: 3px;
+  background: var(--panel-3); color: var(--text, #e6e8ea); pointer-events: none; white-space: nowrap; box-shadow: 0 2px 6px rgba(0,0,0,.4); z-index: 2; }
+.dnd-on[data-loose]:not([data-loose=""])::after { content: attr(data-loose); display: block; margin: 6px 8px 2px; padding: 7px; border: 1px dashed var(--line); border-radius: 3px; font-size: 11px; color: var(--muted); text-align: center; }
+.dnd-on.drop-loose::after { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .ar-row:hover, .ar-row.hot { background: var(--panel-2); border-color: var(--line); }
 .ar-row .who { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .ar-row .who b { font-weight: 600; }
@@ -280,7 +296,7 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
 .ar-row .meta { grid-column: 1; font-size: 10.5px; color: var(--muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .kind { font-family: var(--font-mono); font-size: 10px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--line); color: var(--fg); }
 .kind.ball { border-color: var(--accent); color: var(--accent); }
-.ar-row .seg { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
+.ar-row .seg { grid-column: 2; grid-row: 1; align-self: center; }
 .ar-row .seg button { font-size: 11px; padding: 3px 7px; }
 .ar-row.skip .who, .ar-row.skip .meta { opacity: .45; }
 
@@ -459,3 +475,24 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
   .cut { width: calc((100% - 16px) / 3); }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* connection type and linkages, in Properties */
+.conn { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); display: grid; gap: 6px; }
+.conn-h { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.conn .seg button { font-size: 11.5px; padding: 3px 8px; }
+.conn-f { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.conn-f label { min-width: 84px; }
+.conn-f input.num { width: 64px; }
+.conn-link { display: flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }
+.conn-link span { flex: 1 1 140px; color: #7fd3c4; }
+.conn-add { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.conn-add select { max-width: 150px; }
+.ar-loops-h { margin-top: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.ar-loop { display: flex; align-items: center; gap: 4px; font-size: 12px; padding: 3px 6px; cursor: pointer; }
+.ar-loop small { color: var(--muted); }
+.conn select.num, .conn-add select, .conn-link select { width: auto; min-width: 0; max-width: 190px; text-align: left; }
+.nav-row { display: flex; gap: 3px; }
+#nav-proj[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.ref-row .link { color: #7fb6d6; }
+.ref-row { border-top: 1px dashed var(--line); }
+.ref-row ~ .ref-row { border-top: 0; }
