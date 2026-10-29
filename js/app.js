@@ -5,6 +5,9 @@ import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { mergeVertices, mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { computeBoundsTree, acceleratedRaycast, INTERSECTED, NOT_INTERSECTED } from 'three-mesh-bvh';
 import { soupFromSTL, stlFromSoup } from './solid.js';
 import {
@@ -480,7 +483,7 @@ function attach(child, fixed, how, jointPos, axis) {
  * Every link in the tree has a type:
  *   pinned  turns any way about its point (a ball, or a pin in a socket): the default
  *   hinge   turns about one axis only (its joint's Z), optionally between min and max degrees
- *   roller  slides along one axis only (its joint's Z), optionally between min and max mm
+ *   roller  slides along one axis (its joint's Z at rest), optionally between min and max mm, and turns any way as it goes
  *   fixed   doesn't move (no joint at all: the part sits straight on its parent)
  * Hinges and rollers have their joint turned so its Z is the chosen axis, so the gizmo shows just that ring or arrow.
  *
@@ -491,9 +494,12 @@ function attach(child, fixed, how, jointPos, axis) {
  */
 const TYPE_LABEL = { pinned: 'Pinned', hinge: 'Hinge', roller: 'Roller', fixed: 'Fixed' };
 const TYPE_ICON = { pinned: '◆', hinge: '◐', roller: '⇕', fixed: '└' };
-let links = [];                    // { id, a, b (part ids), pa, pb (points in each part's own frame), kind: 'pin' | 'rail', axis: 'x' | 'y' | 'z', min, max }
+let links = [];                    // { id, a, b (part ids), pa, pb (points in each part's own frame), kind: 'pin' | 'rail', axis: 'x' | 'y' | 'z' | [x, y, z] in b's frame, axisName, min, max }
 const linkTypeOf = part => { const j = jointOf(part); return j ? j.userData.joint.type || 'pinned' : parentPart(part) ? 'fixed' : null; };
 const AXIS_V = { x: V(1, 0, 0), y: V(0, 1, 0), z: V(0, 0, 1) };
+/** A rail's direction in its own part's frame: one of the part's axes, or a direction taken from picked faces. */
+const railAxisLocal = l => Array.isArray(l.axis) ? V(...l.axis).normalize() : AXIS_V[l.axis || 'z'].clone();
+const railLabel = l => Array.isArray(l.axis) ? (l.axisName || 'the picked faces') : `its ${String(l.axis).toUpperCase()}`;
 /** One of a part's own axes, in world space. */
 function partAxis(part, ax) { part.updateMatrixWorld(true); return AXIS_V[ax].clone().transformDirection(part.matrixWorld); }
 /** Turn a joint so its Z points along `dir` (world), without moving anything hanging off it; that becomes its rest. */
@@ -531,7 +537,7 @@ function setLinkType(part, type, axis = null) {
   if (was !== type) { jd.min = jd.max = null; }
   const ax = axis || jd.axis || (type === 'roller' ? 'z' : 'joint');
   jd.axis = ax;
-  if (ax !== 'joint') reframeJoint(j, partAxis(part, ax));
+  if (ax !== 'joint' && ax !== 'custom') reframeJoint(j, partAxis(part, ax));
   else { const kids = j.children.filter(isPart); jd.rest.copy(j.quaternion); jd.restPos.copy(j.position); }
   return null;
 }
@@ -546,11 +552,11 @@ function jointValue(j) {
 function setJointValue(j, v) {
   const jd = j.userData.joint;
   if (jd.min != null) v = Math.max(v, jd.min); if (jd.max != null) v = Math.min(v, jd.max);
-  if (jd.type === 'roller') { j.position.copy(jd.restPos).addScaledVector(V(0, 0, 1).applyQuaternion(jd.rest), v); j.quaternion.copy(jd.rest); }
+  if (jd.type === 'roller') { j.position.copy(jd.restPos).addScaledVector(V(0, 0, 1).applyQuaternion(jd.rest), v); }   // turned any way: only its slide is set
   else if (jd.type === 'hinge') { let a = ((v + 180) % 360 + 360) % 360 - 180; j.quaternion.copy(jd.rest).multiply(new THREE.Quaternion().setFromAxisAngle(V(0, 0, 1), a * Math.PI / 180)); j.position.copy(jd.restPos); }
   j.updateMatrixWorld(true);
 }
-/** After a drag: keep a joint to what its type allows (a hinge only turns about Z, a roller only slides along Z). */
+/** After a drag: keep a joint to what its type allows (a hinge only turns about Z; a roller stays on its line, turned any way). */
 function constrainJoint(j) {
   const jd = j.userData.joint;
   if (jd.type === 'hinge' || jd.type === 'roller') setJointValue(j, jointValue(j));
@@ -562,7 +568,7 @@ function tidyLinks() { links = links.filter(l => partByUuid(l.a) && partByUuid(l
 function linkResiduals(list, out = []) {
   for (const l of list) {
     const a = l._a, b = l._b, pa = l._pa.clone().applyMatrix4(a.matrixWorld), pb = l._pb.clone().applyMatrix4(b.matrixWorld), d = pa.sub(pb);
-    if (l.kind === 'rail') { const ax = AXIS_V[l.axis].clone().transformDirection(b.matrixWorld); let t = d.dot(ax);
+    if (l.kind === 'rail') { const ax = railAxisLocal(l).transformDirection(b.matrixWorld); let t = d.dot(ax);
       if (l.min != null) t = Math.max(t, l.min); if (l.max != null) t = Math.min(t, l.max); d.addScaledVector(ax, -t); }
     out.push(d.x, d.y, d.z);
   }
@@ -580,15 +586,15 @@ function jointsBetween(a, b) {
  * until every pin meets and every rail point sits on its rail. Damped least squares; joints carrying more
  * parts are stiffer, so the pistons move before the leg does. Returns the worst error left (mm).
  */
-function solveLinks(driven = null, iters = 30) {
+function solveLinks(driven = null, iters = 30, only = null) {
   tidyLinks(); if (!links.length) return 0;
   const list = links.map(l => ({ ...l, _a: partByUuid(l.a), _b: partByUuid(l.b), _pa: V(...l.pa), _pb: V(...l.pb) })).filter(l => l._a && l._b);
-  const js = [...new Set(list.flatMap(l => jointsBetween(l._a, l._b)))].filter(j => j !== driven);
+  const js = [...new Set(list.flatMap(l => jointsBetween(l._a, l._b)))].filter(j => j !== driven && (!only || only.includes(j)));
   const dofs = [];
   for (const j of js) {
     const jd = j.userData.joint, w = 1 + subtreeParts(j).length * 0.5;
     if (jd.type === 'hinge' || jd.type === 'roller') dofs.push({ j, k: 'v', w: jd.type === 'roller' ? w * 0.2 : w });
-    else for (const ax of ['x', 'y', 'z']) dofs.push({ j, k: ax, w });
+    if (jd.type !== 'hinge') for (const ax of ['x', 'y', 'z']) dofs.push({ j, k: ax, w });          // pinned and rollers turn any way
   }
   if (!dofs.length) return Math.max(0, ...linkResiduals(list).map(Math.abs));
   const save = () => dofs.map(d => [d.j.position.clone(), d.j.quaternion.clone()]);
@@ -599,24 +605,71 @@ function solveLinks(driven = null, iters = 30) {
   };
   const cost = r => r.reduce((s, v) => s + v * v, 0);
   scene.updateMatrixWorld(true);
-  let r = linkResiduals(list), c = cost(r), lambda = 1e-3;
-  const n = dofs.length, m = r.length;
-  for (let it = 0; it < iters && c > 1e-8; it++) {
-    const st = save(), J = dofs.map((d, k) => { const h = 1e-4; nudge(d, h); const r2 = linkResiduals(list); load(st); return r2.map((v, i) => (v - r[i]) / h); });
-    const A = Array.from({ length: n }, () => new Array(n).fill(0)), g = new Array(n).fill(0);
-    for (let a = 0; a < n; a++) { for (let i = 0; i < m; i++) g[a] -= J[a][i] * r[i]; for (let b = a; b < n; b++) { let v = 0; for (let i = 0; i < m; i++) v += J[a][i] * J[b][i]; A[a][b] = A[b][a] = v; } }
-    let improved = false;
-    for (let tries = 0; tries < 6 && !improved; tries++) {
-      const M = A.map((row, a) => row.map((v, b) => v + (a === b ? lambda * dofs[a].w * (1 + A[a][a]) + 1e-9 : 0)));
-      const x = solveLinear(M, g); if (!x) { lambda *= 10; continue; }
-      dofs.forEach((d, k) => nudge(d, Math.max(-0.3, Math.min(0.3, x[k]))));
-      const r2 = linkResiduals(list), c2 = cost(r2);
-      if (c2 < c) { r = r2; c = c2; lambda = Math.max(lambda / 3, 1e-6); improved = true; } else { load(st); lambda *= 10; }
+  let r = linkResiduals(list), c = cost(r);
+  const run = sub => {
+    let lambda = 1e-3; const n = sub.length, m = r.length;
+    const saveS = () => sub.map(d => [d.j.position.clone(), d.j.quaternion.clone()]);
+    const loadS = st => { sub.forEach((d, i) => { d.j.position.copy(st[i][0]); d.j.quaternion.copy(st[i][1]); }); js.forEach(j => j.updateMatrixWorld(true)); };
+    for (let it = 0; it < iters && c > 1e-8; it++) {
+      const st = saveS(), J = sub.map(d => { const h = 1e-4; nudge(d, h); const r2 = linkResiduals(list); loadS(st); return r2.map((v, i) => (v - r[i]) / h); });
+      const A = Array.from({ length: n }, () => new Array(n).fill(0)), g = new Array(n).fill(0);
+      for (let a = 0; a < n; a++) { for (let i = 0; i < m; i++) g[a] -= J[a][i] * r[i]; for (let b = a; b < n; b++) { let v = 0; for (let i = 0; i < m; i++) v += J[a][i] * J[b][i]; A[a][b] = A[b][a] = v; } }
+      let improved = false;
+      for (let tries = 0; tries < 6 && !improved; tries++) {
+        const M = A.map((row, a) => row.map((v, b) => v + (a === b ? lambda * sub[a].w * (1 + A[a][a]) + 1e-9 : 0)));
+        const x = solveLinear(M, g); if (!x) { lambda *= 10; continue; }
+        sub.forEach((d, k) => nudge(d, Math.max(-0.3, Math.min(0.3, x[k]))));
+        const r2 = linkResiduals(list), c2 = cost(r2);
+        if (c2 < c) { r = r2; c = c2; lambda = Math.max(lambda / 3, 1e-6); improved = true; } else { loadS(st); lambda *= 10; }
+      }
+      if (!improved) break;
     }
-    if (!improved) break;
-  }
+  };
+  // A roller in a loop that already slides on a rail (a plate in its socket, its top in a channel) has two ways to make
+  // up a gap: slide on the rail, or slide itself, which walks its ball out of the socket. The rail goes first: those
+  // rollers only slide when turning and the rail can't close it. Rollers in loops without a rail (a piston rod in its
+  // cylinder) slide as freely as ever, since that's how the piston moves.
+  const railJs = new Set(list.filter(l => l.kind === 'rail').flatMap(l => jointsBetween(l._a, l._b)));
+  const slides = dofs.filter(d => d.k === 'v' && d.j.userData.joint.type === 'roller' && railJs.has(d.j)), turns = dofs.filter(d => !slides.includes(d));
+  if (turns.length) run(turns);
+  if (slides.length && c > 2.5e-5) run(dofs);                 // still more than 0.005 mm out: let the rollers slide too
+  holdFacing(list, driven);
   return Math.sqrt(Math.max(0, ...Array.from({ length: r.length / 3 }, (_, i) => r[3 * i] ** 2 + r[3 * i + 1] ** 2 + r[3 * i + 2] ** 2)));
 }
+/*
+ * Keeping a face pointing the right way. A part on a ball (or a roller) whose far end is held by a link can still spin
+ * on the line from its joint to that end without breaking anything, so the solver lets it drift. A link with `face`
+ * holds that spin: a side of the part (face.sa, in its own frame) keeps pointing the same way relative to the part
+ * it's linked to (face.sb, in that part's frame), like armour that always faces out from the leg it slides on.
+ * Turning about that line never moves the linked end, so every connection still holds.
+ */
+function holdFacing(list, driven = null) {
+  for (const l of list) {
+    if (!l.face) continue;
+    const a = l._a, b = l._b, j = jointOf(a); if (!j || j === driven) continue;
+    const t = j.userData.joint.type || 'pinned'; if (t !== 'pinned' && t !== 'roller') continue;
+    j.updateMatrixWorld(true); a.updateMatrixWorld(true); b.updateMatrixWorld(true);
+    const P = V().setFromMatrixPosition(j.matrixWorld), u = l._pa.clone().applyMatrix4(a.matrixWorld).sub(P); if (u.lengthSq() < 1e-10) continue; u.normalize();
+    const c = V(...l.face.sa).transformDirection(a.matrixWorld).projectOnPlane(u), d = V(...l.face.sb).transformDirection(b.matrixWorld).projectOnPlane(u);
+    if (c.lengthSq() < 1e-8 || d.lengthSq() < 1e-8) continue;
+    const ang = Math.atan2(c.clone().cross(d).dot(u), c.dot(d)); if (Math.abs(ang) < 1e-6) continue;
+    const pq = j.parent.getWorldQuaternion(new THREE.Quaternion()), jq = j.getWorldQuaternion(new THREE.Quaternion());
+    j.quaternion.copy(pq.invert().multiply(new THREE.Quaternion().setFromAxisAngle(u, ang).multiply(jq))); j.updateMatrixWorld(true);
+  }
+}
+/** Remember which way a linked part faces now, relative to what it's linked to (see holdFacing). */
+function setFacing(l) {
+  const a = partByUuid(l.a), b = partByUuid(l.b), j = a && jointOf(a); if (!a || !b || !j) { delete l.face; return; }
+  scene.updateMatrixWorld(true);
+  const P = V().setFromMatrixPosition(j.matrixWorld), u = V(...l.pa).applyMatrix4(a.matrixWorld).sub(P); if (u.lengthSq() < 1e-10) { delete l.face; return; } u.normalize();
+  // the side: from the line out to the part's bulk (the armour plate), or any square direction if it sits on the line
+  let side = partCentroid(a).sub(P).projectOnPlane(u);
+  if (side.lengthSq() < 1e-6) side = (Math.abs(u.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).projectOnPlane(u);
+  side.normalize();
+  l.face = { sa: side.clone().transformDirection(a.matrixWorld.clone().invert()).toArray(), sb: side.clone().transformDirection(b.matrixWorld.clone().invert()).toArray() };
+}
+/** After the part itself has been turned by hand: its new facing is the one to keep. */
+function refreshFacing(j) { for (const l of links) if (l.face && jointOf(partByUuid(l.a)) === j) setFacing(l); }
 /** Every joint a linkage solve might move, plus `j`: their positions and turns, to put back later. */
 function linkedState(j) {
   const set = new Set(j ? [j] : []);
@@ -649,7 +702,7 @@ function addLink(part, to, kind = 'pin', axis = 'z') {
   const pt = closestOrContact(part, to);
   part.updateMatrixWorld(true); to.updateMatrixWorld(true);
   const l = { id: uid(), a: part.uuid, b: to.uuid, pa: pt.clone().applyMatrix4(part.matrixWorld.clone().invert()).toArray(), pb: pt.clone().applyMatrix4(to.matrixWorld.clone().invert()).toArray(), kind, axis, min: null, max: null };
-  links.push(l); return l;
+  links.push(l); setFacing(l); return l;
 }
 function closestOrContact(a, b) {
   let c = null; try { c = contactBetween(contactContext([b, a]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) {}
@@ -733,7 +786,7 @@ const undoStack = [], redoStack = [];
 function snapshot() {
   const snap = [...parts, ...joints].filter(o => o.parent).map(o => ({
     o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name,
-    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null } : null, off: !!o.userData.optOff,
+    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null, axisName: o.userData.joint.axisName || '', pointOff: o.userData.joint.pointOff || null, partOff: o.userData.joint.partOff || null } : null, off: !!o.userData.optOff,
     paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null }));
   snap.options = JSON.parse(JSON.stringify(options));
   snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
@@ -756,6 +809,7 @@ function restore(snap) {
   if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
   if (snap.magnets) { magnets = JSON.parse(JSON.stringify(snap.magnets)); }
   if (snap.links) links = JSON.parse(JSON.stringify(snap.links));
+  if (connSel && !(connSel.kind === 'joint' ? snap.some(e => e.o.uuid === connSel.id && e.o.userData.joint) : links.some(l => l.id === connSel.id))) connSel = null;
   if (snap.refs && JSON.stringify(snap.refs) !== JSON.stringify(refs)) { refs = JSON.parse(JSON.stringify(snap.refs)); rebuildRefs(); if (benchSel?.kind === 'ref' && !refById(benchSel.k)) { benchSel = null; benchMark.visible = false; } }
   if ('kit' in snap && JSON.stringify(snap.kit) !== JSON.stringify(kit)) { kit = snap.kit ? JSON.parse(JSON.stringify(snap.kit)) : null; buildKit(); }
   scene.updateMatrixWorld(true);
@@ -908,8 +962,8 @@ async function applyMatch() {
   const fixedParts = [...byMesh.entries()].sort((x, y) => areaOf(y[1]) - areaOf(x[1]));
   const B0 = fixedParts[0][1];
   const op = {
-    mode: 'MATCH', child: A[0].mesh, fixed: B0[0].mesh, a: [keepPick(A[0])], b: [keepPick(B0[0])],
-    p: { spin: 0, gap: 0, flip: false, across: false, attach: lastAttach, centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat },
+    mode: 'MATCH', child: A[0].mesh, fixed: B0[0].mesh, a: [keepPick(A[0])], b: [keepPick(B0[0])], railRegion: union(B0),
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: defaultAttach(A[0].mesh, B0[0].mesh), centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat, rail: 'along', railEnds: true },
     before: snapshot(),
   };
   op.match = { regionA: union(A), regionB: union(B0), groupsA: A.map(q => q.region), groupsB: B0.map(q => q.region), Ma: A[0].mesh.matrixWorld.clone(), Mb: B0[0].mesh.matrixWorld.clone(), results: [], chosen: 0,
@@ -948,7 +1002,7 @@ function handlePick(ev, hit) {
     mode: tool, child: picks[0].mesh, fixed: picks[per].mesh,
     a: picks.slice(0, per).map(keepPick),
     b: picks.slice(per).map(keepPick),
-    p: { spin: 0, gap: 0, flip: false, across: false, attach: lastAttach, centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat },
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: defaultAttach(picks[0].mesh, picks[per].mesh), centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat, rail: 'along', railEnds: true },
     before: snapshot(),
   };
   picks = [];
@@ -1214,7 +1268,7 @@ async function feelLucky(child, fixed) {
   if (!how) { toast('Cancelled. Nothing moved.'); updateStep(); return; }
   scene.updateMatrixWorld(true);
   const op = { mode: 'MATCH', child, fixed, a: [{ point: worldBox(child).getCenter(V()), normal: V(0, 0, 1) }], b: [{ point: worldBox(fixed).getCenter(V()), normal: V(0, 0, 1) }],
-    p: { spin: 0, gap: 0, flip: false, across: false, attach: lastAttach, centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat }, before: snapshot() };
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: defaultAttach(child, fixed), centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat, rail: 'z', railEnds: false }, before: snapshot() };
   op.reroot = how === 'group';
   op.match = { lucky: true, regionA: [], regionB: [], groupsA: [], groupsB: [], Ma: child.matrixWorld.clone(), Mb: fixed.matrixWorld.clone(), results: [], chosen: 0, flat: false };
   await startLucky(op);
@@ -1504,7 +1558,15 @@ function bindOrient() {
 }
 
 let lastAttach = 'joint', lastCentre = 'auto', lastFrame = 'world', lastPivot = 'parent', lastSeat = true;
-const keepPick = q => ({ point: q.point.clone(), normal: q.normal.clone(), candidates: q.candidates, ringInfo: q.ringInfo, ringNear: q.ringNear, radius: q.radius, kind: q.kind });
+const keepPick = q => ({ point: q.point.clone(), normal: q.normal.clone(), candidates: q.candidates, ringInfo: q.ringInfo, ringNear: q.ringNear, radius: q.radius, kind: q.kind, region: q.region });
+/** Can this snap close a loop instead of re-attaching? The moving part already hangs off something else. */
+function canLoop(child, fixed) { const par = parentPart(child); return !!par && par !== fixed && fixed !== child && !isDescendant(fixed, child); }
+let lastLoopAttach = 'rail';
+/** How a new snap attaches: re-attach as before, or, for a part already on a joint elsewhere (a piston in its socket), ride a rail on the new part. */
+function defaultAttach(child, fixed) {
+  if (canLoop(child, fixed)) return lastLoopAttach;
+  return lastAttach === 'rail' || lastAttach === 'link' ? 'joint' : lastAttach;
+}
 function resolvedOp(op) {
   const res = e => ({ ...e, point: resolveCentre(e, op.p.centre).point.clone() });
   return { ...op, a: op.a.map(res), b: op.b.map(res) };
@@ -1566,6 +1628,8 @@ function runOp(op) {
     if (axis.length() < 1e-6) axis = V(0, 0, 1);
   }
   op.baseAxis = axis.clone().normalize();
+  if ((op.p.attach === 'rail' || op.p.attach === 'link') && canLoop(op.child, op.fixed)) return runLinkOp(op, rop, r);
+  if (op.p.attach === 'rail' || op.p.attach === 'link') op.p.attach = 'joint';
   const T = Tr(offsetWorld(op)).multiply(r.T);
   const childPt = childPoint(rop).applyMatrix4(T);
   const joint = op.p.pivot === 'child' ? childPt : r.joint.clone();
@@ -1582,6 +1646,231 @@ function runOp(op) {
   const j = jointOf(op.child); if (j && op.seam.long) j.userData.joint.long = op.seam.long.clone().applyQuaternion(j.getWorldQuaternion(new THREE.Quaternion()).invert());
   afterHierarchyChange();
   return true;
+}
+
+/*
+ * Closing a loop with a snap (a piston already pinned in its socket, its other end going into a channel): the part keeps
+ * its own joint. It turns on that joint as close as it can to where the snap would put it, then gets a second
+ * connection to the part it was snapped to: a rail along the channel ('rail') or a pin ('link'). Posing then keeps
+ * both: the part turns in its socket and slides up and down the channel.
+ */
+function runLinkOp(op, rop, r) {
+  const child = op.child, fixed = op.fixed;
+  let j = jointOf(child);
+  if (!j || (j.userData.joint.type || 'pinned') === 'fixed') { setLinkType(child, 'pinned'); j = jointOf(child); }
+  if (!j) { toast(`${child.name} needs a joint on ${parentPart(child)?.name || 'its parent'} to move on.`, 'bad'); return false; }
+  scene.updateMatrixWorld(true);
+  const T = Tr(offsetWorld(op)).multiply(r.T), cp = childPoint(rop), target = cp.clone().applyMatrix4(T);
+  const cpLocal = cp.clone().applyMatrix4(child.matrixWorld.clone().invert());
+  // turn about the joint to best match where the snap would take it: its contact point counts most
+  const P = V().setFromMatrixPosition(j.matrixWorld), bb = exactBox(child), X = [], Y = [], w = [];
+  const add = (pt, wt) => { X.push(pt.clone().sub(P)); Y.push(pt.clone().applyMatrix4(T).sub(P)); w.push(wt); };
+  add(cp, 20); for (let i = 0; i < 8; i++) add(V(i & 1 ? bb.max.x : bb.min.x, i & 2 ? bb.max.y : bb.min.y, i & 4 ? bb.max.z : bb.min.z), 1);
+  const q = bestTurn(X, Y, w);
+  const pq = j.parent.getWorldQuaternion(new THREE.Quaternion()), jq = j.getWorldQuaternion(new THREE.Quaternion());
+  j.quaternion.copy(pq.invert().multiply(q.multiply(jq))); j.updateMatrixWorld(true); constrainJoint(j); scene.updateMatrixWorld(true);
+  // the connection: from the part's contact point to the target, along the channel
+  const kind = op.p.attach === 'rail' ? 'rail' : 'pin', inv = fixed.matrixWorld.clone().invert();
+  const l = { id: uid(), a: child.uuid, b: fixed.uuid, pa: cpLocal.toArray(), pb: target.clone().applyMatrix4(inv).toArray(), kind, axis: 'z', axisName: '', min: null, max: null };
+  let dir = null, info = '';
+  if (kind === 'rail') {
+    const d = railDirection(op, target); dir = d.dir; info = d.info;
+    l.axis = dir.clone().transformDirection(inv).normalize().toArray(); l.axisName = d.name;
+    if (op.p.railEnds !== false) { const ends = channelEnds(op, target, dir); if (ends) { l.min = ends.min; l.max = ends.max;
+      const fmt = v => v == null ? 'no end' : `${Math.abs(v).toFixed(1)} mm`; info += (info ? ' · ' : '') + `travel ${fmt(ends.min)} one way, ${fmt(ends.max)} the other`; } }
+  }
+  links.push(l);
+  const err = solveLinks(null, 80, [j]);
+  scene.updateMatrixWorld(true);
+  // a pinned part can still turn on the line from its joint to the connection without coming off it. A ball in a
+  // channel says nothing about that turn, so by default it faces away from the part it slides on (armour outward),
+  // then any turn asked for in Adjust goes on top
+  op.twistInfo = '';
+  if ((j.userData.joint.type || 'pinned') === 'pinned') {
+    const P = V().setFromMatrixPosition(j.matrixWorld), axisW = cpLocal.clone().applyMatrix4(child.matrixWorld).sub(P);
+    if (axisW.lengthSq() > 1e-8) {
+      axisW.normalize();
+      let turn = 0;
+      if (op.p.faceAway ?? op.mode === 'BALL') {
+        const c = partCentroid(child), mid = c.clone().add(target).multiplyScalar(0.5), R = 0.6 * worldBox(child).getSize(V()).length();
+        const near = trisNear(fixed, mid, R), t = topoOf(fixed), f = V(), v = V(); let A = 0;
+        for (const i of near) { const a = t.fa[i]; f.addScaledVector(v.set(t.fc[3 * i], t.fc[3 * i + 1], t.fc[3 * i + 2]).applyMatrix4(fixed.matrixWorld), a); A += a; }
+        if (A) {
+          f.multiplyScalar(1 / A);
+          const perp = x => x.sub(P).addScaledVector(axisW, -x.clone().sub(P).dot(axisW) + 0).projectOnPlane(axisW);
+          const u = perp(c.clone()), w = perp(f.clone()).negate();
+          if (u.lengthSq() > 1e-8 && w.lengthSq() > 1e-8) { turn = Math.atan2(u.clone().cross(w).dot(axisW), u.dot(w)); op.twistInfo = `turned ${Math.abs(turn * 180 / Math.PI).toFixed(0)}° on its axis to face away from ${fixed.name}`; }
+        }
+      }
+      turn += (op.p.twist || 0) * Math.PI / 180;
+      if (Math.abs(turn) > 1e-6) {
+        const qt = new THREE.Quaternion().setFromAxisAngle(axisW, turn), pq2 = j.parent.getWorldQuaternion(new THREE.Quaternion()), jq2 = j.getWorldQuaternion(new THREE.Quaternion());
+        j.quaternion.copy(pq2.invert().multiply(qt.multiply(jq2))); j.updateMatrixWorld(true); scene.updateMatrixWorld(true);
+      }
+    }
+  }
+  if (op.p.keepFacing !== false) setFacing(l);
+  const at = cpLocal.clone().applyMatrix4(child.matrixWorld);
+  op.result = { ...r, T, joint: target.clone(), parentPoint: target.clone(), childPoint: at, link: l.id };
+  op.jointAxis = (dir || op.baseAxis).clone(); op.baseAxis = op.jointAxis.clone();
+  op.linkNote = (kind === 'rail' ? `Rides a rail along ${l.axisName}` : 'Pinned to it as well') + (info ? ` (${info})` : '') + '.'
+    + (op.twistInfo ? ` It ${op.twistInfo}.` : '') + (err > 0.05 ? ` It can't quite reach on its joint: ${err.toFixed(2)} mm off. Check its joint is where it should be, or try "Pinned" to re-attach it instead.` : '');
+  op.seam = { n: op.jointAxis.clone(), c: target.clone(), long: null };
+  afterHierarchyChange();
+  return true;
+}
+/** Where a part's bulk is (the middle of its corners, world). */
+function partCentroid(m) {
+  const g = m.geometry, pos = g.attributes.position;
+  if (!g.userData.centroid) { const c = V(), v = V(), step = Math.max(1, Math.floor(pos.count / 50000)); let n = 0; for (let i = 0; i < pos.count; i += step) { c.add(v.fromBufferAttribute(pos, i)); n++; } g.userData.centroid = c.multiplyScalar(1 / n); }
+  m.updateMatrixWorld(true); return g.userData.centroid.clone().applyMatrix4(m.matrixWorld);
+}
+/** The turn (about the origin) that best takes the points X onto Y, weighted (Horn's quaternion method). */
+function bestTurn(X, Y, w) {
+  const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  X.forEach((x, i) => { const a = x.toArray(), b = Y[i].toArray(); for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) S[r][c] += w[i] * a[r] * b[c]; });
+  const [[xx, xy, xz], [yx, yy, yz], [zx, zy, zz]] = S;
+  const N = [[xx + yy + zz, yz - zy, zx - xz, xy - yx], [yz - zy, xx - yy - zz, xy + yx, zx + xz], [zx - xz, xy + yx, -xx + yy - zz, yz + zy], [xy - yx, zx + xz, yz + zy, -xx - yy + zz]];
+  const v = eigenSym(N)[0].vector;
+  return new THREE.Quaternion(v[1], v[2], v[3], v[0]).normalize();
+}
+/*
+ * Picking faces for a direction (a rail along a groove, a roller up a channel): click faces on one part, then take
+ * the direction along them, across them, or straight out of them. onDone gets { dir (world), name, mesh, axes, which }.
+ */
+let dirPick = null;
+function startDirPick(title, onDone, { mesh = null, onCancel = null } = {}) {
+  endDirPick(); cancelPick();
+  dirPick = { onDone, onCancel, regions: [], mesh };
+  $('dp-title').textContent = title; $('dirpick').hidden = false; syncDirPick();
+  toast(mesh ? `Click faces on ${mesh.name}.` : 'Click the faces that set the direction.');
+}
+function cancelDirPick() { const cb = dirPick?.onCancel; endDirPick(); toast('Cancelled picking faces.'); cb?.(); }
+function endDirPick() { if (!dirPick) return; dirPick = null; $('dirpick').hidden = true; clearFx(); }
+function dirPickList() { return [...new Set(dirPick.regions.flatMap(r => r.list))]; }
+function syncDirPick() {
+  const ax = dirPick.regions.length ? faceAxes(dirPick.regions[0].mesh, dirPickList()) : null;
+  dirPick.axes = ax;
+  ['along', 'across', 'out'].forEach(k => { $('dp-' + k).disabled = !ax; });
+  $('dp-note').textContent = !ax ? 'Click the faces that set the direction: a groove\'s walls and floor, or a flat strip. Click more to add; click one again to drop it. Esc cancels.'
+    : `${dirPick.regions.length} area${dirPick.regions.length > 1 ? 's' : ''} on ${dirPick.regions[0].mesh.name}, read as ${ax.kind === 'groove' ? 'a channel: Along runs down it' : ax.kind === 'flat' ? 'a flat face: Along is its long way' : ax.kind === 'strip' ? 'a long strip: Along runs the length of it' : 'a round surface: Along has no clear meaning, Out points from its middle'}.`;
+  clearFx(); for (const r of dirPick.regions) showRegion(r.mesh, r.list, '#d6a24a');
+  if (ax) {                                                   // the three directions, drawn from the faces' middle
+    const L = Math.max(2, Math.sqrt(ax.area) * 0.8), mk = (d, col) => { const g = new THREE.BufferGeometry().setFromPoints([ax.centre.clone().addScaledVector(d, -L), ax.centre.clone().addScaledVector(d, L)]);
+      const ln = new THREE.Line(g, new THREE.LineBasicMaterial({ color: col, depthTest: false })); ln.renderOrder = 999; fx.add(ln); };
+    mk(ax.along, '#f1d08f'); mk(ax.across, '#7fb3d9'); mk(ax.out, '#e2804f');
+  }
+}
+function dirPickClick(hit) {
+  if (!hit) { toast('Missed. Click on a part.'); return; }
+  const m = hit.object;
+  if (dirPick.mesh && m !== dirPick.mesh) { toast(`Click faces on ${dirPick.mesh.name}.`, 'bad'); return; }
+  if (dirPick.regions.length && m !== dirPick.regions[0].mesh) { toast(`Keep to one part: these faces are on ${dirPick.regions[0].mesh.name}.`, 'bad'); return; }
+  const had = dirPick.regions.findIndex(r => r.list.includes(hit.faceIndex));
+  if (had >= 0) { dirPick.regions.splice(had, 1); syncDirPick(); return; }
+  m.updateMatrixWorld(true);
+  const res = pickSurface(topoOf(m), m.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+  if (res.err) { toast(res.err, 'bad'); return; }
+  dirPick.regions.push({ mesh: m, list: res.region }); syncDirPick();
+}
+function finishDirPick(which) {
+  const dp = dirPick, ax = dp?.axes; if (!ax) return;
+  const what = ax.kind === 'groove' ? 'channel' : ax.kind === 'flat' ? 'face' : ax.kind === 'strip' ? 'strip' : 'surface', mesh = dp.regions[0].mesh;
+  const name = which === 'along' ? (ax.kind === 'groove' ? `the channel on ${mesh.name}` : `the ${what} on ${mesh.name}`) : `${which === 'across' ? 'across' : 'out of'} the ${what} on ${mesh.name}`;
+  endDirPick(); dp.onDone({ dir: ax[which].clone(), name, mesh, axes: ax, which });
+}
+function bindDirPick() {
+  ['along', 'across', 'out'].forEach(k => $('dp-' + k).addEventListener('click', () => finishDirPick(k)));
+  $('dp-cancel').addEventListener('click', cancelDirPick);
+}
+/** Triangles of a mesh with their centres within R (world mm) of a world point. */
+function trisNear(mesh, pWorld, R) {
+  mesh.updateMatrixWorld(true);
+  const inv = mesh.matrixWorld.clone().invert(), S = V().setFromMatrixScale(mesh.matrixWorld), sc = Math.max(S.x, S.y, S.z) || 1;
+  const sphere = new THREE.Sphere(pWorld.clone().applyMatrix4(inv), R / sc), out = [], c = V();
+  mesh.geometry.boundsTree.shapecast({
+    intersectsBounds: box => box.intersectsSphere(sphere),
+    intersectsTriangle: (tri, i) => { tri.getMidpoint(c); if (c.distanceTo(sphere.center) <= sphere.radius) out.push(i); return false; },
+  });
+  return out;
+}
+/**
+ * The directions some picked faces give (world): along them (down a groove, where their normals all lie square to
+ * one line; or the long way along a flat face), across them, and straight out of them.
+ */
+function faceAxes(mesh, list) {
+  if (!list?.length) return null;
+  mesh.updateMatrixWorld(true);
+  const t = topoOf(mesh), M = mesh.matrixWorld, nm = new THREE.Matrix3().getNormalMatrix(M), C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], nb = V(), n = V(), c = V(); let A = 0;
+  for (const i of list) {
+    const a = t.fa[i]; if (!a) continue;
+    n.set(t.fn[3 * i], t.fn[3 * i + 1], t.fn[3 * i + 2]).applyMatrix3(nm).normalize(); A += a; nb.addScaledVector(n, a);
+    c.addScaledVector(V(t.fc[3 * i], t.fc[3 * i + 1], t.fc[3 * i + 2]).applyMatrix4(M), a);
+    const x = n.toArray(); for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) C[r][k] += a * x[r] * x[k];
+  }
+  if (!A) return null;
+  const ev = eigenSym3(C), l1 = ev[0].value, l2 = ev[1].value, l3 = ev[2].value;
+  let kind, along, out = nb.clone();
+  if (l2 > 0.12 * l1 && l3 < 0.6 * l2) { kind = 'groove'; along = ev[2].vector.clone(); }
+  else if (l2 <= 0.12 * l1) { kind = 'flat'; out.normalize(); along = faceLongAxis(t, M, list, out) || ev[1].vector.clone(); }
+  else {
+    // normals every which way (a ribbed tube, a ball socket): if the picked area is a long strip, it runs along that
+    kind = 'round'; along = ev[2].vector.clone();
+    const P = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], m = c.clone().multiplyScalar(1 / A), q = V();
+    for (const i of list) { const a = t.fa[i]; if (!a) continue; q.set(t.fc[3 * i], t.fc[3 * i + 1], t.fc[3 * i + 2]).applyMatrix4(M).sub(m); const x = q.toArray(); for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) P[r][k] += a * x[r] * x[k]; }
+    const pe = eigenSym3(P);
+    if (pe[0].value > 2.25 * pe[1].value) { kind = 'strip'; along = pe[0].vector.clone(); }
+  }
+  if (kind === 'round') {                                   // no direction along it: Out is the way most of the faces face
+    out = ev[0].vector.clone(); if (out.dot(nb) < 0) out.negate(); along.addScaledVector(out, -along.dot(out));
+    if (along.lengthSq() < 1e-10) along = (Math.abs(out.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).addScaledVector(out, -(Math.abs(out.z) < 0.9 ? out.z : out.x));
+    along.normalize();
+  } else { out.addScaledVector(along, -out.dot(along)); if (out.lengthSq() < 1e-10) out = ev[0].vector.clone(); out.normalize(); }
+  if (along.z < -1e-6 || (Math.abs(along.z) <= 1e-6 && along.x < 0)) along.negate();
+  return { kind, along: along.normalize(), across: along.clone().cross(out).normalize(), out, centre: c.multiplyScalar(1 / A), area: A };
+}
+/** Which way a new rail runs, from the op's choice. Returns { dir (world), name, info }. */
+function railDirection(op, target) {
+  const fixed = op.fixed, ch = op.p.rail || 'along';
+  if (ch === 'x' || ch === 'y' || ch === 'z') return { dir: partAxis(fixed, ch), name: `${fixed.name}'s ${ch.toUpperCase()}`, info: '' };
+  if (ch === 'picked' && op.p.railPick) {
+    const pk = op.p.railPick, d = V(...pk.dir).transformDirection(fixed.matrixWorld).normalize();
+    return { dir: d, name: pk.name, info: '' };
+  }
+  // the faces picked on the part it slides in; for a ball, the socket's surface and a little round it
+  let ax = null;
+  const own = op.railRegion || op.b[0]?.region;
+  if (own?.length) ax = faceAxes(fixed, own);
+  if (!ax || ax.kind === 'round') {
+    const R = op.mode === 'BALL' && op.a[0].radius ? op.a[0].radius * 2.5 : Math.max(3, 0.08 * worldBox(fixed).getSize(V()).length());
+    const wide = faceAxes(fixed, trisNear(fixed, target, R)); if (wide && (!ax || wide.kind !== 'round')) ax = wide;
+  }
+  op.railAxes = ax;
+  if (!ax) return { dir: partAxis(fixed, 'z'), name: `${fixed.name}'s Z`, info: 'no faces to read a direction from' };
+  const which = ch === 'across' ? 'across' : ch === 'out' ? 'out' : 'along';
+  const what = ax.kind === 'groove' ? 'the channel' : ax.kind === 'flat' ? 'the face' : ax.kind === 'strip' ? 'the strip' : 'the socket';
+  const name = which === 'along' ? (ax.kind === 'groove' ? 'the channel' : `the ${what.slice(4)}`) : which === 'across' ? `across ${what}` : `out of ${what}`;
+  const info = ax.kind === 'round' && which === 'along' ? 'no clear channel here: pick its faces, or choose X, Y or Z' : '';
+  return { dir: ax[which].clone(), name, info };
+}
+/**
+ * How far a ball can slide each way along a channel before it runs out (the walls fall away, or something closes it off):
+ * walk along the line and watch the distance to the surface. For faces, how far the picked faces run. Returns { min, max } or null.
+ */
+function channelEnds(op, target, dir) {
+  const fixed = op.fixed;
+  if (op.mode === 'BALL' && op.a[0].radius) {
+    const r = op.a[0].radius, inv = fixed.matrixWorld.clone().invert(), S = V().setFromMatrixScale(fixed.matrixWorld), sc = Math.max(S.x, S.y, S.z) || 1, bvh = fixed.geometry.boundsTree;
+    const dist = t => { const h = bvh.closestPointToPoint(target.clone().addScaledVector(dir, t).applyMatrix4(inv)); return h ? h.distance * sc : Infinity; };
+    const d0 = dist(0), step = r / 4, maxT = 40 * r, ends = [];
+    for (const sg of [-1, 1]) { let t = 0; while (t < maxT) { const n = t + step, d = dist(sg * n); if (Math.abs(d - d0) > 0.35 * r) break; t = n; } ends.push(t >= maxT ? null : sg * t); }
+    if (ends[0] == null && ends[1] == null) return null;
+    return { min: ends[0], max: ends[1] };
+  }
+  const list = op.railRegion || op.b[0]?.region; if (!list?.length) return null;
+  const t = topoOf(fixed), M = fixed.matrixWorld; let lo = Infinity, hi = -Infinity; const v = V();
+  for (const i of list) for (let k = 0; k < 3; k++) { const d = v.fromArray(t.pos, t.idx[3 * i + k] * 3).applyMatrix4(M).sub(target).dot(dir); lo = Math.min(lo, d); hi = Math.max(hi, d); }
+  return hi - lo > 1e-3 ? { min: Math.min(0, lo), max: Math.max(0, hi) } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,7 +2050,18 @@ function showAdjust() {
   $('adj-chain').innerHTML = '';
   const mk = (txt, col, bold) => { const s = document.createElement('span'); if (col) { const d = document.createElement('i'); d.className = 'dot'; d.style.background = col; s.append(d, ' '); }
     const t = document.createElement(bold ? 'b' : 'span'); t.textContent = txt; s.append(t); return s; };
-  $('adj-chain').append(mk(op.child.name, 'var(--move)', true), mk(op.p.attach === 'none' ? 'moved to' : 'attached to'), mk(op.fixed.name, 'var(--fixed)', true));
+  const loop = canLoop(op.child, op.fixed) || !!op.result?.link;
+  $('adj-chain').append(mk(op.child.name, 'var(--move)', true), mk(op.p.attach === 'none' ? 'moved to' : op.p.attach === 'rail' ? 'slides in' : op.p.attach === 'link' ? 'also pinned to' : 'attached to'), mk(op.fixed.name, 'var(--fixed)', true));
+  if (op.p.attach === 'rail' || op.p.attach === 'link') $('adj-chain').append(mk(`· keeps its joint on ${parentPart(op.child)?.name || 'its parent'}`));
+  $('adj-loop').hidden = !loop; $('adj-pivot-f').hidden = op.p.attach === 'rail' || op.p.attach === 'link';
+  $('adj-rail-f').hidden = op.p.attach !== 'rail';
+  if (op.p.attach === 'rail') {
+    const ax = op.railAxes, faceOk = !!ax;
+    document.querySelectorAll('#adj-rail button').forEach(b => { b.setAttribute('aria-pressed', b.dataset.v === (op.p.rail || 'along') ? 'true' : 'false'); if (['along', 'across', 'out'].includes(b.dataset.v)) b.disabled = !faceOk && op.p.rail !== 'picked'; });
+    $('adj-rail-ends').checked = op.p.railEnds !== false;
+    $('adj-face-away').checked = op.p.faceAway ?? op.mode === 'BALL'; if (document.activeElement !== $('adj-twist')) $('adj-twist').value = op.p.twist || 0;
+    $('adj-rail-note').textContent = (op.linkNote || '') + (ax ? ` Faces read as ${ax.kind === 'groove' ? 'a channel' : ax.kind === 'flat' ? 'a flat face' : ax.kind === 'strip' ? 'a long strip' : 'a round socket (no clear direction)'}.` : '');
+  }
   if (op.match?.targets) $('adj-chain').append(mk('· also fitted against'), mk(op.match.targets.slice(1).map(t => t.mesh.name).join(', '), 'var(--fixed)', true));
   const geo = op.mode === 'PLANE' || op.mode === 'MID', isMatch = op.mode === 'MATCH';
   $('adj-spin-f').hidden = !(geo || isMatch); $('adj-gap-f').hidden = !(geo || isMatch); $('adj-flip-f').hidden = !geo; $('adj-across-f').hidden = op.mode !== 'MID';
@@ -1786,7 +2086,7 @@ function showAdjust() {
   $('adj-flip-label').textContent = op.mode === 'MID' ? 'Swap sides' : 'Face the same way';
   $('adj-spin').value = $('adj-spin-n').value = op.p.spin;
   $('adj-gap').value = op.p.gap; $('adj-flip').checked = op.p.flip; $('adj-across').checked = op.p.across;
-  document.querySelectorAll('#adj-parent button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.attach ? 'true' : 'false'));
+  document.querySelectorAll('#adj-parent button, #adj-loop button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.attach ? 'true' : 'false'));
   document.querySelectorAll('#adj-frame button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.frame ? 'true' : 'false'));
   document.querySelectorAll('#adj-pivot button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.pivot ? 'true' : 'false'));
   ['x', 'y', 'z'].forEach((k, i) => { const el = $('adj-off-' + k); if (el && document.activeElement !== el) el.value = (op.p.offset[i] || 0).toFixed(3); });
@@ -1828,8 +2128,26 @@ function bindAdjust() {
   $('adj-seat').addEventListener('change', slow(() => { lastOp.p.seat = lastSeat = $('adj-seat').checked; rerunLast(); showAdjust(); if (lastOp.p.seat && lastOp.seat) toast(`Seated: ${seatSummary(lastOp.seat.info)}`, 'ok'); }));
   document.querySelectorAll('#adj-centre button').forEach(b => b.addEventListener('click', () => {
     if (!lastOp) return; slow(() => { lastOp.p.centre = lastCentre = b.dataset.v; rerunLast(); showAdjust(); flashCentres(); })(); }));
-  document.querySelectorAll('#adj-parent button').forEach(b => b.addEventListener('click', () => {
-    if (!lastOp) return; lastOp.p.attach = lastAttach = b.dataset.v; rerunLast(); showAdjust(); }));
+  document.querySelectorAll('#adj-parent button, #adj-loop button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp) return; const v = b.dataset.v; lastOp.p.attach = v;
+    if (canLoop(lastOp.child, lastOp.fixed) || lastOp.result?.link) lastLoopAttach = v; if (v !== 'rail' && v !== 'link') lastAttach = v;
+    rerunLast(); showAdjust(); if (lastOp.linkNote && (v === 'rail' || v === 'link')) toast(lastOp.linkNote, 'ok'); }));
+  document.querySelectorAll('#adj-rail button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp) return; lastOp.p.rail = b.dataset.v; rerunLast(); showAdjust(); }));
+  $('adj-rail-ends').addEventListener('change', () => { if (!lastOp) return; lastOp.p.railEnds = $('adj-rail-ends').checked; rerunLast(); showAdjust(); });
+  $('adj-face-away').addEventListener('change', () => { if (!lastOp) return; lastOp.p.faceAway = $('adj-face-away').checked; rerunLast(); showAdjust(); });
+  const twist = d => { if (!lastOp) return; lastOp.p.twist = ((((lastOp.p.twist || 0) + d) % 360) + 540) % 360 - 180; rerunLast(); showAdjust(); };
+  $('adj-twist').addEventListener('change', () => { if (!lastOp) return; lastOp.p.twist = +$('adj-twist').value || 0; rerunLast(); showAdjust(); });
+  $('adj-tw-m').addEventListener('click', () => twist(-90)); $('adj-tw-p').addEventListener('click', () => twist(90));
+  $('adj-rail-pick').addEventListener('click', () => {
+    if (!lastOp) return; const op = lastOp;
+    startDirPick('Pick faces for the rail', dirs => {
+      if (!lastOp || lastOp !== op) return;
+      op.fixed.updateMatrixWorld(true);
+      op.p.rail = 'picked'; op.p.railPick = { dir: dirs.dir.clone().transformDirection(op.fixed.matrixWorld.clone().invert()).normalize().toArray(), name: dirs.name };
+      rerunLast(); showAdjust(); toast(`Slides ${dirs.name}.`, 'ok');
+    });
+  });
   $('adjust-head').addEventListener('click', () => { $('adjust-body').hidden = !$('adjust-body').hidden; });
   $('adj-search').addEventListener('click', searchAllFaces);
 
@@ -1907,6 +2225,7 @@ function paintSelection() { liveParts().forEach(m => m.material.emissive.set(m =
 /** mode: 'replace' (plain click), 'toggle' (Ctrl-click), 'add' */
 function select(mesh, mode = 'replace') {
   if (benchSel) { benchSel = null; benchMark.visible = false; }
+  connSel = null;
   const m = mesh && mesh.parent ? mesh : null;
   if (mode === 'replace') selection = m ? [m] : [];
   else if (m && mode === 'toggle') selection = isSel(m) ? selection.filter(x => x !== m) : [...selection, m];
@@ -1926,6 +2245,18 @@ function selectionRoots() { return selection.filter(m => m.parent && !selection.
 let gizmoBase = null;
 function syncGizmo() {
   tc.detach(); tc.showX = tc.showY = tc.showZ = true;
+  slideJ = null; $('pose-roller').hidden = true; connDrag = null;
+  if (connSel && ['move', 'rotate'].includes(tool)) {
+    const ci = connInfo(connSel); if (!ci) return;
+    proxy.position.copy(ci.point); proxy.scale.set(1, 1, 1);
+    // its own axes (rest axes for a joint) unless the bar says world
+    const q = moveFrame === 'world' ? new THREE.Quaternion() : ci.kind === 'joint' ? ci.restQ.clone() : ci.q.clone();
+    proxy.quaternion.copy(q); proxy.updateMatrixWorld(true);
+    if (tool === 'rotate' && ci.kind === 'link' && ci.type !== 'rail') { toast('A pin has no axes to turn. Use Move to drag its point.'); return; }
+    tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace(moveFrame === 'world' ? 'world' : 'local'); tc.attach(proxy);
+    connDrag = { c: connSel };
+    $('move-frame-note').textContent = moveFrame === 'world' ? 'world axes' : 'the connection\'s own axes'; return;
+  }
   if (benchSel && ['move', 'rotate'].includes(tool)) {
     const o = benchObj(); if (!o) return;
     const c = new THREE.Box3().setFromObject(o).getCenter(V());
@@ -1942,14 +2273,55 @@ function syncGizmo() {
     const j = jointOf(selected);
     if (!j) { toast(parentPart(selected) ? `${selected.name} is fixed to ${parentPart(selected).name}. Make it Pinned, Hinge or Roller in Properties to pose it.` : `${selected.name} has no joint yet. Snap it onto a parent first.`); return; }
     const t = j.userData.joint.type || 'pinned';
-    tc.setMode(t === 'roller' ? 'translate' : 'rotate'); tc.setSpace('local');
-    if (t !== 'pinned') { tc.showX = tc.showY = false; }          // a hinge turns, and a roller slides, about its Z only
+    if (t === 'roller') {
+      $('pose-roller').hidden = false; document.querySelectorAll('#pose-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)));
+      if (poseMode === 'slide') {
+        // the slide arrow runs along the roller's line, which stays put in its parent however the roller has turned
+        j.updateMatrixWorld(true);
+        proxy.position.setFromMatrixPosition(j.matrixWorld); proxy.quaternion.copy(j.parent.getWorldQuaternion(new THREE.Quaternion()).multiply(j.userData.joint.rest)); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+        tc.setMode('translate'); tc.setSpace('local'); tc.showX = tc.showY = false; tc.attach(proxy);
+        slideJ = { j }; return;
+      }
+      tc.setMode('rotate'); tc.setSpace('local'); tc.attach(j); return;           // turns any way
+    }
+    tc.setMode('rotate'); tc.setSpace('local');
+    if (t !== 'pinned') { tc.showX = tc.showY = false; }          // a hinge turns about its Z only
     tc.attach(j); return;
   }
   const c = sceneBox(selection.length ? selection : [selected]).getCenter(V());
-  proxy.position.copy(c); proxy.quaternion.identity(); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
-  tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace('world'); tc.attach(proxy);
+  proxy.position.copy(c); proxy.scale.set(1, 1, 1);
+  const fr = gizmoFrame(selected);
+  proxy.quaternion.copy(fr.q); proxy.updateMatrixWorld(true);
+  tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace(fr.local ? 'local' : 'world'); tc.attach(proxy);
+  $('move-frame-note').textContent = fr.note;
   gizmoLinkAsk();
+}
+/*
+ * Which way the Move and Rotate arrows point: the world's X/Y/Z, the part's own axes (as it was modelled, turned with
+ * it), or the axes of what it's attached to: its joint, if it has one, or else its parent part.
+ */
+let moveFrame = (() => { try { return localStorage.getItem('kitbash-moveframe') || 'world'; } catch (e) { return 'world'; } })();
+let poseMode = (() => { try { return localStorage.getItem('kitbash-posemode') || 'turn'; } catch (e) { return 'turn'; } })();
+let slideJ = null;                  // posing a roller by its slide arrow: { j, v0, p0 }
+let connDrag = null;                // dragging a selected connection's point or axes: { c, p, q }
+function gizmoFrame(part) {
+  const q = new THREE.Quaternion();
+  if (moveFrame === 'part') { part.updateMatrixWorld(true); part.getWorldQuaternion(q); return { q, local: true, note: `${part.name}'s own axes` }; }
+  if (moveFrame === 'parent') {
+    const j = jointOf(part), par = parentPart(part);
+    if (j) { j.getWorldQuaternion(q); return { q, local: true, note: `${par.name}: its joint's axes` }; }
+    if (par) { par.getWorldQuaternion(q); return { q, local: true, note: `${par.name}'s axes` }; }
+    part.getWorldQuaternion(q); return { q, local: true, note: `not attached: ${part.name}'s own axes` };
+  }
+  return { q, local: false, note: '' };
+}
+function setMoveFrame(v) {
+  moveFrame = v; try { localStorage.setItem('kitbash-moveframe', v); } catch (e) {}
+  document.querySelectorAll('#move-frame button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v))); syncGizmo();
+}
+function setPoseMode(v) {
+  poseMode = v; try { localStorage.setItem('kitbash-posemode', v); } catch (e) {}
+  document.querySelectorAll('#pose-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v))); syncGizmo();
 }
 /** The gizmo just landed on a part that hangs off another: offer to bring its group (once per pick of that part). */
 function gizmoLinkAsk() {
@@ -1976,6 +2348,8 @@ tc.addEventListener('mouseDown', () => {
     gizmoBase = { M0inv: proxy.matrixWorld.clone().invert(), items, bench: { o, W0: o.matrixWorld.clone(), sel: { ...benchSel } } };
     return;
   }
+  if (tc.object === proxy && connDrag) { connDrag.p = proxy.position.clone(); connDrag.q = proxy.quaternion.clone(); return; }
+  if (tc.object === proxy && slideJ) { slideJ.v0 = jointValue(slideJ.j); slideJ.p0 = proxy.position.clone(); poseHeld = links.length ? linkedState(slideJ.j) : null; return; }
   if (tc.object === proxy && selected) {
     const items = (selection.length ? selectionRoots() : [selected]).map(m => { m.updateMatrixWorld(true); return { m, W0: m.matrixWorld.clone() }; });
     gizmoBase = { M0inv: proxy.matrixWorld.clone().invert(), items };
@@ -1983,6 +2357,29 @@ tc.addEventListener('mouseDown', () => {
 });
 tc.addEventListener('objectChange', () => {
   if (fit.src && !$('fitcheck').hidden) scheduleFit();          // the cross-sections follow the drag
+  if (tc.object === proxy && connDrag?.p) {
+    const ci = connInfo(connDrag.c); if (!ci) return;
+    if (tc.mode === 'translate') {
+      const dW = proxy.position.clone().sub(connDrag.p); connDrag.p = proxy.position.clone(); if (dW.lengthSq() < 1e-14) return;
+      // into the same axes the offsets are kept in
+      const frameQ = ci.kind === 'joint' ? ci.restQ : ci.b.getWorldQuaternion(new THREE.Quaternion()), d = dW.clone().applyQuaternion(frameQ.clone().invert());
+      if (ci.kind === 'link') { const S = V().setFromMatrixScale(ci.b.matrixWorld); d.divide(S); }
+      shiftConn(ci, 'point', d.toArray());
+    } else {
+      const dq = proxy.quaternion.clone().multiply(connDrag.q.clone().invert()); connDrag.q = proxy.quaternion.clone();
+      if (ci.kind === 'joint') turnPivot(ci.j, dq);
+      else if (ci.type === 'rail') { const ax = railAxisLocal(ci.l).transformDirection(ci.b.matrixWorld).applyQuaternion(dq); ci.l.axis = ax.transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray(); ci.l.axisName = 'a direction turned by hand'; }
+    }
+    if (links.length) solveLinks(ci.kind === 'joint' ? ci.j : null, 15);
+    return;
+  }
+  if (tc.object === proxy && slideJ && slideJ.p0) {
+    const j = slideJ.j, ax = V(0, 0, 1).applyQuaternion(proxy.quaternion), prev = poseHeld || linkedState(j);
+    setJointValue(j, slideJ.v0 + proxy.position.clone().sub(slideJ.p0).dot(ax));
+    if (links.length) { const r = poseWithLinks(j, prev); poseHeld = linkedState(j);
+      if (!r.ok && performance.now() - (poseHeld.t || 0) > 1500) { toast("That's as far as the linkage goes: a piston or rail won't reach any further.", 'bad'); poseHeld.t = performance.now(); } }
+    posePanelLive(); if (magnets.length) rebuildMagnets(); return;
+  }
   if (tc.object?.userData.joint) {
     const j = tc.object; constrainJoint(j);
     if (links.length) {
@@ -2009,8 +2406,11 @@ tc.addEventListener('mouseUp', () => {
     else if (bb.sel.kind === 'ref') { const r = refById(bb.sel.k); if (r) { r.pos = o.position.toArray(); r.quat = o.quaternion.toArray(); } }
     else if (sprues?.frames[bb.sel.k]) { shiftSprue(bb.sel.k, o.position.clone()); }
   }
+  const slid = slideJ?.p0; if (slideJ) slideJ.p0 = null;
+  if (connDrag?.p) { const c = connDrag.c; connDrag.p = null; connChanged(c); renderPartPanel(); syncGizmo(); markDirty(); return; }
+  if (tc.object?.userData.joint && links.some(l => l.face)) refreshFacing(tc.object);
   gizmoBase = null; renderPartPanel(); markDirty(); if (sprues) rebuildSprues();
-  if (bb) syncGizmo();
+  if (bb || slid) syncGizmo();                        // the slide arrow goes back to where the roller stopped
 });
 
 const eyeOpen = '<svg viewBox="0 0 16 16"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z"/><circle cx="8" cy="8" r="2"/></svg>';
@@ -2030,6 +2430,11 @@ function renderOutliner() {
     const link = document.createElement('span'); link.className = 'link';
     const lt = linkTypeOf(p); link.textContent = depth ? TYPE_ICON[lt] : ''; link.title = lt === 'fixed' ? 'Fixed to its parent' : `${TYPE_LABEL[lt]} (pose with P)`;
     if (links.some(l => l.a === p.uuid || l.b === p.uuid)) { link.textContent += '⛓'; link.title += ' · also connected to another part'; }
+    if (depth && jointOf(p)) {
+      link.classList.add('pick'); link.title += ' · click to select this connection'; const jid = jointOf(p).uuid;
+      if (connSel?.kind === 'joint' && connSel.id === jid) link.classList.add('on');
+      link.addEventListener('click', ev => { ev.stopPropagation(); selectConn({ kind: 'joint', id: jid }); });
+    }
     const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = baseColor(p);
     const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = p.name;
     const eye = document.createElement('button'); eye.className = 'eye'; eye.type = 'button'; eye.title = p.visible ? 'Hide' : 'Show';
@@ -2067,6 +2472,7 @@ function renderOutliner() {
 function renderPartPanel() {
   const el = $('part-panel'); el.innerHTML = '';
   if (benchSel) return renderBenchPanel(el);
+  if (connSel) { if (connInfo(connSel)) return renderConnPanel(el); connSel = null; }
   if (!selected) { el.innerHTML = '<p class="note">Select a part to see its size and attachments. Ctrl-click or Ctrl-drag to select several.</p>'; return; }
   if (selection.length > 1) return renderMultiPanel(el);
   const p = selected, size = exactBox(p).getSize(V()), par = parentPart(p), j = jointOf(p);
@@ -2101,10 +2507,78 @@ function renderPartPanel() {
   connectionRows(p, el);
   magnetRows(p, el);
 }
+/** The selected connection: what it joins, how, its offsets, and its magnets. */
+function renderConnPanel(el) {
+  const ci = connInfo(connSel), c = connSel;
+  const head = document.createElement('div'); head.className = 'multi-head'; head.textContent = ci.kind === 'joint' ? `Connection: ${TYPE_LABEL[ci.type]}` : ci.type === 'rail' ? 'Connection: rail' : 'Connection: extra pin';
+  const sm = document.createElement('small'); sm.textContent = ci.kind === 'joint' ? `${ci.a.name} hangs off ${ci.b.name} here. Move (G) drags the point, Rotate (R) turns its axes; the parts stay put.`
+    : `${ci.a.name} is ${ci.type === 'rail' ? 'on a rail on' : 'pinned to'} ${ci.b.name} here. Move (G) drags the point on ${ci.b.name}${ci.type === 'rail' ? ', Rotate (R) turns the rail' : ''}.`;
+  head.append(sm); el.append(head);
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, title) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; if (title) x.title = title; x.addEventListener('click', fn); row.append(x); return x; };
+  b(`Select ${ci.a.name}`, () => { connSel = null; select(ci.a); renderPartPanel(); });
+  b(`Select ${ci.b.name}`, () => { connSel = null; select(ci.b); renderPartPanel(); });
+  if (ci.kind === 'link') b('Remove', () => { pushUndo(); links = links.filter(l => l.id !== c.id); magnets.forEach(mg => { if (sameConn(mg.conn, c)) delete mg.conn; }); connSel = null; afterHierarchyChange(); renderPartPanel(); toast('Removed that connection.'); });
+  else b('Detach', () => { pushUndo(); const p = ci.a; connSel = null; detach(p); afterHierarchyChange(); select(p); toast(`${p.name} is loose now.`); }, 'Take the part off: no joint, no parent');
+  el.append(row);
+  // type, axis, limits and extra links: the same rows as the part's own
+  if (ci.kind === 'joint') connectionRows(ci.a, el);
+  else connectionRows(ci.a, el, { only: c.id });
+  // offsets you can come back to
+  const off = connOffsets(ci), sec = document.createElement('div'); sec.className = 'conn conn-off';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = ci.kind === 'joint' ? "Offsets (mm, along the joint's own axes)" : "Offsets (mm, along each part's own axes)"; sec.append(h);
+  const stepSel = document.createElement('select'); stepSel.className = 'num osel'; stepSel.setAttribute('aria-label', 'Step');
+  for (const v of ['0.01', '0.05', '0.1', '0.5', '1']) { const o = document.createElement('option'); o.value = v; o.textContent = `${v} mm steps`; stepSel.append(o); } stepSel.value = connStep;
+  stepSel.addEventListener('change', () => { connStep = stepSel.value; });
+  const line = (label, which, vals, tip) => {
+    const f = document.createElement('div'); f.className = 'conn-f off-row'; const l = document.createElement('label'); l.textContent = label; l.title = tip; f.append(l);
+    ['X', 'Y', 'Z'].forEach((ax, i) => {
+      const wrap = document.createElement('span'); wrap.className = 'off-ax';
+      const mk = (t, sg) => { const x = document.createElement('button'); x.type = 'button'; x.className = 'mini'; x.textContent = t; x.setAttribute('aria-label', `${label} ${ax} ${sg > 0 ? 'up' : 'down'} a step`);
+        x.addEventListener('click', () => { const d = [0, 0, 0]; d[i] = sg * +connStep; pushUndo(); shiftConn(connInfo(c), which, d); connChanged(c); }); return x; };
+      const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = connStep; n.value = (+vals[i]).toFixed(2); n.setAttribute('aria-label', `${label} ${ax} in mm`); n.title = `${ax}: ${tip}`;
+      n.addEventListener('change', () => { const d = [0, 0, 0]; d[i] = (+n.value || 0) - vals[i]; if (!d[i]) return; pushUndo(); shiftConn(connInfo(c), which, d); connChanged(c); });
+      const t = document.createElement('span'); t.className = 'ax ' + ax.toLowerCase(); t.textContent = ax;
+      wrap.append(t, mk('−', -1), n, mk('+', 1)); f.append(wrap);
+    });
+    sec.append(f);
+  };
+  if (ci.kind === 'joint') {
+    line('Point', 'point', off.point, `moves where ${ci.a.name} turns (or slides) on ${ci.b.name}, along the joint's axes; nothing else moves`);
+    line(`${ci.a.name} from it`, 'part', off.part, `moves ${ci.a.name} away from the point, along the joint's axes (a gap, or a ball sitting deeper)`);
+  } else {
+    line(`On ${ci.b.name}`, 'point', off.point, `moves the end on ${ci.b.name}, along ${ci.b.name}'s axes`);
+    line(`On ${ci.a.name}`, 'part', off.part, `moves the end on ${ci.a.name}, along ${ci.a.name}'s axes`);
+  }
+  const zr = document.createElement('div'); zr.className = 'btnrow'; zr.append(stepSel);
+  const zero = document.createElement('button'); zero.type = 'button'; zero.className = 'btn'; zero.textContent = 'Clear offsets'; zero.title = 'Put the point and the part back where the connection was made';
+  zero.addEventListener('click', () => { const o = connOffsets(connInfo(c)); if (!o.point.some(Boolean) && !o.part.some(Boolean)) return; pushUndo(); shiftConn(connInfo(c), 'point', o.point.map(v => -v)); shiftConn(connInfo(c), 'part', o.part.map(v => -v)); connChanged(c); toast('Offsets cleared.'); });
+  zr.append(zero); sec.append(zr); el.append(sec);
+  // magnets at this connection
+  const ms = magnets.filter(mg => sameConn(mg.conn, c)), mbox = document.createElement('div'); mbox.className = 'conn';
+  const mh = document.createElement('div'); mh.className = 'conn-h'; mh.textContent = ms.length ? `Magnets here (${ms.length})` : 'Magnets'; mbox.append(mh);
+  for (const mg of ms) {
+    const r2 = document.createElement('div'); r2.className = 'conn-f off-row'; const t = document.createElement('label'); t.textContent = `${magLabel(mg)}, shifted`; r2.append(t);
+    ['across', 'and'].forEach((lab, i) => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = '0.1'; n.value = (+(mg.shift?.[i] || 0)).toFixed(2); n.setAttribute('aria-label', `Magnet shift ${i ? 'Y' : 'X'} in mm`); n.title = 'Shift the pair across the connection, mm';
+      n.addEventListener('change', () => { pushUndo(); mg.shift = mg.shift || [0, 0]; mg.shift[i] = +n.value || 0; placeConnMagnets(c); markDirty(); }); r2.append(n); });
+    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'mini'; rm.textContent = '✕'; rm.title = 'Remove this pair of holes';
+    rm.addEventListener('click', () => { pushUndo(); magnets = magnets.filter(x => x !== mg); markDirty(); rebuildMagnets(); renderPartPanel(); });
+    const sz = document.createElement('button'); sz.type = 'button'; sz.className = 'mini'; sz.textContent = '⟳'; sz.title = "Give this pair the size and fit set in the Magnet tool's bar";
+    sz.addEventListener('click', () => { pushUndo(); Object.assign(mg, magSize()); placeConnMagnets(c); markDirty(); renderPartPanel(); });
+    r2.append(sz, rm); mbox.append(r2);
+  }
+  const add = document.createElement('div'); add.className = 'btnrow';
+  const ab = document.createElement('button'); ab.type = 'button'; ab.className = 'btn'; ab.textContent = `Add magnet here (${magLabel(magSize())})`;
+  ab.title = `A pair of holes, one in ${ci.a.name} and one in ${ci.b.name}, where they meet along this connection. Size and fit come from the Magnet tool's bar. They move with the connection if you change it later.`;
+  ab.addEventListener('click', () => addConnMagnet(c)); add.append(ab); mbox.append(add); el.append(mbox);
+}
+let connStep = '0.1';
 /** How the selected part is connected: its link type to its parent, and any extra connections (pistons, levers). */
-function connectionRows(p, el) {
-  const par = parentPart(p), sec = document.createElement('div'); sec.className = 'conn';
-  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = par ? `Connection to ${par.name}` : 'Connections'; sec.append(h);
+function connectionRows(p, el, { only = null } = {}) {
+  const par = only ? null : parentPart(p), sec = document.createElement('div'); sec.className = 'conn';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = par ? `Connection to ${par.name}` : only ? 'This connection' : 'Connections'; sec.append(h);
+  if (par && jointOf(p) && !connSel) { const pk = document.createElement('button'); pk.type = 'button'; pk.className = 'mini conn-pick'; pk.textContent = '⌖ Select'; pk.title = 'Select this connection: drag its point, set offsets, add magnets';
+    pk.addEventListener('click', () => selectConn({ kind: 'joint', id: jointOf(p).uuid })); h.append(' ', pk); }
   const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); sec.append(f); return f; };
   const num = (v, ph, step, onCh, aria) => { const i = document.createElement('input'); i.type = 'number'; i.className = 'num'; i.step = step; i.placeholder = ph; i.value = v == null ? '' : +(+v).toFixed(2); i.setAttribute('aria-label', aria);
     i.addEventListener('change', () => onCh(i.value === '' ? null : +i.value)); return i; };
@@ -2113,7 +2587,7 @@ function connectionRows(p, el) {
   const change = (fn, msg) => { pushUndo(); lastOp = null; const err = fn(); scene.updateMatrixWorld(true); if (links.length) solveLinks(jointOf(p)); afterHierarchyChange(); if (err) toast(err, 'bad'); else if (msg) toast(msg, 'ok'); };
   if (par) {
     const type = linkTypeOf(p), seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${p.name} connects to ${par.name}`);
-    for (const [t, tip] of [['pinned', 'Turns any way about its point, like a ball or a pin in a socket'], ['hinge', 'Turns about one axis only, like a knee'], ['roller', 'Slides along one axis only, like a piston rod'], ['fixed', "Doesn't move"]]) {
+    for (const [t, tip] of [['pinned', 'Turns any way about its point, like a ball or a pin in a socket'], ['hinge', 'Turns about one axis only, like a knee'], ['roller', 'Slides along one axis and turns any way as it goes, like a ball riding in a channel'], ['fixed', "Doesn't move"]]) {
       const b = document.createElement('button'); b.type = 'button'; b.textContent = TYPE_LABEL[t]; b.title = tip; b.setAttribute('aria-pressed', type === t ? 'true' : 'false');
       b.addEventListener('click', () => { if (type !== t) change(() => setLinkType(p, t), `${p.name} is now ${TYPE_LABEL[t].toLowerCase()} to ${par.name}.`); });
       seg.append(b);
@@ -2122,8 +2596,14 @@ function connectionRows(p, el) {
     const j = jointOf(p), jd = j?.userData.joint;
     if (jd && (jd.type === 'hinge' || jd.type === 'roller')) {
       const isH = jd.type === 'hinge', unit = isH ? '°' : 'mm';
-      field(isH ? 'Turns about' : 'Slides along', sel([...(isH ? [['joint', 'Joint axis']] : []), ['x', `${p.name}'s X`], ['y', `${p.name}'s Y`], ['z', `${p.name}'s Z`]], jd.axis || (isH ? 'joint' : 'z'),
-        v => change(() => setLinkType(p, jd.type, v)), isH ? 'Hinge axis' : 'Roller axis'));
+      field(isH ? 'Turns about' : 'Slides along', sel([...(isH ? [['joint', 'Joint axis']] : []), ['x', `${p.name}'s X`], ['y', `${p.name}'s Y`], ['z', `${p.name}'s Z`],
+          ...(jd.axis === 'custom' ? [['custom', jd.axisName || 'Picked faces']] : []), ['faces', 'Pick faces…']], jd.axis || (isH ? 'joint' : 'z'),
+        v => {
+          if (v !== 'faces') { change(() => setLinkType(p, jd.type, v)); return; }
+          startDirPick(isH ? `Pick faces for ${p.name}'s hinge axis` : `Pick faces for ${p.name} to slide along`, d => change(() => {
+            const jj = jointOf(p); reframeJoint(jj, d.dir); jj.userData.joint.axis = 'custom'; jj.userData.joint.axisName = d.name[0].toUpperCase() + d.name.slice(1); jj.userData.joint.min = jj.userData.joint.max = null;
+          }, `${p.name} now ${isH ? 'turns about' : 'slides along'} ${d.name}.`), { onCancel: renderPartPanel });
+        }, isH ? 'Hinge axis' : 'Roller axis'));
       const val = num(jointValue(j), '0', isH ? 1 : 0.1, v => { pushUndo(); lastOp = null; const prev = linkedState(j); setJointValue(j, v || 0); const r = poseWithLinks(j, prev); afterHierarchyChange();
         if (!r.ok) toast(`The linkage stops it at ${jointValue(j).toFixed(isH ? 1 : 2)}${isH ? '°' : ' mm'}: a piston or rail won't reach any further.`, 'bad'); }, isH ? 'Hinge angle in degrees' : 'Roller travel in mm'); val.id = 'conn-value';
       field(isH ? `Angle ${unit}` : `Travel ${unit}`, val);
@@ -2132,29 +2612,50 @@ function connectionRows(p, el) {
     }
   }
   // extra connections that close loops: pistons, levers
-  const mine = links.filter(l => l.a === p.uuid || l.b === p.uuid);
+  const mine = links.filter(l => (l.a === p.uuid || l.b === p.uuid) && (!only || l.id === only));
   for (const l of mine) {
     const other = partByUuid(l.a === p.uuid ? l.b : l.a); if (!other) continue;
     const railOn = partByUuid(l.b), f = document.createElement('div'); f.className = 'conn-link';
     const t = document.createElement('span');
-    t.textContent = l.kind !== 'rail' ? `Also pinned to ${other.name}` : railOn === p ? `${other.name} rides a rail on it (its ${l.axis.toUpperCase()})` : `Rides a rail on ${railOn.name} (its ${l.axis.toUpperCase()})`;
+    t.textContent = l.kind !== 'rail' ? `Also pinned to ${other.name}` : railOn === p ? `${other.name} rides a rail on it (${railLabel(l)})` : `Rides a rail on ${railOn.name} (${railLabel(l)})`;
     // seen from this part, a rail is on the other part: the rail side is b
-    const kind = sel([['pin', 'Pin'], ['rail-x', `Rail along ${other.name}'s X`], ['rail-y', `Rail along ${other.name}'s Y`], ['rail-z', `Rail along ${other.name}'s Z`]],
-      l.kind === 'rail' && railOn === other ? 'rail-' + l.axis : l.kind === 'rail' ? '' : 'pin', v => change(() => {
+    const custom = l.kind === 'rail' && Array.isArray(l.axis);
+    const kind = sel([['pin', 'Pin'], ['rail-x', `Rail along ${other.name}'s X`], ['rail-y', `Rail along ${other.name}'s Y`], ['rail-z', `Rail along ${other.name}'s Z`],
+        ...(custom && railOn === other ? [['rail-custom', `Rail along ${l.axisName || 'the picked faces'}`]] : []), ['rail-faces', 'Rail along picked faces…']],
+      l.kind === 'rail' && railOn === other ? (custom ? 'rail-custom' : 'rail-' + l.axis) : l.kind === 'rail' ? '' : 'pin', v => {
+      if (v === 'rail-custom') return;
+      if (v === 'rail-faces') {
+        startDirPick('Pick faces for the rail', d => change(() => {
+          const A = partByUuid(l.a), B = partByUuid(l.b); A.updateMatrixWorld(true); B.updateMatrixWorld(true);
+          const at = V(...l.pa).applyMatrix4(A.matrixWorld);
+          if (l.b === p.uuid) Object.assign(l, { a: B.uuid, b: A.uuid });            // the rail goes on the other part
+          const a2 = partByUuid(l.a), b2 = partByUuid(l.b);
+          l.pa = at.clone().applyMatrix4(a2.matrixWorld.clone().invert()).toArray(); l.pb = at.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray();
+          l.kind = 'rail'; l.axis = d.dir.clone().transformDirection(b2.matrixWorld.clone().invert()).normalize().toArray(); l.axisName = d.name; l.min = l.max = null;
+        }, `Now rides a rail along ${d.name}.`), { onCancel: renderPartPanel });
+        return;
+      }
+      change(() => {
         const A = partByUuid(l.a), B = partByUuid(l.b); A.updateMatrixWorld(true); B.updateMatrixWorld(true);
         const at = V(...l.pa).applyMatrix4(A.matrixWorld);                  // where the moving end is now: the pin or the rail starts there
         if (v !== 'pin' && l.b === p.uuid) { Object.assign(l, { a: B.uuid, b: A.uuid }); }
         const a2 = partByUuid(l.a), b2 = partByUuid(l.b);
         l.pa = at.clone().applyMatrix4(a2.matrixWorld.clone().invert()).toArray(); l.pb = at.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray();
-        if (v === 'pin') l.kind = 'pin'; else { l.kind = 'rail'; l.axis = v.slice(5); l.min = l.max = null; } }), 'Connection kind');
+        if (v === 'pin') l.kind = 'pin'; else { l.kind = 'rail'; l.axis = v.slice(5); l.axisName = ''; l.min = l.max = null; } }); }, 'Connection kind');
     if (l.kind === 'rail' && railOn === p) { const o = document.createElement('option'); o.value = ''; o.textContent = `Rail on ${p.name}`; o.disabled = true; kind.prepend(o); kind.value = ''; }
     const del = document.createElement('button'); del.type = 'button'; del.className = 'mini'; del.textContent = '✕'; del.title = 'Remove this connection';
     del.addEventListener('click', () => change(() => { links = links.filter(x => x !== l); }, 'Removed that connection.'));
-    f.append(t, kind, del); sec.append(f);
+    const pick = document.createElement('button'); pick.type = 'button'; pick.className = 'mini'; pick.textContent = '⌖'; pick.title = 'Select this connection: drag its point, set offsets, add magnets';
+    pick.addEventListener('click', () => selectConn({ kind: 'link', id: l.id }));
+    f.append(t, kind, ...(only ? [] : [pick]), del); sec.append(f);
+    { const lab = document.createElement('label'); lab.className = 'check conn-face'; const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!l.face;
+      cb.title = `Keep ${partByUuid(l.a)?.name || 'it'} facing the same way relative to ${partByUuid(l.b)?.name || 'the part it\'s linked to'} while you pose, instead of spinning on its own axis`;
+      cb.addEventListener('change', () => change(() => { if (cb.checked) setFacing(l); else delete l.face; }, cb.checked ? 'It keeps facing this way as you pose.' : 'It can spin on its own axis as you pose.'));
+      lab.append(cb, ' Keep facing this way'); sec.append(lab); }
     if (l.kind === 'rail') field('Rail ends mm', num(l.min, 'none', 0.1, v => change(() => { l.min = v; }), 'Rail start'), document.createTextNode('to'), num(l.max, 'none', 0.1, v => change(() => { l.max = v; }), 'Rail end'));
   }
   const others = liveParts().filter(o => o !== p && !mine.some(l => l.a === o.uuid || l.b === o.uuid) && o !== par);
-  if (others.length) {
+  if (others.length && !only) {
     const who = sel([['', 'Connect also to…'], ...others.map(o => [o.uuid, o.name])], '', () => {}, 'Part to connect to');
     const kind = sel([['pin', 'with a pin'], ['rail-x', 'on a rail (its X)'], ['rail-y', 'on a rail (its Y)'], ['rail-z', 'on a rail (its Z)']], 'pin', () => {}, 'Connection kind');
     const go = document.createElement('button'); go.type = 'button'; go.className = 'btn'; go.textContent = 'Connect';
@@ -3439,8 +3940,8 @@ function poseDofs(fig, F, whole) {
   for (const j of js) {
     const jd = j.userData.joint, t = jd.type || 'pinned';
     if (t === 'hinge') out.push({ j, name: 'hinge', sweep: true, step: 0.35, min: 0.01, apply: h => setJointValue(j, jointValue(j) + h * 180 / Math.PI) });
-    else if (t === 'roller') out.push({ j, name: 'roller', step: size * 0.04, min: size * 0.002, apply: h => setJointValue(j, jointValue(j) + h) });
     else {
+      if (t === 'roller') out.push({ j, name: 'roller', step: size * 0.04, min: size * 0.002, apply: h => setJointValue(j, jointValue(j) + h) });
       // pinned: turn in the picture's plane (what the outline shows best), and tilt toward or away from it (foreshortening),
       // both about the joint's point; a turn about the limb's own length doesn't change its outline, so that's left alone
       const turnWorld = (axis, h) => { const pw = j.parent.getWorldQuaternion(new THREE.Quaternion()); j.quaternion.premultiply(pw.clone().invert().multiply(new THREE.Quaternion().setFromAxisAngle(axis, h)).multiply(pw)); j.updateMatrixWorld(true); };
@@ -3528,6 +4029,109 @@ function updateStats() {
   $('stats').textContent = `${ps.length} parts · ${tris.toLocaleString()} tris · ${joints.filter(j => j.parent).length} joints`;
 }
 
+/*
+ * Connections you can select and change later: each joint (a part on its parent) and each extra link (a pin or a rail).
+ * Select one by clicking its marker, its icon in the Parts list, or ⌖ in Properties. Then:
+ *   - Move (G) drags the connection point itself, Rotate (R) turns its axes; the parts stay where they are
+ *   - Properties shows its type, axis and limits, offsets you can type (the point, and the part from the point),
+ *     and magnets placed at it: they follow when the connection changes
+ * Offsets are kept with the connection (joint: pointOff in its rest axes, partOff in its own axes; link: offA/offB in
+ * each part's axes), so they can be read and changed again at any point.
+ */
+let connSel = null;                 // { kind: 'joint', id: joint uuid } | { kind: 'link', id: link id }
+const jointById = id => joints.find(j => j.uuid === id && j.parent) || null;
+const linkById = id => links.find(l => l.id === id) || null;
+/** Everything about a connection, live: its parts, where it is and which way it points (world). */
+function connInfo(c) {
+  if (!c) return null;
+  if (c.kind === 'joint') {
+    const j = jointById(c.id); if (!j) return null;
+    const child = j.children.find(isPart), par = parentPart(child || j) || (isPart(j.parent) ? j.parent : null); if (!child || !par) return null;
+    j.updateMatrixWorld(true);
+    const jd = j.userData.joint, P = V().setFromMatrixPosition(j.matrixWorld), q = j.getWorldQuaternion(new THREE.Quaternion());
+    const rq = j.parent.getWorldQuaternion(new THREE.Quaternion()).multiply(jd.rest);
+    return { c, kind: 'joint', j, jd, a: child, b: par, point: P, axis: V(0, 0, 1).applyQuaternion(q), q, restQ: rq, name: `${child.name} on ${par.name}`, type: jd.type || 'pinned' };
+  }
+  const l = linkById(c.id); if (!l) return null;
+  const a = partByUuid(l.a), b = partByUuid(l.b); if (!a || !b) return null;
+  a.updateMatrixWorld(true); b.updateMatrixWorld(true);
+  const P = V(...l.pb).applyMatrix4(b.matrixWorld), ja = jointOf(a);
+  let axis = l.kind === 'rail' ? railAxisLocal(l).transformDirection(b.matrixWorld)
+    : ja ? V(...l.pa).applyMatrix4(a.matrixWorld).sub(V().setFromMatrixPosition(ja.matrixWorld)) : worldBox(a).getCenter(V()).sub(worldBox(b).getCenter(V()));
+  if (axis.lengthSq() < 1e-10) axis = V(0, 0, 1); axis.normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(V(0, 0, 1), axis);
+  return { c, kind: 'link', l, a, b, point: P, axis, q, restQ: b.getWorldQuaternion(new THREE.Quaternion()), name: `${a.name} ${l.kind === 'rail' ? 'on a rail on' : 'pinned to'} ${b.name}`, type: l.kind };
+}
+function allConns() {
+  return [...joints.filter(j => j.parent && j.children.some(isPart)).map(j => ({ kind: 'joint', id: j.uuid })), ...links.map(l => ({ kind: 'link', id: l.id }))].map(connInfo).filter(Boolean);
+}
+const sameConn = (x, y) => !!x && !!y && x.kind === y.kind && x.id === y.id;
+function selectConn(c) {
+  connSel = c || null;
+  if (connSel) { selection = []; selected = null; if (benchSel) { benchSel = null; benchMark.visible = false; } }
+  paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); updateButtons();
+  if (connSel) { const ci = connInfo(connSel); if (ci) toast(`Connection: ${ci.name}. Move (G) drags its point, Rotate (R) turns its axes.`); }
+}
+/** The connection whose marker is within a few pixels of a click, nearest first. */
+function connAt(ev) {
+  if (!$('set-joints').checked) return null;
+  const r = renderer.domElement.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top; let best = null, bd = 12;
+  for (const ci of allConns()) {
+    if (!isVisibleChain(ci.a) || !isVisibleChain(ci.b)) continue;
+    const pts = [ci.point]; if (ci.kind === 'link') pts.push(V(...ci.l.pa).applyMatrix4(ci.a.matrixWorld));
+    for (const p of pts) { const v = p.clone().project(camera); if (v.z > 1) continue; const d = Math.hypot((v.x + 1) / 2 * r.width - x, (1 - v.y) / 2 * r.height - y); if (d < bd) { bd = d; best = ci.c; } }
+  }
+  return best;
+}
+// the selected connection's marker: a ring round its point, square to its axis
+const connMark = new THREE.Group();
+{ const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 48 }, (_, i) => { const a = i / 48 * Math.PI * 2; return V(Math.cos(a), Math.sin(a), 0); })), new THREE.LineBasicMaterial({ color: '#4db4dc', depthTest: false }));
+  const ax = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(0, 0, -1.6), V(0, 0, 1.6)]), new THREE.LineBasicMaterial({ color: '#4db4dc', depthTest: false }));
+  ring.renderOrder = ax.renderOrder = 1000; connMark.add(ring, ax); connMark.visible = false; scene.add(connMark); }
+function updateConnMark() {
+  const ci = connSel && connInfo(connSel); connMark.visible = !!ci; if (!ci) return;
+  const s2 = markerSize() * 3.5; connMark.position.copy(ci.point); connMark.quaternion.copy(ci.q); connMark.scale.setScalar(s2);
+}
+/** Move a joint's point (world mm) without moving anything on it: the parts stay put, the pivot moves. */
+function movePivot(j, dWorld) {
+  const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
+  home.updateMatrixWorld(true);
+  const inv = home.matrixWorld.clone().invert(), P = V().setFromMatrixPosition(j.matrixWorld), P2 = P.clone().add(dWorld).applyMatrix4(inv), dLocal = P2.sub(P.clone().applyMatrix4(inv));
+  j.position.add(dLocal); j.userData.joint.restPos.add(dLocal); j.updateMatrixWorld(true); kids.forEach(k => j.attach(k));
+}
+/** Turn a joint's axes (world turn dq about its point) without moving anything on it. */
+function turnPivot(j, dq) {
+  const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
+  const pq = home.getWorldQuaternion(new THREE.Quaternion()), jq = j.getWorldQuaternion(new THREE.Quaternion());
+  j.quaternion.copy(pq.clone().invert().multiply(dq.clone().multiply(jq)));
+  const jd = j.userData.joint, rw = pq.clone().multiply(jd.rest); jd.rest.copy(pq.clone().invert().multiply(dq.clone().multiply(rw)));
+  j.updateMatrixWorld(true); kids.forEach(k => j.attach(k));
+  if (jd.type === 'hinge' || jd.type === 'roller') { jd.axis = 'custom'; jd.axisName = 'Turned by hand'; }
+}
+/** The distances a connection has been shifted by, for showing and typing. */
+function connOffsets(ci) {
+  if (ci.kind === 'joint') return { point: ci.jd.pointOff || [0, 0, 0], part: ci.jd.partOff || [0, 0, 0] };
+  return { point: ci.l.offB || [0, 0, 0], part: ci.l.offA || [0, 0, 0] };
+}
+/**
+ * Shift a connection by d (3 numbers): which 'point' (the connection's point, in its rest axes; for a link, the end on
+ * its second part, in that part's axes) or 'part' (a joint's part away from its point, in the joint's axes; for a
+ * link, the end on its first part, in that part's axes).
+ */
+function shiftConn(ci, which, d) {
+  if (ci.kind === 'joint') {
+    const jd = ci.jd, key = which === 'point' ? 'pointOff' : 'partOff', o = jd[key] || [0, 0, 0]; jd[key] = o.map((v, i) => +(v + d[i]).toFixed(6));
+    if (which === 'point') movePivot(ci.j, V(...d).applyQuaternion(ci.restQ));
+    else { const kid = ci.a; kid.position.add(V(...d).applyQuaternion(kid.quaternion.clone().identity())); kid.updateMatrixWorld(true); }   // the joint's own frame is the child's parent frame
+  } else {
+    const l = ci.l, key = which === 'point' ? 'offB' : 'offA', o = l[key] || [0, 0, 0]; l[key] = o.map((v, i) => +(v + d[i]).toFixed(6));
+    if (which === 'point') l.pb = V(...l.pb).add(V(...d)).toArray(); else l.pa = V(...l.pa).add(V(...d)).toArray();
+  }
+  scene.updateMatrixWorld(true);
+}
+/** After a connection changed: close the loops again and re-seat its magnets. */
+function connChanged(c) { if (links.length) solveLinks(c.kind === 'joint' ? jointById(c.id) : null); scene.updateMatrixWorld(true); placeConnMagnets(c); afterHierarchyChange(); }
+
 // skeleton: joint to joint lines, drawn every frame
 const linkLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: '#7fd3c4', depthTest: false, transparent: true, opacity: .95 }));
 linkLines.renderOrder = 999; linkLines.frustumCulled = false; scene.add(linkLines);
@@ -3546,10 +4150,11 @@ function updateSkeleton() {
     const a = partByUuid(l.a), b = partByUuid(l.b); if (!a || !b || !isVisibleChain(a) || !isVisibleChain(b)) continue;
     const pa = V(...l.pa).applyMatrix4(a.matrixWorld), pb = V(...l.pb).applyMatrix4(b.matrixWorld), s2 = markerSize() * 1.2;
     for (const d of [V(s2, 0, 0), V(0, s2, 0), V(0, 0, s2)]) lp.push(pa.clone().sub(d), pa.clone().add(d));
-    if (l.kind === 'rail') { const ax = AXIS_V[l.axis].clone().transformDirection(b.matrixWorld), lo = l.min ?? -s2 * 8, hi = l.max ?? s2 * 8; lp.push(pb.clone().addScaledVector(ax, lo), pb.clone().addScaledVector(ax, hi)); }
+    if (l.kind === 'rail') { const ax = railAxisLocal(l).transformDirection(b.matrixWorld), lo = l.min ?? -s2 * 8, hi = l.max ?? s2 * 8; lp.push(pb.clone().addScaledVector(ax, lo), pb.clone().addScaledVector(ax, hi)); }
     else if (pa.distanceTo(pb) > 1e-3) lp.push(pa, pb);
   }
   linkLines.geometry.setFromPoints(lp);
+  updateConnMark();
 }
 
 // ---------------------------------------------------------------------------
@@ -4146,13 +4751,18 @@ async function mergeSTLs(bufs, title = 'Merging into one solid', holes = []) {
   if (!$('exp-merge').checked) return { files: bufs, note: '' };
   loading.show(title); loading.set(0.15, 'Removing the surfaces inside the model…'); await nextFrame();
   try {
-    const out = await mergeJobs(bufs.map((b, i) => ({ soups: [soupFromSTL(b)], subtract: holes[i] || [] })), { fillHollows: true });
+    const out = await mergeJobs(bufs.map((b, i) => ({ soups: [soupFromSTL(b)], subtract: holes[i] || [] })), { fillHollows: true, loose: $('exp-loose').value });
     const s = out.reduce((a, r) => ({ inS: a.inS + r.inputShells, outS: a.outS + r.shells, h: a.h + r.hollows, hv: a.hv + r.hollowVolume, hl: a.hl + r.hollowsLeft, hlv: a.hlv + r.hollowLeftVolume, rep: a.rep + r.repaired, un: a.un + r.unmerged }), { inS: 0, outS: 0, h: 0, hv: 0, hl: 0, hlv: 0, rep: 0, un: 0 });
     const mm3 = v => v < 1 ? v.toFixed(2) : v.toFixed(0);
     const files = out.map(r => stlFromSoup(r.positions));
-    let note = s.inS > s.outS || s.h || s.hl ? `Merged ${s.inS} shell${s.inS === 1 ? '' : 's'} into ${s.outS} solid${s.outS === 1 ? '' : 's'}, with no surfaces left inside.` : 'Already clean: no surfaces inside.';
+    let note = s.inS > s.outS ? `Merged ${s.inS} shell${s.inS === 1 ? '' : 's'} into ${s.outS} solid${s.outS === 1 ? '' : 's'}, with no surfaces left inside.` : 'No surfaces left inside.';
     if (s.h) note += ` Filled ${s.h} sealed hollow${s.h === 1 ? '' : 's'} (${mm3(s.hv)} mm³).`;
     if (s.hl) note += ` ${s.hl} sealed hollow${s.hl === 1 ? ' is' : 's are'} left inside (${mm3(s.hlv)} mm³): tick "Fill hollow pockets" to fill ${s.hl === 1 ? 'it' : 'them'}.`;
+    const bits = out.flatMap(r => r.loose), nb = bits.length, gapMax = Math.max(0, ...bits.map(b => b.gap)), joined = out.reduce((a, r) => a + r.bridged, 0), droppedN = out.reduce((a, r) => a + r.dropped, 0);
+    const bitWord = n => `${n} loose bit${n === 1 ? '' : 's'}`;
+    if (nb) note += $('exp-loose').value === 'connect' ? ` Joined ${bitWord(joined)} that didn't touch the rest (up to ${gapMax.toFixed(2)} mm away) with small bridges.` + (joined < nb ? ` ${nb - joined} couldn't be bridged.` : '')
+      : $('exp-loose').value === 'drop' ? ` Left out ${bitWord(droppedN)} that didn't touch the rest.`
+      : ` ${bitWord(nb)} ${nb === 1 ? "doesn't" : "don't"} touch the rest (up to ${gapMax.toFixed(2)} mm away) and will print as separate pieces.`;
     const cutN = out.reduce((a, r) => a + r.cut, 0); if (cutN) note += ` Cut ${cutN} magnet hole${cutN === 1 ? '' : 's'}.`;
     if (s.rep) note += ` Closed small holes in ${s.rep} piece${s.rep === 1 ? '' : 's'} first.`;
     if (s.un) note += ` ${s.un} piece${s.un === 1 ? ' has' : 's have'} holes too big to close and went in as they were.`;
@@ -4216,15 +4826,23 @@ async function findPockets(ms, h, progress = () => {}, opts = {}) {
     for (const P of parts) {
       const u0 = Math.max(0, Math.floor((P.box.min.getComponent(u) - o.getComponent(u)) / h)), u1 = Math.min(n[u] - 1, Math.ceil((P.box.max.getComponent(u) - o.getComponent(u)) / h));
       const w0 = Math.max(0, Math.floor((P.box.min.getComponent(w) - o.getComponent(w)) / h)), w1 = Math.min(n[w] - 1, Math.ceil((P.box.max.getComponent(w) - o.getComponent(w)) / h));
-      const bvh = P.m.geometry.boundsTree, ldir = dir.clone().transformDirection(P.inv);
+      const bvh = P.m.geometry.boundsTree, ldir = dir.clone().transformDirection(P.inv), flip = P.m.matrixWorld.determinant() < 0 ? -1 : 1;
+      const eps = 1e-5 * Math.max(1, size.length());
       for (let a = u0; a <= u1; a++) {
         for (let c = w0; c <= w1; c++) {
-          const org = V(); org.setComponent(ax, o.getComponent(ax) - h); org.setComponent(u, o.getComponent(u) + a * h); org.setComponent(w, o.getComponent(w) + c * h);
+          // a hair off the grid lines, so rays don't run exactly along the edges of square-cut models
+          const org = V(); org.setComponent(ax, o.getComponent(ax) - h); org.setComponent(u, o.getComponent(u) + a * h + 0.0173 * h); org.setComponent(w, o.getComponent(w) + c * h + 0.0291 * h);
           ray.origin.copy(org).applyMatrix4(P.inv); ray.direction.copy(ldir);
-          const hits = bvh.raycast(ray, THREE.DoubleSide); if (hits.length < 2 || hits.length % 2) continue;   // open or touching: no say here
-          const ts = hits.map(x => wp.copy(x.point).applyMatrix4(P.m.matrixWorld).getComponent(ax)).sort((p, q) => p - q);
-          for (let k = 0; k + 1 < ts.length; k += 2) {
-            const i0 = Math.max(0, Math.ceil((ts[k] - o.getComponent(ax)) / h)), i1 = Math.min(n[ax] - 1, Math.floor((ts[k + 1] - o.getComponent(ax)) / h));
+          const hits = bvh.raycast(ray, THREE.DoubleSide); if (hits.length < 2) continue;
+          // inside is where more surfaces have been entered than left (by which way each one faces), so a part made of
+          // overlapping pieces counts as solid all the way through; a corner hit twice counts once
+          const ev = hits.map(x => ({ t: wp.copy(x.point).applyMatrix4(P.m.matrixWorld).getComponent(ax), s: x.face.normal.dot(ldir) * flip < 0 ? 1 : -1 })).sort((p, q) => p.t - q.t);
+          const seq = []; for (const e of ev) { const l = seq[seq.length - 1]; if (l && Math.abs(e.t - l.t) < eps && e.s === l.s) continue; seq.push(e); }
+          let wind = 0; const spans = [];
+          for (let k = 0; k < seq.length; k++) { const was = wind; wind += seq[k].s; if (was <= 0 && wind > 0) spans.push(seq[k].t); else if (was > 0 && wind <= 0) spans.push(seq[k].t); }
+          if (wind !== 0 || spans.length % 2) continue;                    // open or torn here: no say
+          for (let k = 0; k + 1 < spans.length; k += 2) {
+            const i0 = Math.max(0, Math.ceil((spans[k] - o.getComponent(ax)) / h)), i1 = Math.min(n[ax] - 1, Math.floor((spans[k + 1] - o.getComponent(ax)) / h));
             for (let t = i0; t <= i1; t++) { const idx = [0, 0, 0]; idx[ax] = t; idx[u] = a; idx[w] = c; const v = at(idx[0], idx[1], idx[2]);
               if (stamp[v] !== ax + 1) { stamp[v] = ax + 1; votes[v]++; } }
           }
@@ -4284,14 +4902,28 @@ async function findPockets(ms, h, progress = () => {}, opts = {}) {
     const F = [[[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
                [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]], [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]], [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]][d];
     pos.push(...F[0], ...F[1], ...F[2], ...F[0], ...F[2], ...F[3]); };
-  for (let v = 0; v < N; v++) { if (!grow[v]) continue; const i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
-    [[i > 0 ? v - sx : -1, 0], [i < nx - 1 ? v + sx : -1, 1], [j > 0 ? v - sy : -1, 2], [j < ny - 1 ? v + sy : -1, 3], [k > 0 ? v - sz : -1, 4], [k < nz - 1 ? v + sz : -1, 5]]
-      .forEach(([y, d]) => { if (y < 0 || !grow[y]) cube(i, j, k, d); }); }
-  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(Array.from({ length: pos.length / 3 }, (_, i) => i));
-  return { pockets, volume: cells * h ** 3, biggest: biggest * h ** 3, h, geometry: g };
+  const skin = mask => {
+    pos.length = 0;
+    for (let v = 0; v < N; v++) { if (!mask[v]) continue; const i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
+      [[i > 0 ? v - sx : -1, 0], [i < nx - 1 ? v + sx : -1, 1], [j > 0 ? v - sy : -1, 2], [j < ny - 1 ? v + sy : -1, 3], [k > 0 ? v - sz : -1, 4], [k < nz - 1 ? v + sz : -1, 5]]
+        .forEach(([y, d]) => { if (y < 0 || !mask[y]) cube(i, j, k, d); }); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(Array.from({ length: pos.length / 3 }, (_, i) => i)); return g;
+  };
+  // geometry: the filler (the air plus a cell into the walls, so it overlaps them); air: just the trapped air, for showing
+  return { pockets, volume: cells * h ** 3, biggest: biggest * h ** 3, h, geometry: skin(grow), air: skin(fill) };
 }
 const pocketFx = new THREE.Group(); scene.add(pocketFx);
-function clearPocketPreview() { while (pocketFx.children.length) { const c = pocketFx.children.pop(); c.geometry?.dispose(); } $('exp-pocket-show').setAttribute('aria-pressed', 'false'); $('exp-pocket-show').textContent = 'Show pockets'; }
+function clearPocketPreview() { while (pocketFx.children.length) { const c = pocketFx.children.pop(); c.geometry?.dispose(); if (c.isLineSegments2) c.material.dispose(); } $('exp-pocket-show').setAttribute('aria-pressed', 'false'); $('exp-pocket-show').textContent = 'Show pockets'; }
+/** A bold outline of a shape's corners (the edges where its faces fold, not the flat seams between them), drawn through the model. */
+function outlineOf(geom, color, width = 2.5) {
+  const welded = mergeVertices(geom.index ? geom.toNonIndexed() : geom, 1e-4);
+  const edges = new THREE.EdgesGeometry(welded, 30); welded.dispose();
+  const lg = new LineSegmentsGeometry().setPositions(edges.attributes.position.array); edges.dispose();
+  const mat = new LineMaterial({ color, linewidth: width, transparent: true, depthTest: false, depthWrite: false });
+  const line = new LineSegments2(lg, mat); line.renderOrder = 999;
+  line.onBeforeRender = r => { r.getSize(mat.resolution); };
+  return line;
+}
 const pocketSummary = r => r.pockets ? `${r.pockets} sealed pocket${r.pockets > 1 ? 's' : ''}, ${r.volume < 1 ? r.volume.toFixed(2) : r.volume.toFixed(0)} mm³ in all (largest ${r.biggest < 1 ? r.biggest.toFixed(2) : r.biggest.toFixed(0)} mm³)` : 'No sealed pockets';
 async function runPockets(title, ms = exportMeshes()) {
   if (!ms.length) return null;
@@ -4305,8 +4937,10 @@ async function showPocketPreview() {
   $('exp-pocket-note').textContent = `${pocketSummary(r)}, checked at ${r.h.toFixed(2)} mm.` + (r.pockets ? ' Shown in red through the model; exports with this option on fill them solid.' : ' Nothing to fill.');
   toast(pocketSummary(r) + '.', r.pockets ? 'bad' : 'ok');
   if (!r.geometry) return;
-  const m = new THREE.Mesh(r.geometry, new THREE.MeshBasicMaterial({ color: '#e36b6b', transparent: true, opacity: 0.55, depthTest: false, depthWrite: false }));
+  r.geometry.dispose();
+  const m = new THREE.Mesh(r.air, new THREE.MeshBasicMaterial({ color: '#e36b6b', transparent: true, opacity: 0.5, depthTest: false, depthWrite: false }));
   m.renderOrder = 998; pocketFx.add(m);
+  pocketFx.add(outlineOf(r.air, '#ff2a2a'));
   $('exp-pocket-show').setAttribute('aria-pressed', 'true'); $('exp-pocket-show').textContent = 'Hide pockets';
 }
 
@@ -4318,7 +4952,7 @@ let magnets = [];       // [{ id, d, t, cd, ct, sides: [{ part, o: local point, 
 const magnetFx = new THREE.Group(); scene.add(magnetFx);
 const magSize = () => ({ d: Math.max(0.5, +$('mag-d').value || 3), t: Math.max(0.3, +$('mag-t').value || 2), cd: Math.max(0, +$('mag-cd').value || 0), ct: Math.max(0, +$('mag-ct').value || 0) });
 const magLabel = mg => `${+mg.d.toFixed(2)} × ${+mg.t.toFixed(2)} mm`;
-let magPending = null;
+let magPending = null, magShift = false;
 function toLocal(part, p, n) { part.updateMatrixWorld(true); const inv = part.matrixWorld.clone().invert(); return { o: p.clone().applyMatrix4(inv).toArray(), n: n.clone().transformDirection(inv).toArray() }; }
 function sideWorld(sd) { const m = partById(sd.part); if (!m) return null; m.updateMatrixWorld(true); return { m, o: V(...sd.o).applyMatrix4(m.matrixWorld), n: V(...sd.n).transformDirection(m.matrixWorld).normalize() }; }
 const hitNormal = hit => hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize();
@@ -4336,12 +4970,52 @@ function addMagnet(sides) {
   toast(thin.length ? `Magnet ${magLabel(mg)} ${what}, but ${thin.join(' and ')} ${thin.length > 1 ? 'are' : 'is'} too thin there: the hole would break through or leave under 0.6 mm. Try a thinner magnet or another spot.`
                     : `Magnet ${magLabel(mg)} ${what}: holes ${(sz.d + sz.cd).toFixed(2)} mm wide, ${depth.toFixed(2)} mm deep.`, thin.length ? 'bad' : 'ok');
 }
+/*
+ * A magnet at a connection: the pair goes where the two parts meet along the connection's axis, one hole in each,
+ * found by looking from the connection point along its axis for each part's facing surface. It remembers the
+ * connection (mg.conn) and a shift across it (mg.shift, mm), and is placed again whenever the connection changes.
+ */
+function connMagnetSides(ci, shift = [0, 0], dirB = null) {
+  // which way the holes go: across where the parts meet (kept with the magnet, in the second part's frame), else the connection's axis
+  const ax = (dirB ? V(...dirB).transformDirection(ci.b.matrixWorld) : ci.axis.clone()).normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(V(0, 0, 1), ax), e1 = V(1, 0, 0).applyQuaternion(q), e2 = V(0, 1, 0).applyQuaternion(q);
+  const at = ci.point.clone().addScaledVector(e1, shift[0] || 0).addScaledVector(e2, shift[1] || 0);
+  const R = Math.max(3, 0.6 * Math.min(worldBox(ci.a).getSize(V()).length(), worldBox(ci.b).getSize(V()).length()));
+  const hit = (m, from, d) => { const rc = new THREE.Raycaster(from, d, 0, 2 * R); const hs = rc.intersectObject(m, false); return hs.length ? hs[0].point : null; };
+  // the first part sits on the +axis side, the second on the -axis side: each one's face toward the other
+  const pa = hit(ci.a, at.clone().addScaledVector(ax, -R), ax) || at.clone(), pb = hit(ci.b, at.clone().addScaledVector(ax, R), ax.clone().negate()) || at.clone();
+  return [{ m: ci.a, o: pa, n: ax.clone().negate() }, { m: ci.b, o: pb, n: ax.clone() }];
+}
+function addConnMagnet(c, shift = [0, 0]) {
+  const ci = connInfo(c); if (!ci) return null;
+  // the direction across their contact, from the second part toward the first (a hinge's or roller's own axis is
+  // the way it moves, not the way the faces meet)
+  let dir = null;
+  try { const cc = contactBetween(contactContext([ci.b, ci.a]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); if (cc?.nOut?.[0]?.lengthSq() > 1e-9) dir = cc.nOut[0].clone().normalize(); } catch (e) {}
+  if (!dir) dir = ci.axis.clone();
+  if (dir.dot(worldBox(ci.a).getCenter(V()).sub(ci.point)) < 0 && dir.dot(worldBox(ci.b).getCenter(V()).sub(ci.point)) > 0) dir.negate();
+  const dirB = dir.clone().transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray();
+  const sides = connMagnetSides(ci, shift, dirB); addMagnet(sides);
+  const mg = magnets[magnets.length - 1]; mg.conn = { ...c }; mg.shift = shift.slice(); mg.dir = dirB; markDirty(); renderPartPanel(); return mg;
+}
+function placeConnMagnets(c) {
+  const ci = connInfo(c); if (!ci) return;
+  for (const mg of magnets) {
+    if (!sameConn(mg.conn, c)) continue;
+    const sides = connMagnetSides(ci, mg.shift || [0, 0], mg.dir || null);
+    mg.sides = sides.map((sd, k) => ({ part: sd.m.uuid, ...toLocal(sd.m, sd.o, sd.n), pole: mg.sides[k]?.pole || (k ? 'S' : 'N') }));
+  }
+  rebuildMagnets();
+}
+/** The connections between two parts (their joint either way, or an extra link). */
+function connsBetween(m1, m2) { return allConns().filter(ci => (ci.a === m1 && ci.b === m2) || (ci.a === m2 && ci.b === m1)).map(ci => ci.c); }
 function handleMagnetClick(hit) {
   if (!hit) { toast('Missed. Click on a part where it meets another.'); return; }
   const m = hit.object, p = hit.point.clone(), n = hitNormal(hit);
   if (magPending) {                               // second click: the part it fits against
     if (m === magPending.m) { toast(`That's ${m.name} again. Click the part it fits against.`, 'bad'); return; }
     const a = magPending; magPending = null; updateStep();
+    if (!magShift) { const cs = connsBetween(a.m, m); if (cs.length) { addConnMagnet(cs[0]); toast(`Magnet placed at the connection between ${a.m.name} and ${m.name}.`, 'ok'); return; } }
     // touching? then the pair goes where they really meet (that face is usually hidden once assembled), nearest the first click
     let c = null; try { c = contactBetween(contactContext([a.m, m]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) { c = null; }
     if (c) {
@@ -4357,6 +5031,7 @@ function handleMagnetClick(hit) {
   const others = liveParts().filter(x => x !== m && isVisibleChain(x) && !boxed(x));
   const rc = new THREE.Raycaster(p.clone().addScaledVector(n, -0.6), n, 0, 2.6); rc.firstHitOnly = true;
   const h2 = rc.intersectObjects(others, false)[0];
+  if (h2 && !magShift) { const cs = connsBetween(m, h2.object); if (cs.length) { addConnMagnet(cs[0]); toast(`Magnet placed at the connection between ${m.name} and ${h2.object.name}: it follows if you change the connection. Shift-click to put it exactly where you click.`, 'ok'); return; } }
   if (h2) addMagnet([{ m, o: p, n }, { m: h2.object, o: h2.point.clone(), n: n.clone().negate() }]);
   else { magPending = { m, o: p, n }; updateStep(); $('step-text').textContent = `No part touches ${m.name} there. Click the spot on the part it fits against (Esc to cancel)`; rebuildMagnets(); }
 }
@@ -4391,6 +5066,10 @@ function magnetRows(p, el) {
     const other = mg.sides.find(sd => sd.part !== p.uuid), row = document.createElement('div'); row.className = 'mag-row';
     const t = document.createElement('span'); t.textContent = `${magLabel(mg)} · hole ${(mg.d + mg.cd).toFixed(2)} × ${(mg.t + mg.ct).toFixed(2)}${other ? ` · ${partById(other.part)?.name}` : ''}`;
     const bt = (txt, title, fn) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.title = title; x.addEventListener('click', fn); return x; };
+    if (mg.conn) {
+      const ci = connInfo(mg.conn); t.textContent += ci ? ' · at the connection' : ' · (its connection is gone)';
+      if (ci) row.append(bt('⌖', 'Select the connection it sits on', () => selectConn(mg.conn)));
+    }
     row.append(t, bt('Use bar size', `Give this pair the size and fit set in the Magnet tool's bar`, () => { pushUndo(); Object.assign(mg, magSize()); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`That magnet is now ${magLabel(mg)}.`); }),
                bt('Remove', 'Remove this pair of holes', () => { pushUndo(); magnets = magnets.filter(x => x !== mg); markDirty(); rebuildMagnets(); renderPartPanel(); toast('Removed the magnet.'); }));
     box.append(row);
@@ -4457,6 +5136,7 @@ async function showSeamPreview() {
   $('exp-fill-note').textContent = (stats.moved ? `${stats.seams} seam${stats.seams === 1 ? '' : 's'}: ${stats.moved.toLocaleString()} corners (amber) pushed by up to ${stats.largest.toFixed(2)} mm. No slits left up to ${o.maxGap} mm.`
     : `No parts within ${o.maxGap} mm of each other.`) + (wide.open ? ` Red: ${wide.open} spot${wide.open > 1 ? 's' : ''} with a gap wider than ${o.maxGap} mm that won't be filled.` : '');
 }
+$('exp-merge').addEventListener('change', () => { $('exp-merge-f').hidden = $('exp-merge-note').hidden = !$('exp-merge').checked; });
 $('exp-pockets').addEventListener('change', () => { $('exp-pockets-f').hidden = !$('exp-pockets').checked; if (!$('exp-pockets').checked) clearPocketPreview(); markDirty(); });
 $('exp-pocket-show').addEventListener('click', () => { if ($('exp-pocket-show').getAttribute('aria-pressed') === 'true') clearPocketPreview(); else showPocketPreview(); });
 ['exp-pocket-res', 'exp-pocket-drain'].forEach(id => $(id).addEventListener('change', () => { if (pocketFx.children.length) showPocketPreview(); markDirty(); }));
@@ -4483,9 +5163,14 @@ renderer.domElement.addEventListener('pointerup', e => {
   if (!down || down.button !== 0 || down.onGizmo) { down = null; return; }
   const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
   if (moved > 5) return;                          // that was an orbit drag
+  if (dirPick) { dirPickClick(raycast(e)); return; }  // picking faces for a direction
   if (!SNAP_STEPS[tool] && tool !== 'ORIENT' && tool !== 'pose' && !(e.ctrlKey || e.metaKey || e.shiftKey)) {
     const bh = benchHit(e);
     if (bh) { if (bh.kind === 'book' && tool === 'select') { openBook(); return; } selectBench(bh.kind, bh.k); return; }
+  }
+  if (['select', 'move', 'rotate', 'MAGNET'].includes(tool) && !(e.ctrlKey || e.metaKey) && !marr.picking) {
+    const c = connAt(e);
+    if (c) { if (tool === 'MAGNET') { const ci = connInfo(c); addConnMagnet(c); if (ci) toast(`Magnet placed at the connection: ${ci.name}. It follows if you change the connection.`, 'ok'); } else selectConn(c); return; }
   }
   const hit = raycast(e);
   if (marr.picking) {                              // Mirror & array: this click picks the centre
@@ -4493,7 +5178,7 @@ renderer.domElement.addEventListener('pointerup', e => {
     marr.picked = hit.point.clone(); marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false');
     fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)), 'pick'); fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2))); marrPreview(); return;
   }
-  if (tool === 'MAGNET') { handleMagnetClick(hit); return; }
+  if (tool === 'MAGNET') { magShift = e.shiftKey; handleMagnetClick(hit); magShift = false; return; }
   if (tool === 'LUCKY') { handleLuckyClick(hit); return; }
   if (SNAP_STEPS[tool]) {                          // measuring a big surface can take a moment: let the message paint first
     const ev = { shiftKey: e.shiftKey };
@@ -4803,9 +5488,11 @@ window.addEventListener('keydown', e => {
   if (k === 'k' && !e.shiftKey) { setFitPinned(!(fit.pinned || !$('fitcheck').hidden)); toast(fit.pinned ? 'Fit check on: cross-sections through the selected part where it meets its neighbour. K hides it.' : 'Fit check hidden. K brings it back.'); return; }
   if (e.shiftKey && k === 'm') { openMarr('mirror'); return; }
   if (e.shiftKey && k === 'a') { openMarr('linear'); return; }
+  if (k === 'escape' && dirPick) { cancelDirPick(); return; }
   if (k === 'escape' && !$('marr').hidden) { if (marr.picking) { marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false'); } else closeMarr(); return; }
   if (k === 'enter' && !$('marr').hidden && !e.target.closest?.('#marr')) { applyMarr(); return; }
   if (map[k]) { setTool(map[k]); return; }
+  if (k === 'escape' && connSel) { selectConn(null); return; }
   if (k === 'escape' && benchSel) { select(null); syncGizmo(); renderPartPanel(); return; }
   if (k === 'escape' && magPending) { magPending = null; rebuildMagnets(); updateStep(); toast('Cancelled that magnet.'); return; }
   if (k === 'escape') { if (!$('orient').hidden) { closeOrient(); return; } if (picks.length) cancelPick(); else if (tool === 'select' && selection.length) select(null); else setTool('select'); return; }
@@ -4831,7 +5518,7 @@ function rebuildPickFx() {
 // ---------------------------------------------------------------------------
 // Projects: autosave to this browser (IndexedDB) and project files (.zip)
 // ---------------------------------------------------------------------------
-const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
+const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-loose', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
 const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
 let idb = null;
 const idbReady = new Promise(res => {
@@ -4860,7 +5547,7 @@ function serializeProject() {
     parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
       geom: m.userData.part.geomKey, tris: m.userData.part.tris, parent: parentId(m), ...tr(m) })),
     joints: joints.filter(j => j.parent).map(j => { const jd = j.userData.joint; return { id: j.uuid, parent: parentId(j), size: jd.size, rest: jd.rest.toArray(),
-      type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, ...tr(j) }; }),
+      type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, axisName: jd.axisName || '', pointOff: jd.pointOff || null, partOff: jd.partOff || null, ...tr(j) }; }),
     links: JSON.parse(JSON.stringify(links)),
     refs: JSON.parse(JSON.stringify(refs)),
     settings: Object.fromEntries(SETTING_IDS.map(id => [id, $(id).type === 'checkbox' ? $(id).checked : $(id).value])),
@@ -4890,7 +5577,7 @@ function buildProject(data, geoms, paints = new Map()) {
   [...parts, ...joints].forEach(o => o.parent && o.parent.remove(o));
   parts.length = 0; joints.length = 0; undoStack.length = 0; redoStack.length = 0; lastOp = null;
   for (const [id, v] of Object.entries(data.settings || {})) { const el = $(id); if (!el) continue; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; }
-  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked; $('exp-pockets-f').hidden = !$('exp-pockets').checked;
+  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked; $('exp-pockets-f').hidden = !$('exp-pockets').checked; $('exp-merge-f').hidden = $('exp-merge-note').hidden = !$('exp-merge').checked;
   const byId = new Map(), missing = [], shared = new Map();
   for (const p of data.parts) {
     const rec = geoms.get(p.geom); if (!rec) { missing.push(p.name); continue; }
@@ -4902,7 +5589,7 @@ function buildProject(data, geoms, paints = new Map()) {
     refreshPaint(m);
   }
   for (const j of data.joints || []) { const o = makeJoint(j.size || 0.5); o.uuid = j.id; const jd = o.userData.joint; jd.rest.fromArray(j.rest);
-    Object.assign(jd, { type: j.type || 'pinned', min: j.min ?? null, max: j.max ?? null, axis: j.axis || null }); jd.restPos.fromArray(j.restPos || j.pos); byId.set(j.id, o); }
+    Object.assign(jd, { type: j.type || 'pinned', min: j.min ?? null, max: j.max ?? null, axis: j.axis || null, axisName: j.axisName || '', pointOff: j.pointOff || null, partOff: j.partOff || null }); jd.restPos.fromArray(j.restPos || j.pos); byId.set(j.id, o); }
   const place = (o, rec) => { (rec.parent && byId.get(rec.parent) || world).add(o); o.position.fromArray(rec.pos); o.quaternion.fromArray(rec.quat); o.scale.fromArray(rec.scale); };
   for (const j of data.joints || []) place(byId.get(j.id), j);
   for (const p of data.parts) if (byId.has(p.id)) place(byId.get(p.id), p);
@@ -5187,7 +5874,9 @@ function resize() {
 }
 new ResizeObserver(resize).observe(view);
 bindAdjust();
-bindFit();
+bindFit(); bindDirPick();
+document.querySelectorAll('#move-frame button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === moveFrame)); b.addEventListener('click', () => setMoveFrame(b.dataset.v)); });
+document.querySelectorAll('#pose-mode button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)); b.addEventListener('click', () => setPoseMode(b.dataset.v)); });
 bindProject();
 bindAutorig(); bindTreeDnD(); bindMarr();
 bindOrient();
@@ -5217,4 +5906,4 @@ $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   
 })();
 renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
 // automated tests only (a query string never reaches the page inside claude.ai)
-if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles }; }
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf }; }

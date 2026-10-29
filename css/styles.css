@@ -502,3 +502,21 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
 .ma-xyz { display: flex; gap: 4px; } .ma-xyz input { width: 100%; min-width: 0; }
 .marr [hidden] { display: none !important; }
 #ma-pick[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+/* direction picker: a small card over the view while faces are being clicked */
+.dirpick { position: absolute; top: 64px; left: 50%; transform: translateX(-50%); z-index: 30; width: min(420px, calc(100% - 32px)); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; box-shadow: 0 8px 28px rgba(0,0,0,.35); font-size: 13px; }
+.dirpick p { margin: 6px 0 10px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.dirpick .btnrow { display: flex; gap: 6px; flex-wrap: wrap; }
+#adj-rail-note { color: var(--muted); font-size: 12px; }
+.twist { display: inline-flex; gap: 4px; align-items: center; } .twist .num { width: 58px; }
+/* connections you can select */
+.orow .link.pick { cursor: pointer; border-radius: 4px; padding: 0 2px; }
+.orow .link.pick:hover, .orow .link.on { background: rgba(77, 180, 220, .22); color: #8fd0ec; }
+.conn-pick { margin-left: 6px; }
+.off-row { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.off-row > label { flex: 1 0 100%; }
+.off-ax { display: inline-flex; align-items: center; gap: 2px; }
+.off-ax .num { width: 58px; }
+.off-ax .ax { font: 600 11px var(--mono, monospace); width: 12px; text-align: center; }
+.off-ax .ax.x { color: #e36b6b; } .off-ax .ax.y { color: #7fc77f; } .off-ax .ax.z { color: #6fa3dd; }
+.conn-off .btnrow { display: flex; gap: 6px; align-items: center; margin-top: 6px; }

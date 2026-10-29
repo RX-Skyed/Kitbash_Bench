@@ -36,7 +36,15 @@
             <option value="ask">Ask each time</option>
             <option value="alone">Move just that part</option>
             <option value="group">Make it the base, bring the group</option>
-          </select></span><label class="check"><input type="checkbox" id="set-orbitsel-2" data-mirror="set-orbitsel" checked> Orbit around selection</label></span>
+          </select></span><label class="check"><input type="checkbox" id="set-orbitsel-2" data-mirror="set-orbitsel" checked> Orbit around selection</label>
+      <span class="ofield"><label>Axes</label><span class="seg" id="move-frame" role="group" aria-label="Which way the arrows point">
+        <button type="button" data-v="world" title="The world's X, Y and Z">World</button>
+        <button type="button" data-v="part" title="The part's own axes, as it was modelled, turned with it">Part</button>
+        <button type="button" data-v="parent" title="The axes of what it's attached to: its joint, or its parent part">Attached to</button></span>
+        <span class="note" id="move-frame-note"></span></span></span>
+    <span class="ogroup" data-tools="pose"><span class="ohint">Drag the rings to pose a part about its joint.</span><span class="ofield" id="pose-roller" hidden><label>Roller</label><span class="seg" id="pose-mode" role="group" aria-label="Pose a roller by">
+        <button type="button" data-v="turn" title="Turn it any way about its joint">Turn</button>
+        <button type="button" data-v="slide" title="Slide it along its line">Slide</button></span></span></span>
     <span class="ogroup" data-tools="paint"><span class="swatches" id="paint-swatches" role="radiogroup" aria-label="Paint colour"></span><input type="color" id="paint-color" value="#8a1414" aria-label="Custom colour" title="Any colour">
       <span class="seg" id="paint-mode" role="group" aria-label="How to paint"><button type="button" data-v="brush" aria-pressed="true">Brush</button><button type="button" data-v="fill" aria-pressed="false">Fill part</button></span>
       <span class="ofield" id="paint-size-f"><label for="paint-size">Size mm</label><input type="range" id="paint-size-r" min="0.2" max="8" step="0.1" value="1.5" aria-label="Brush size"><input class="num" id="paint-size" type="number" min="0.1" max="30" step="0.1" value="1.5"></span>
@@ -129,6 +137,16 @@
       </div>
     </div>
 
+    <div class="dirpick" id="dirpick" hidden role="dialog" aria-labelledby="dp-title">
+      <b id="dp-title">Pick faces for the direction</b>
+      <p id="dp-note">Click the faces that set the direction: a groove's walls and floor, or a flat strip. Click more to add; click one again to drop it.</p>
+      <div class="btnrow">
+        <button class="btn primary" id="dp-along" type="button" disabled title="Along the faces: down the groove, or the long way along a flat face">Along</button>
+        <button class="btn" id="dp-across" type="button" disabled title="Across the faces">Across</button>
+        <button class="btn" id="dp-out" type="button" disabled title="Straight out of the faces">Out</button>
+        <button class="btn" id="dp-cancel" type="button">Cancel</button>
+      </div>
+    </div>
     <div class="autorig orient marr" id="marr" hidden role="dialog" aria-labelledby="ma-title">
       <header><b id="ma-title">Mirror &amp; array</b><span class="ar-sum" id="ma-sum"></span>
         <button class="icon-btn" id="ma-close" type="button" aria-label="Close without making anything">×</button></header>
@@ -276,7 +294,7 @@
           <label>Slide until touching</label><span></span>
           <div class="row slides" id="adj-slides"></div>
         </div>
-        <div class="field">
+        <div class="field" id="adj-pivot-f">
           <label>Pivot on</label><span></span>
           <div class="row seg" id="adj-pivot" role="group" aria-label="Which contact point the joint rotates around">
             <button type="button" data-v="parent" title="The point you picked on the part it attaches to">Parent's point</button>
@@ -294,6 +312,26 @@
             <button type="button" data-v="plain" title="Child follows the parent, no joint">Fixed</button>
             <button type="button" data-v="none" title="Only move the part">None</button>
           </div>
+          <div class="row seg" id="adj-loop" role="group" aria-label="Keep its own joint and also connect">
+            <button type="button" data-v="rail" id="adj-attach-rail" title="Keeps its own joint (say, a ball in a socket) and rides a rail on this part: it turns on its joint to reach, then slides along the channel when you pose">Slide in it</button>
+            <button type="button" data-v="link" id="adj-attach-link" title="Keeps its own joint and is also pinned to this part, like the far end of a piston">Pin to it too</button>
+          </div>
+        </div>
+        <div class="field" id="adj-rail-f" hidden>
+          <label>Slides along</label>
+          <div class="row seg" id="adj-rail" role="group" aria-label="Rail direction">
+            <button type="button" data-v="along" title="Along the picked faces: down a groove or channel, or the long way along a flat face">Channel</button>
+            <button type="button" data-v="across" title="Across the picked faces">Across</button>
+            <button type="button" data-v="out" title="Straight out of the picked faces">Out</button>
+            <button type="button" data-v="x" title="The part's own X">X</button>
+            <button type="button" data-v="y" title="The part's own Y">Y</button>
+            <button type="button" data-v="z" title="The part's own Z">Z</button>
+          </div>
+          <div class="row"><label class="check"><input type="checkbox" id="adj-face-away"> Face away from the part it slides on</label></div>
+          <div class="row pair"><span>Turn on its axis</span><span class="twist"><button class="btn" id="adj-tw-m" type="button" title="Turn it 90° the other way on its axis">↺ 90°</button><input class="num" id="adj-twist" type="number" step="5" value="0" aria-label="Turn on its axis, degrees" title="Turn on its own axis (from its joint to where it slides), degrees"><button class="btn" id="adj-tw-p" type="button" title="Turn it 90° on its axis">↻ 90°</button></span></div>
+          <div class="row pair"><button class="btn" id="adj-rail-pick" type="button" title="Click faces on any part (a groove's walls, a flat strip) and slide along, across or out of them">Pick faces…</button>
+            <label class="check"><input type="checkbox" id="adj-rail-ends" checked> Stop at the channel's ends</label></div>
+          <div class="row pair" id="adj-rail-note"></div>
         </div>
       </div>
     </div>
@@ -394,6 +432,10 @@
         </div>
         <label class="check"><input type="checkbox" id="exp-merge" checked> Merge into one clean solid (removes every surface inside the model)</label>
         <p class="note fill-f" id="exp-merge-note">Overlapping parts and pieces are joined into a single closed shell, so nothing is left inside for the slicer to print as a void or a wall, and any hollow sealed completely inside is filled. Applies to every export: one file, each part, and sprues. Parts that only nearly touch stay separate: use Fill seams to join them.</p>
+        <div class="fill-f" id="exp-merge-f">
+          <label for="exp-loose">Loose bits (small pieces up to 2 mm from the rest, not touching it)</label>
+          <select class="num osel" id="exp-loose" style="width:auto;text-align:left"><option value="connect" selected>Join them on with a small bridge</option><option value="keep">Keep them as separate pieces</option><option value="drop">Leave them out</option></select>
+        </div>
         <label class="check"><input type="checkbox" id="exp-fill"> Fill seams so it prints as one solid piece</label>
         <div class="fill-f" id="exp-fill-f" hidden>
           <label for="exp-gap">Close gaps up to (mm)</label>
