@@ -496,3 +496,9 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
 .ref-row .link { color: #7fb6d6; }
 .ref-row { border-top: 1px dashed var(--line); }
 .ref-row ~ .ref-row { border-top: 0; }
+.marr { width: 330px; }
+.ma-grid { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; align-items: center; font-size: 12px; color: var(--muted); }
+.ma-grid select { width: 100%; text-align: left; }
+.ma-xyz { display: flex; gap: 4px; } .ma-xyz input { width: 100%; min-width: 0; }
+.marr [hidden] { display: none !important; }
+#ma-pick[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }

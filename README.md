@@ -15,13 +15,15 @@ Nothing to install, and nothing is uploaded: your files stay on your computer.
 - **Pistons and linkages:** a part can also be pinned to a second part, or ride a rail on it, as well as hanging off its parent. Pose the leg and the pistons turn and slide to stay connected; slide a piston and the leg bends to match. If a piston can't reach, the pose stops where the real model would jam.
 - **Auto-assemble:** if your files were exported in their assembled places, the bench finds where they touch and builds the joints for you. Before it builds, you can change what hangs off what, joint or fixed, and which parts are options of each other.
 - **Reference images:** drop a picture on the view (or View › Add reference image…). It faces your view, behind the parts; size it, make it see-through, move and turn it to line it up, and pose the model against it. **Match pose** (experimental) bends the joints until the model's outline covers the figure in the picture.
+- **Fit check any time:** press **K** (or View › Fit check) to keep the cross-sections up while you work. They cut through the selected part where it meets what it's attached to (or the two parts you've selected, or a loose part's nearest neighbour) and update live as you move, turn or pose, so you can watch a gap close or an overlap appear. × or K hides it.
 - **Orthographic view:** View › Orthographic (Numpad 5, or the Persp/Ortho button under the view cube) for a flat, no-perspective view that lines up with references.
 - **Colour it in:** brush paint onto the model, fill whole parts, and switch the bare plastic between grey plastic, resins, bone, or black, grey or white primer to preview a scheme.
 - **Magnets:** pairs of magnet holes where parts meet, in common disc sizes or your own, with clearance for resin or FDM. They move with the parts and are cut into the exported files.
+- **Mirror and array:** mirror parts in place or make mirrored copies ("Right Arm" → "Left Arm", attached on the other side with its own joint), copy along a line, or round an axis through any centre: the part's own, its joint, what it's attached to, another part, or a spot you click. Copies bring everything attached to them. Shift+M and Shift+A, or Edit › Mirror… / Array….
 - **Swap options:** heads, weapons or arms that fit the same spot share one joint. Pick a choice for each, save sets, and export every combination.
 - **Model kit mode:** pieces go onto sprues (copies too, from names like `Leg x8`), sealed in a shrink-wrapped box with the box art and instruction booklet from the folder. Unbox it on the bench.
 - **Instructions:** a PDF in the folder becomes a booklet you can flip through.
-- **Export for printing:** the whole model as one STL, just a selection, each part separately, or whole sprues. **Fill seams** closes the hairline gaps between parts so they print as one solid piece.
+- **Export for printing:** the whole model as one STL, just a selection, each part separately, or whole sprues. **Merge into one clean solid** (on by default) joins every overlapping part and piece into a single closed shell, so no surfaces are left inside to print as walls or voids, fills any hollow sealed inside, and cuts magnet holes exactly. **Fill seams** closes the hairline gaps between parts that only nearly touch, so they merge too.
 - **Projects save automatically** in your browser. Save a project file to back up your work or move it to another computer.
 
 ## Quick start
@@ -29,7 +31,7 @@ Nothing to install, and nothing is uploaded: your files stay on your computer.
 1. Open the page and choose **File › Open folder** (or drag a folder of STLs onto the bench).
 2. Choose how they come in: **Model kit**, **Off the sprue, spread out**, or **Where the files put them**.
 3. Pick a snap tool on the left (**Face** is a good start), click the area on the part that moves, then the area it attaches to.
-4. Fine-tune in the **Adjust** panel (bottom left) if needed. The **Fit check** (bottom right) shows cross-sections of the joint.
+4. Fine-tune in the **Adjust** panel (bottom left) if needed. The **Fit check** (bottom right) shows cross-sections of the joint; press **K** to keep it up any time.
 5. **File › Export…** when you're done.
 
 Try **File › Load sample kit** to play without your own files.
@@ -56,6 +58,7 @@ Each tool's settings appear in the bar under the menus while it's active.
 ## Getting around
 
 - **Left-drag** to orbit, **right-drag** or **Shift-drag** to pan, **wheel** to zoom
+- **K** shows or hides the Fit check
 - **F** frames the selection; **double-click** centres the view on a spot
 - **Numpad 1 / 3 / 7** for front, right and top views; the cube in the corner does the same; **Numpad 5** switches perspective and orthographic
 - **Ctrl+Z / Ctrl+Shift+Z** to undo and redo; **Esc** cancels
@@ -71,7 +74,8 @@ Each tool's settings appear in the bar under the menus while it's active.
 - When you move a part that hangs off another, you're asked whether to bring the whole group along.
 - The last piece of a puzzle? In Match, pick areas on every part it touches and it fits against them all at once.
 - Feeling lucky works best on parts made to fit: cut faces, pegs, sockets and seams that sit flush. A search takes from a few seconds to a minute depending on the parts and your computer; **Quick** in the options bar is faster, **Thorough** looks harder. Its guesses are listed in Adjust, best first.
-- Printing in resin? Kit › Check for hollow pockets finds air sealed inside the model; tick **Fill hollow pockets** in Export and the file comes out solid there. Your parts stay as they are.
+- Printing in resin? Merge already fills hollows that are sealed completely. Kit › Check for hollow pockets also finds air whose only way out is a crack too narrow to drain; tick **Fill hollow pockets** in Export to fill those too. Your parts stay as they are.
+- Merging takes a moment on detailed sculpts (several seconds for half a million triangles). A piece with holes too big to close goes into the file as it was, and the export note says so.
 - Match pose works from the picture's point of view: line the picture up with the figure (similar size, overlapping, square on), and use a cut-out or a plain background. One picture can't show turns toward or away from it, so check the result from the side.
 - Paint is for previewing: STL files don't carry colour, so exports are plain geometry.
 
@@ -84,6 +88,9 @@ js/app.js        the app: scene, tools, kit, export
 js/math.js       the geometry (snapping, fitting, seams, sprues), with no page code
 js/lucky.js      the "Do ya feel lucky?" search, plain number crunching
 js/lucky-worker.js  runs that search in the background, one per spare processor core
+js/solid.js      merging parts into one clean solid for export
+js/solid-worker.js  runs the merge in the background
+js/vendor/       Manifold, the exact mesh-boolean library the merge uses (manifold.js and manifold.wasm)
 ```
 
 Because the scripts are separate files, the page has to be served from a web address (GitHub Pages, or any local server such as `python -m http.server`). Double-clicking `index.html` to open it from disk won't run it: browsers block scripts loaded that way.
@@ -98,4 +105,4 @@ Everything runs in your browser. Your STL files, box art and instructions are ne
 
 ## Built with
 
-[three.js](https://threejs.org) and [three-mesh-bvh](https://github.com/gkjohnson/three-mesh-bvh) and [three-bvh-csg](https://github.com/gkjohnson/three-bvh-csg) (MIT), [JSZip](https://stuk.github.io/jszip/) (MIT), [PDF.js](https://mozilla.github.io/pdf.js/) (Apache 2.0), and the Barlow and IBM Plex fonts (SIL Open Font License).
+[three.js](https://threejs.org) and [three-mesh-bvh](https://github.com/gkjohnson/three-mesh-bvh) and [three-bvh-csg](https://github.com/gkjohnson/three-bvh-csg) (MIT), [Manifold](https://github.com/elalish/manifold) (Apache 2.0, bundled in js/vendor), [JSZip](https://stuk.github.io/jszip/) (MIT), [PDF.js](https://mozilla.github.io/pdf.js/) (Apache 2.0), and the Barlow and IBM Plex fonts (SIL Open Font License).

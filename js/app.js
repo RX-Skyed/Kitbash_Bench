@@ -6,6 +6,7 @@ import { mergeVertices, mergeGeometries } from 'three/addons/utils/BufferGeometr
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { computeBoundsTree, acceleratedRaycast, INTERSECTED, NOT_INTERSECTED } from 'three-mesh-bvh';
+import { soupFromSTL, stlFromSoup } from './solid.js';
 import {
   V,
   buildTopo,
@@ -1239,6 +1240,171 @@ async function startLucky(op) {
 }
 
 // ---------------------------------------------------------------------------
+// Mirror and array: mirrored copies, copies along a line, copies round an axis (each with everything attached)
+// ---------------------------------------------------------------------------
+const marr = { mode: 'mirror', roots: [], picked: null, picking: false };
+const marrGhost = new THREE.Group(); scene.add(marrGhost);
+const ghostMat = new THREE.MeshBasicMaterial({ color: '#7fb6d6', transparent: true, opacity: 0.32, depthWrite: false, side: THREE.DoubleSide });
+/** "Right Arm" ↔ "Left Arm", "Pauldron_L" ↔ "Pauldron_R"; anything else gets "(mirror)". */
+function mirrorName(n) {
+  const sw = { left: 'right', right: 'left', Left: 'Right', Right: 'Left', LEFT: 'RIGHT', RIGHT: 'LEFT' };
+  let out = n.replace(/\b(left|right|Left|Right|LEFT|RIGHT)\b/g, w => sw[w]);
+  if (out === n) out = n.replace(/([ _\-.])([LR])(?=$|[ _\-.\d])/g, (m0, sep, c) => sep + (c === 'L' ? 'R' : 'L'));
+  return out === n ? `${n} (mirror)` : out;
+}
+/** The next free numbered name: "Rivet" → "Rivet 2", "Rivet 3" → "Rivet 4" (whatever's taken). */
+function nextName(n) {
+  const base = n.replace(/ \d+$/, ''), esc = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), re = new RegExp('^' + esc + ' (\\d+)$');
+  let k = 1; for (const m of liveParts()) { const mm = m.name.match(re); if (mm) k = Math.max(k, +mm[1]); }
+  return `${base} ${k + 1}`;
+}
+/** A copy of one part: same mesh (shared), its own colour, fill and brushed paint. */
+function clonePartAlone(m, name) {
+  const pt = m.userData.part, c = addPart(name, m.geometry, { welded: true, geomKey: pt.geomKey, color: pt.color }), ct = c.userData.part;
+  ct.topo = pt.topo; ct.fill = pt.fill || null;
+  if (pt.paint) { ownGeometry(c); ct.paint = pt.paint.slice(); ct.paintVer = 1; }
+  refreshPaint(c); c.visible = m.visible;
+  return c;
+}
+/** A copy of a part and everything attached to it, joints and all (the chosen option of a slot only). */
+function cloneTree(root, rename) {
+  const rec = m => {
+    const c = clonePartAlone(m, rename(m.name));
+    for (const k of liveParts().filter(x => parentPart(x) === m && !x.userData.optOff)) {
+      const kc = rec(k), j = jointOf(k);
+      if (j) { const jd = j.userData.joint, nj = makeJoint(jd.size); Object.assign(nj.userData.joint, { ...jd, rest: jd.rest.clone(), restPos: jd.restPos.clone(), long: jd.long?.clone() });
+        nj.position.copy(j.position); nj.quaternion.copy(j.quaternion); c.add(nj); nj.add(kc); }
+      else c.add(kc);
+      kc.position.copy(k.position); kc.quaternion.copy(k.quaternion); kc.scale.copy(k.scale);
+    }
+    return c;
+  };
+  return rec(root);
+}
+/** Hang `part` where `orig` hangs, as `T` would carry that connection (a mirrored or turned joint, same type and limits). */
+function attachLike(part, orig, T, info) {
+  const par = info.par; if (!par) return;
+  if (info.type === 'fixed') { par.attach(part); return; }
+  const jp = info.jp.clone().applyMatrix4(T), ax = info.jz.clone().transformDirection(T);
+  attach(part, par, 'joint', jp, ax);
+  const nj = jointOf(part); if (!nj) return;
+  Object.assign(nj.userData.joint, { type: info.type, min: info.min, max: info.max, axis: info.type === 'pinned' ? null : 'joint' });
+}
+function linkInfo(m) {
+  const par = parentPart(m), j = jointOf(m); scene.updateMatrixWorld(true);
+  return { par, type: linkTypeOf(m) || 'fixed', jp: j ? V().setFromMatrixPosition(j.matrixWorld) : null, jz: j ? V(0, 0, 1).transformDirection(j.matrixWorld) : null, min: j?.userData.joint.min ?? null, max: j?.userData.joint.max ?? null };
+}
+const marrParts = () => [...new Set(marr.roots.flatMap(subtreeParts))].filter(m => m.visible);
+/** The centre choices: [value, label, point]. */
+function marrPivots() {
+  const r0 = marr.roots[0], own = new Set(marrParts()), out = [['self', 'Its own centre', sceneBox(marrParts()).getCenter(V())]];
+  const par = parentPart(r0); if (par) out.push(['parent', `${par.name} (what it's attached to)`, worldBox(par).getCenter(V())]);
+  const j = jointOf(r0); if (j) out.push(['joint', 'Its joint', V().setFromMatrixPosition(j.matrixWorld)]);
+  if (marr.picked) out.push(['pick', 'The spot you picked', marr.picked.clone()]);
+  out.push(['origin', 'World origin', V()]);
+  for (const m of liveParts()) if (!own.has(m) && m !== par && m.visible) out.push(['part:' + m.uuid, m.name, worldBox(m).getCenter(V())]);
+  return out;
+}
+/** The axis choices: [value, label, direction]. */
+function marrAxes() {
+  const r0 = marr.roots[0], out = [['x', 'X (left–right)', V(1, 0, 0)], ['y', 'Y (front–back)', V(0, 1, 0)], ['z', 'Z (up–down)', V(0, 0, 1)], ['view', 'The view direction', fwd()]];
+  const j = jointOf(r0); if (j) { j.updateMatrixWorld(true); out.push(['joint', 'Its joint axis', V(0, 0, 1).transformDirection(j.matrixWorld)]); }
+  const pv = $('ma-pivot').value, pp = pv === 'parent' ? parentPart(r0) : pv.startsWith('part:') ? partByUuid(pv.slice(5)) : null;
+  if (pp) for (const a of ['x', 'y', 'z']) out.push(['p' + a, `${pp.name}'s ${a.toUpperCase()}`, partAxis(pp, a)]);
+  return out;
+}
+function fillSelect(sel, opts, keep) { const v = keep ?? sel.value; sel.innerHTML = ''; for (const [k, t] of opts) { const o = document.createElement('option'); o.value = k; o.textContent = t; sel.append(o); } if (opts.some(o => o[0] === v)) sel.value = v; }
+/** The transforms (world) that make each copy (or, mirroring in place, move the original). */
+function marrTransforms() {
+  const pv = marrPivots().find(o => o[0] === $('ma-pivot').value) || marrPivots()[0], c = pv[2];
+  const ax = (marrAxes().find(o => o[0] === $('ma-axis').value) || marrAxes()[0])[2].clone().normalize();
+  if (marr.mode === 'mirror') {
+    const n = ax, R = new THREE.Matrix4().set(1 - 2 * n.x * n.x, -2 * n.x * n.y, -2 * n.x * n.z, 0, -2 * n.y * n.x, 1 - 2 * n.y * n.y, -2 * n.y * n.z, 0, -2 * n.z * n.x, -2 * n.z * n.y, 1 - 2 * n.z * n.z, 0, 0, 0, 0, 1);
+    return [Tr(c).multiply(R).multiply(Tr(c.clone().negate()))];
+  }
+  const count = Math.max(1, Math.min(200, Math.round(+$('ma-count').value || 1))), out = [];
+  if (marr.mode === 'linear') { const d = V(+$('ma-dx').value || 0, +$('ma-dy').value || 0, +$('ma-dz').value || 0); for (let k = 1; k <= count; k++) out.push(Tr(d.clone().multiplyScalar(k))); return out; }
+  const A = (+$('ma-angle').value || 360) * Math.PI / 180, full = Math.abs(A) >= 2 * Math.PI - 1e-6, step = full ? A / (count + 1) : A / count;
+  const c0 = sceneBox(marrParts()).getCenter(V());
+  for (let k = 1; k <= count; k++) {
+    const T = Tr(c).multiply(new THREE.Matrix4().makeRotationAxis(ax, step * k)).multiply(Tr(c.clone().negate()));
+    out.push($('ma-turn').checked ? T : Tr(c0.clone().applyMatrix4(T).sub(c0)));
+  }
+  return out;
+}
+function marrPreview() {
+  while (marrGhost.children.length) marrGhost.children.pop();
+  if ($('marr').hidden) return;
+  let Ts; try { Ts = marrTransforms(); } catch (e) { return; }
+  scene.updateMatrixWorld(true);
+  for (const T of Ts) for (const m of marrParts()) { const g = new THREE.Mesh(m.geometry, ghostMat); g.matrixAutoUpdate = false; g.matrix.copy(T).multiply(m.matrixWorld); g.renderOrder = 5; marrGhost.add(g); }
+  const n = Ts.length, what = marr.roots.length > 1 ? `${marr.roots.length} parts` : marr.roots[0].name, extra = marrParts().length - marr.roots.length;
+  $('ma-sum').textContent = `${what}${extra > 0 ? ` + ${extra} attached` : ''}`;
+  $('ma-apply').textContent = marr.mode === 'mirror' ? ($('ma-keep').checked ? 'Make mirrored copy' : 'Mirror it') : `Make ${n} cop${n === 1 ? 'y' : 'ies'}`;
+  $('ma-note').textContent = marr.mode === 'mirror' ? 'The plane goes through the centre, square to the axis. Blue shows where it goes.'
+    : marr.mode === 'linear' ? 'Each copy is one step further on. Blue shows where they go.'
+    : `${Math.abs(+$('ma-angle').value) >= 360 ? 'Evenly round a full turn, the original included.' : 'Spread up to the angle, the last copy at the end.'} Blue shows where they go.`;
+}
+function syncMarr() {
+  document.querySelectorAll('#ma-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === marr.mode)));
+  const m = marr.mode;
+  document.querySelectorAll('#marr .ma-mir').forEach(e => { e.hidden = m !== 'mirror'; });
+  document.querySelectorAll('#marr .ma-arr').forEach(e => { e.hidden = m === 'mirror'; });
+  document.querySelectorAll('#marr .ma-rad').forEach(e => { e.hidden = m !== 'radial'; });
+  document.querySelectorAll('#marr .ma-lin').forEach(e => { e.hidden = m !== 'linear'; });
+  for (const id of ['ma-pivot', 'ma-pivot-l', 'ma-axis', 'ma-axis-l', 'ma-pick']) $(id).hidden = m === 'linear';
+  $('ma-pivot-l').textContent = m === 'mirror' ? 'Through' : 'Around';
+  $('ma-axis-l').textContent = m === 'mirror' ? 'Across (square to)' : 'Axis';
+  fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)));
+  fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2)));
+  marrPreview();
+}
+function openMarr(mode = 'mirror') {
+  const roots = selection.length ? selectionRoots() : selected ? [selected] : [];
+  if (!roots.length) { toast('Select the parts to mirror or copy first (Ctrl-click for several).', 'bad'); return; }
+  if (!$('orient').hidden) closeOrient(); closeAutorig(false); lastOp = null; $('adjust').hidden = true; showFit();
+  marr.roots = roots; marr.picked = null; marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false');
+  marr.mode = mode === 'array' ? 'linear' : mode;
+  $('marr').hidden = false;
+  fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)), parentPart(roots[0]) ? 'parent' : 'self');
+  fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2)), marr.mode === 'radial' ? 'z' : 'x');
+  syncMarr();
+}
+function closeMarr() { $('marr').hidden = true; marr.picking = false; marrPreview(); }
+function applyMarr() {
+  const Ts = marrTransforms(); if (!Ts.length) return;
+  pushUndo(); lastOp = null; scene.updateMatrixWorld(true);
+  const made = [], attachOn = $('ma-attach').checked;
+  const infos = new Map(marr.roots.map(r => [r, linkInfo(r)]));
+  if (marr.mode === 'mirror' && !$('ma-keep').checked) {
+    const T = Ts[0];
+    for (const r of marr.roots) { const info = infos.get(r); detach(r); applyWorld(r, T); if (info.par) attachLike(r, r, T, info); }
+    closeMarr(); afterHierarchyChange(); selectMany(marr.roots);
+    toast(`Mirrored ${marr.roots.length > 1 ? `${marr.roots.length} parts` : marr.roots[0].name}.`, 'ok'); return;
+  }
+  Ts.forEach((T, k) => {
+    for (const r of marr.roots) {
+      const name = marr.mode === 'mirror' ? mirrorName : nextName;
+      const c = cloneTree(r, name); r.updateMatrixWorld(true);
+      setWorld(c, T.clone().multiply(r.matrixWorld));
+      if (attachOn) attachLike(c, r, T, infos.get(r));
+      made.push(c);
+    }
+  });
+  closeMarr(); afterHierarchyChange(); selectMany(made);
+  const n = made.length;
+  toast(marr.mode === 'mirror' ? `Made ${made.map(m => m.name).join(', ')}${attachOn && infos.get(marr.roots[0]).par ? `, attached to ${infos.get(marr.roots[0]).par.name}` : ''}.` : `Made ${n} cop${n === 1 ? 'y' : 'ies'}.`, 'ok');
+}
+function bindMarr() {
+  document.querySelectorAll('#ma-mode button').forEach(b => b.addEventListener('click', () => { marr.mode = b.dataset.v; fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2)), marr.mode === 'radial' ? 'z' : 'x'); syncMarr(); }));
+  $('ma-pivot').addEventListener('change', () => { fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2))); marrPreview(); });
+  for (const id of ['ma-axis', 'ma-count', 'ma-angle', 'ma-dx', 'ma-dy', 'ma-dz', 'ma-keep', 'ma-turn', 'ma-attach']) $(id).addEventListener('input', marrPreview);
+  $('ma-pick').addEventListener('click', () => { marr.picking = !marr.picking; $('ma-pick').setAttribute('aria-pressed', String(marr.picking)); if (marr.picking) toast('Click a spot on any part to use as the centre.'); });
+  $('ma-apply').addEventListener('click', applyMarr);
+  $('ma-cancel').addEventListener('click', closeMarr); $('ma-close').addEventListener('click', closeMarr);
+}
+
+// ---------------------------------------------------------------------------
 // Orient: lay a face flat, square a part or a seam to the X, Y, Z planes
 // ---------------------------------------------------------------------------
 const ori = { part: null, before: null, sources: [], p: { source: 0, target: '-z', square: true, spin: 0, ground: true, scope: 'assembly' } };
@@ -1434,22 +1600,76 @@ function fitRadius(op) {
 function defaultDepthFrac(op) { return op.mode === 'PLANE' || (op.mode === 'MATCH' && op.match?.flat) ? -0.15 : 0; }   // flat contact: look just inside the fixed part     // faces: look just inside the fixed part, where a peg sits in its hole
 function scheduleFit() { if (fit.pending) return; fit.pending = true; requestAnimationFrame(() => { fit.pending = false; drawFit(); }); }
 
+/*
+ * The fit check shows by itself right after a snap. K (or View › Fit check) keeps it up any time: then it cuts through
+ * whatever you're working on — the selected part where it hangs off its parent (at the joint), two selected parts where
+ * they meet, or a loose part where it meets its nearest neighbour — and follows them live while you move or pose.
+ */
+fit.pinned = (() => { try { return localStorage.getItem('kitbash-fit') === '1'; } catch (e) { return false; } })();
+fit.hiddenFor = null;                // × hides the snap's own fit check until the next snap
+function setFitPinned(on) {
+  fit.pinned = on; try { localStorage.setItem('kitbash-fit', on ? '1' : '0'); } catch (e) {}
+  if (on) { fit.hiddenFor = null; $('fit-body').hidden = false; } else fit.hiddenFor = lastOp;
+  $('menu-fit')?.setAttribute('aria-checked', String(on)); showFit();
+}
+/** Where we're looking: { A (moving), B (fixed), point, axis, radius, key } in world space, or null. */
+function fitSource() {
+  const op = lastOp;
+  const onOp = op?.result && op.child.parent && (!fit.pinned || !selected || selected === op.child || selected === op.fixed);
+  if (onOp && fit.hiddenFor !== op) return { A: op.child, B: op.fixed, point: op.result.joint, axis: op.jointAxis || V(0, 0, 1), radius: fitRadius(op), op, key: 'op' };
+  if (!fit.pinned) return null;
+  const sel = selection.length ? selection : selected ? [selected] : [];
+  let A = null, B = null;
+  if (sel.length >= 2) { A = selected || sel[sel.length - 1]; B = sel.find(m => m !== A); }
+  else if (sel.length === 1) { A = sel[0]; B = parentPart(A); }
+  if (!A) return null;
+  scene.updateMatrixWorld(true);
+  if (!B) {                                        // the base or a loose part: its nearest neighbour, else the nearest part attached to it
+    const ab = worldBox(A), c = ab.getCenter(V()), mine = subtreeParts(A), near = list => { let best = Infinity, n = null;
+      for (const m of list) { if (m === A || !m.visible) continue; const d = worldBox(m).distanceToPoint(c); if (d < best) { best = d; n = m; } } return n; };
+    B = near(liveParts().filter(m => !mine.includes(m)));
+    if (!B) { const kid = near(mine.filter(m => parentPart(m) === A)); if (!kid) return null; B = A; A = kid; }
+  }
+  const key = A.uuid + '|' + B.uuid, j = parentPart(A) === B ? jointOf(A) : null;
+  if (j) return { A, B, point: V().setFromMatrixPosition(j.matrixWorld), axis: V(0, 0, 1).transformDirection(j.matrixWorld), radius: jointRadius(A, B), key };
+  // no joint: where they meet, worked out once and carried along with the moving part
+  if (fit.cache?.key !== key) {
+    const pv = pivotPoint(A, B), pt = pv.point.clone(), ax = pv.axis.clone();
+    if (!(ax.lengthSq() > 1e-12)) ax.set(0, 0, 1); ax.normalize();
+    const inv = A.matrixWorld.clone().invert();
+    fit.cache = { key, p: pt.applyMatrix4(inv), n: ax.transformDirection(inv) };
+  }
+  return { A, B, point: fit.cache.p.clone().applyMatrix4(A.matrixWorld), axis: fit.cache.n.clone().transformDirection(A.matrixWorld), radius: jointRadius(A, B), key };
+}
+function jointRadius(A, B) { const d = Math.min(worldBox(A).getSize(V()).length(), worldBox(B).getSize(V()).length()); return Math.min(Math.max(d * 0.3, 1.5), 60); }
 function showFit() {
-  const op = lastOp, el = $('fitcheck');
-  if (!op || !op.result) { el.hidden = true; cutPlane.visible = false; return; }
-  if (fit.op !== op) { fit.op = op; fit.zoom = 1; fit.depthFrac = defaultDepthFrac(op); $('fit-depth').value = Math.round(fit.depthFrac * 100); }
+  const el = $('fitcheck'), src = fitSource();
+  $('menu-fit')?.setAttribute('aria-checked', String(fit.pinned));
+  if (!src) {
+    if (fit.pinned) {            // on, but nothing to cut yet
+      el.hidden = false; fit.src = null; $('fit-a').textContent = 'moving'; $('fit-b').textContent = 'fixed';
+      for (let i = 0; i < 3; i++) { const cv = $('cut' + i); cv.getContext('2d').clearRect(0, 0, cv.width, cv.height); $('cut' + i + '-read').textContent = i ? '' : selected ? 'Nothing near it' : 'Select a part'; $('cut' + i + '-read').className = 'read'; }
+      return;
+    }
+    el.hidden = true; cutPlane.visible = false; fit.src = null; return;
+  }
+  if (fit.src?.key !== src.key || fit.src?.op !== src.op || fit.src?.A !== src.A) {
+    fit.zoom = 1; fit.depthFrac = src.op ? defaultDepthFrac(src.op) : 0; $('fit-depth').value = Math.round(fit.depthFrac * 100);
+  }
+  fit.src = src; $('fit-a').textContent = src.A.name; $('fit-b').textContent = src.B.name;
   el.hidden = false; scheduleFit();
 }
 function drawFit() {
-  const op = lastOp; if (!op || !op.result || $('fitcheck').hidden || $('fit-body').hidden) return;
+  if ($('fitcheck').hidden || $('fit-body').hidden) return;
+  const src = fit.src && fit.src.A.parent && fit.src.B.parent ? fitSource() : null; if (!src) return;
   scene.updateMatrixWorld(true);
-  const R = fitRadius(op) * fit.zoom; fit.R = R;
+  const R = src.radius * fit.zoom; fit.R = R;
   const depth = fit.depthFrac * R;
   $('fit-depth-n').textContent = `${depth >= 0 ? '+' : ''}${depth.toFixed(2)} mm`;
-  fit.cuts = fitCuts(op.result.joint, op.jointAxis || V(0, 0, 1), depth);
+  fit.cuts = fitCuts(src.point, src.axis, depth);
   fit.cuts.forEach((c, i) => {
-    const A = sliceMesh(op.child.geometry, op.child.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH);
-    const B = sliceMesh(op.fixed.geometry, op.fixed.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH);
+    const A = sliceMesh(src.A.geometry, src.A.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH);
+    const B = sliceMesh(src.B.geometry, src.B.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH);
     drawCut($('cut' + i), $('cut' + i + '-read'), A, B, R, c);
   });
 }
@@ -1503,7 +1723,7 @@ function bindFit() {
   document.querySelectorAll('.cut').forEach(fig => {
     const cv = fig.querySelector('canvas'), i = +fig.dataset.i;
     cv.addEventListener('wheel', e => { e.preventDefault(); fit.zoom = Math.min(Math.max(fit.zoom * (e.deltaY > 0 ? 1.15 : 1 / 1.15), 0.05), 20); scheduleFit(); }, { passive: false });
-    cv.addEventListener('dblclick', () => { fit.zoom = 1; if (lastOp) { fit.depthFrac = defaultDepthFrac(lastOp); $('fit-depth').value = Math.round(fit.depthFrac * 100); } scheduleFit(); });
+    cv.addEventListener('dblclick', () => { fit.zoom = 1; if (fit.src?.op) { fit.depthFrac = defaultDepthFrac(fit.src.op); $('fit-depth').value = Math.round(fit.depthFrac * 100); } scheduleFit(); });
     fig.addEventListener('mouseenter', () => {
       const c = fit.cuts?.[i]; if (!c) return;
       const R = fit.R; cutPlane.position.copy(c.origin);
@@ -1693,11 +1913,13 @@ function select(mesh, mode = 'replace') {
   else if (m && mode === 'add' && !isSel(m)) selection = [...selection, m];
   selected = m && isSel(m) ? m : selection[selection.length - 1] || null;
   paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); renderOptions(); updateButtons();
+  if (fit.pinned) showFit();
 }
 function selectMany(list, add = false) {
   selection = add ? [...new Set([...selection, ...list])] : [...new Set(list)];
   selected = selection[selection.length - 1] || null;
   paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); renderOptions(); updateButtons();
+  if (fit.pinned) showFit();
 }
 /** Selected parts that aren't inside another selected part's attachments (those move with it anyway). */
 function selectionRoots() { return selection.filter(m => m.parent && !selection.some(o => o !== m && isDescendant(m, o))); }
@@ -1760,6 +1982,7 @@ tc.addEventListener('mouseDown', () => {
   }
 });
 tc.addEventListener('objectChange', () => {
+  if (fit.src && !$('fitcheck').hidden) scheduleFit();          // the cross-sections follow the drag
   if (tc.object?.userData.joint) {
     const j = tc.object; constrainJoint(j);
     if (links.length) {
@@ -1868,8 +2091,8 @@ function renderPartPanel() {
     }, !!rerootCheck(p));
     row.lastChild.title = rerootCheck(p) || (swap ? `Make ${p.name} the parent and ${par.name} its child. Nothing moves.` : `Make ${p.name} the base: every link between it and the current base turns round. Nothing moves.`);
   }
-  b('Mirror', () => { pushUndo(); const c = worldBox(p).getCenter(V());
-    applyWorld(p, Tr(c).multiply(new THREE.Matrix4().makeScale(-1, 1, 1)).multiply(Tr(c.clone().negate()))); afterHierarchyChange(); });
+  b('Mirror…', () => openMarr('mirror')); row.lastChild.title = 'Mirror it, or make a mirrored copy, across a plane through any centre (Shift+M)';
+  b('Array…', () => openMarr('linear')); row.lastChild.title = 'Copies along a line or round an axis (Shift+A)';
   b('Drop to grid', () => { pushUndo(); applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); });
   b('Square up', () => openOrient(p, { kind: 'auto' }));
   if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
@@ -1966,6 +2189,7 @@ function renderMultiPanel(el) {
   b('Detach', () => { pushUndo(); list.filter(m => parentPart(m)).forEach(m => detach(m)); afterHierarchyChange(); }, !list.some(m => parentPart(m)));
   b('Drop to grid', () => { pushUndo(); const dz = -lowestZ(list); roots.forEach(m => applyWorld(m, Tr(V(0, 0, dz)))); afterHierarchyChange(); }, false, 'Lowers them together until the lowest touches the grid');
   b('Square up together', () => openOrient(selected, { kind: 'auto' }));
+  b('Mirror…', () => openMarr('mirror'), false, 'Mirror them, or make mirrored copies (Shift+M)'); b('Array…', () => openMarr('linear'), false, 'Copies along a line or round an axis (Shift+A)');
   const allShown = list.every(m => m.visible);
   b(allShown ? 'Hide' : 'Show', () => { list.forEach(m => { m.visible = !allShown; }); renderOutliner(); renderPartPanel(); markDirty(); });
   b('Delete', () => deleteSelected());
@@ -1994,6 +2218,7 @@ function afterHierarchyChange() {
   if (selected && !selected.parent) selected = selection[selection.length - 1] || null;
   paintSelection();
   renderOutliner(); renderPartPanel(); renderOptions(); rebuildSprues(); rebuildMagnets(); showAdjust(); updateButtons(); updateStats(); syncGizmo();
+  if (fit.pinned) showFit();
 }
 // ---------------------------------------------------------------------------
 // Rearranging by drag and drop: in the parts list and in the auto-assemble review
@@ -2405,7 +2630,9 @@ async function exportSprues(only) {
     const pieces = Object.keys(sprues.poses).map(partById).filter(m => m && onSprue(m) && sprues.gates.some(g => g.part === m.uuid && g.frame === k));
     files.push({ name: `Sprue ${f.letter}.stl`, pieces });
   });
-  for (const f of files) { const cut = await cutMagnetHoles(f.pieces, f.pieces); f.data = writeSTL([sprueMeshes(sprues.frames.findIndex(x => `Sprue ${x.letter}.stl` === f.name)), ...cut.meshes]); delete f.pieces; }
+  const holesOf = [];
+  for (const f of files) { const cut = await cutMagnetHoles(f.pieces, f.pieces); holesOf.push(cut.holes); f.data = writeSTL([sprueMeshes(sprues.frames.findIndex(x => `Sprue ${x.letter}.stl` === f.name)), ...cut.meshes]); delete f.pieces; }
+  const mg = await mergeSTLs(files.map(f => f.data), 'Merging each sprue into one solid', holesOf); files.forEach((f, i) => { f.data = mg.files[i]; });
   await deliver(files, `${safe(project.name || 'kit')}-sprues.zip`);
 }
 // ---------------------------------------------------------------------------
@@ -3898,8 +4125,49 @@ function filledMesh(m, positions) {
   if (m.matrixWorld.determinant() < 0) for (let t = 0; t < ix.length; t += 3) { const k = ix[t+1]; ix[t+1] = ix[t+2]; ix[t+2] = k; }
   g.setIndex(new THREE.BufferAttribute(ix, 1)); const out = new THREE.Mesh(g); out.updateMatrixWorld(true); return out;
 }
-/** One STL of these parts, with the seams filled if that option is on. */
+/*
+ * Solid merge: every closed shell in the file is unioned into one clean solid (Manifold, exact booleans, in a
+ * background worker), so no surface is left inside the model: no overlapping walls, nothing for a slicer to read as
+ * a void. With "Fill hollow pockets" on, hollows sealed inside the result are filled too.
+ */
+let solidWorker = null, solidSeq = 0;
+const solidWaits = new Map();
+function mergeJobs(jobs, opts) {
+  if (!solidWorker) {
+    solidWorker = new Worker(new URL('./solid-worker.js', import.meta.url), { type: 'module' });
+    solidWorker.onmessage = e => { const w = solidWaits.get(e.data.id); solidWaits.delete(e.data.id); if (!w) return; e.data.error ? w.no(new Error(e.data.error)) : w.ok(e.data.out); };
+    solidWorker.onerror = e => { for (const w of solidWaits.values()) w.no(new Error(e.message || 'The merge helper failed to start')); solidWaits.clear(); solidWorker = null; };
+  }
+  const id = ++solidSeq;
+  return new Promise((ok, no) => { solidWaits.set(id, { ok, no }); solidWorker.postMessage({ id, jobs, opts }); });
+}
+/** Merge each STL (ArrayBuffer) into one solid. Returns { files: [ArrayBuffer], note } — the originals if merging is off or fails. */
+async function mergeSTLs(bufs, title = 'Merging into one solid', holes = []) {
+  if (!$('exp-merge').checked) return { files: bufs, note: '' };
+  loading.show(title); loading.set(0.15, 'Removing the surfaces inside the model…'); await nextFrame();
+  try {
+    const out = await mergeJobs(bufs.map((b, i) => ({ soups: [soupFromSTL(b)], subtract: holes[i] || [] })), { fillHollows: true });
+    const s = out.reduce((a, r) => ({ inS: a.inS + r.inputShells, outS: a.outS + r.shells, h: a.h + r.hollows, hv: a.hv + r.hollowVolume, hl: a.hl + r.hollowsLeft, hlv: a.hlv + r.hollowLeftVolume, rep: a.rep + r.repaired, un: a.un + r.unmerged }), { inS: 0, outS: 0, h: 0, hv: 0, hl: 0, hlv: 0, rep: 0, un: 0 });
+    const mm3 = v => v < 1 ? v.toFixed(2) : v.toFixed(0);
+    const files = out.map(r => stlFromSoup(r.positions));
+    let note = s.inS > s.outS || s.h || s.hl ? `Merged ${s.inS} shell${s.inS === 1 ? '' : 's'} into ${s.outS} solid${s.outS === 1 ? '' : 's'}, with no surfaces left inside.` : 'Already clean: no surfaces inside.';
+    if (s.h) note += ` Filled ${s.h} sealed hollow${s.h === 1 ? '' : 's'} (${mm3(s.hv)} mm³).`;
+    if (s.hl) note += ` ${s.hl} sealed hollow${s.hl === 1 ? ' is' : 's are'} left inside (${mm3(s.hlv)} mm³): tick "Fill hollow pockets" to fill ${s.hl === 1 ? 'it' : 'them'}.`;
+    const cutN = out.reduce((a, r) => a + r.cut, 0); if (cutN) note += ` Cut ${cutN} magnet hole${cutN === 1 ? '' : 's'}.`;
+    if (s.rep) note += ` Closed small holes in ${s.rep} piece${s.rep === 1 ? '' : 's'} first.`;
+    if (s.un) note += ` ${s.un} piece${s.un === 1 ? ' has' : 's have'} holes too big to close and went in as they were.`;
+    return { files, note: note + ' ' };
+  } catch (e) {
+    console.warn(e); toast(`Couldn't merge into one solid (${e.message || e}). Exported the parts as they are.`, 'bad');
+    return { files: bufs, note: '' };
+  } finally { loading.hide(); }
+}
+/** One STL of these parts, with the seams filled if that option is on, merged into one solid if that's on. */
 async function oneSTL(ms) {
+  const r = await oneSTLRaw(ms), m = await mergeSTLs([r.data], undefined, [r.holes]);
+  return { data: m.files[0], note: m.note + r.note };
+}
+async function oneSTLRaw(ms) {
   // hollow pockets first, on the parts as they are: the filler goes in as one more solid
   let extra = [], pnote = '';
   if ($('exp-pockets').checked) {
@@ -3907,13 +4175,13 @@ async function oneSTL(ms) {
     if (r?.geometry) { const f = new THREE.Mesh(r.geometry); f.updateMatrixWorld(true); extra = [f]; }
     if (r) pnote = (r.pockets ? `Filled ${pocketSummary(r).replace(/^\d+ sealed/, m => m.toLowerCase())}.` : 'No sealed pockets to fill.') + ' ';
   }
-  if (!$('exp-fill').checked || ms.length < 2) { const cut = await cutMagnetHoles(ms, ms); return { data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note }; }
+  if (!$('exp-fill').checked || ms.length < 2) { const cut = await cutMagnetHoles(ms, ms); return { data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note, holes: cut.holes }; }
   toast('Filling seams…'); await nextFrame();
   const { out, stats } = fillSeamsAll(ms, fillOpts());
   const left = gapsLeft(ms, out, fillOpts().maxGap * 2);
   const note = stats.moved ? `Filled ${stats.seams} seam${stats.seams === 1 ? '' : 's'}: pushed ${stats.moved.toLocaleString()} corners by up to ${stats.largest.toFixed(2)} mm.` : 'No seams within reach to fill.';
   const cut = await cutMagnetHoles(ms.map((m, k) => filledMesh(m, out[k].positions)), ms);
-  return { data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note + note + (left.open ? ` ${left.open} spot${left.open > 1 ? 's' : ''} have gaps wider than ${fillOpts().maxGap} mm; raise "Close gaps up to" to fill them.` : '') };
+  return { holes: cut.holes, data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note + note + (left.open ? ` ${left.open} spot${left.open > 1 ? 's' : ''} have gaps wider than ${fillOpts().maxGap} mm; raise "Close gaps up to" to fill them.` : '') };
 }
 $('exp-all').addEventListener('click', async () => {
   const ms = exportMeshes(); if (!ms.length) return;
@@ -4132,7 +4400,12 @@ function magnetRows(p, el) {
 /** At export: the holes cut into copies of the parts that carry magnets (meshes[i] is the export copy of parts[i]). */
 async function cutMagnetHoles(meshes, parts) {
   const todo = parts.map((m, i) => ({ i, m, sides: magnets.flatMap(mg => mg.sides.filter(sd => sd.part === m.uuid).map(sd => ({ mg, sd }))) })).filter(x => x.sides.length);
-  if (!todo.length) return { meshes, note: '' };
+  if (!todo.length) return { meshes, note: '', holes: [] };
+  if ($('exp-merge').checked) {          // merging: the holes are cut by the merge itself, exactly, so the result stays one clean solid
+    const byPart = meshes.map(() => []);
+    for (const { i, sides } of todo) for (const { mg, sd } of sides) { const w = sideWorld(sd), g = holeGeometry(mg, w.o, w.n); byPart[i].push(Float32Array.from((g.index ? g.toNonIndexed() : g).attributes.position.array)); }
+    return { meshes, note: '', holes: byPart.flat(), byPart };
+  }
   let CSG; try { CSG = await import('three-bvh-csg'); } catch (e) { return { meshes, note: "Magnet holes weren't cut: the hole-cutting tool didn't load. Check your connection. " }; }
   loading.show('Cutting magnet holes'); const out = meshes.slice(); let holes = 0, failed = [];
   try {
@@ -4155,7 +4428,7 @@ async function cutMagnetHoles(meshes, parts) {
       } catch (e) { console.warn(e); failed.push(m.name); }
     }
   } finally { loading.hide(); }
-  return { meshes: out, note: `Cut ${holes} magnet hole${holes === 1 ? '' : 's'}.` + (failed.length ? ` Couldn't cut into ${failed.join(', ')} (its mesh may not be closed); exported without.` : '') + ' ' };
+  return { meshes: out, holes: [], note: `Cut ${holes} magnet hole${holes === 1 ? '' : 's'}.` + (failed.length ? ` Couldn't cut into ${failed.join(', ')} (its mesh may not be closed); exported without.` : '') + ' ' };
 }
 function bindMagnets() {
   const SIZE = () => $('mag-size').value;
@@ -4196,6 +4469,8 @@ $('exp-each').addEventListener('click', async () => {
   const ms = exportMeshes(); if (!ms.length) return;
   const used = new Set(), cut = await cutMagnetHoles(ms, ms); if (cut.note) $('exp-note').textContent = cut.note;
   const files = ms.map((m, i) => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([cut.meshes[i]]) }; });
+  const mg = await mergeSTLs(files.map(f => f.data), 'Merging each part into one solid', cut.byPart || []); files.forEach((f, i) => { f.data = mg.files[i]; });
+  if (mg.note || cut.note) $('exp-note').textContent = mg.note + (cut.note || '');
   deliver(files, 'parts-stl.zip');
 });
 
@@ -4213,6 +4488,11 @@ renderer.domElement.addEventListener('pointerup', e => {
     if (bh) { if (bh.kind === 'book' && tool === 'select') { openBook(); return; } selectBench(bh.kind, bh.k); return; }
   }
   const hit = raycast(e);
+  if (marr.picking) {                              // Mirror & array: this click picks the centre
+    if (!hit) { toast('Missed. Click a spot on a part.'); return; }
+    marr.picked = hit.point.clone(); marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false');
+    fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)), 'pick'); fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2))); marrPreview(); return;
+  }
   if (tool === 'MAGNET') { handleMagnetClick(hit); return; }
   if (tool === 'LUCKY') { handleLuckyClick(hit); return; }
   if (SNAP_STEPS[tool]) {                          // measuring a big surface can take a moment: let the message paint first
@@ -4520,6 +4800,11 @@ window.addEventListener('keydown', e => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const map = { '1': 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', b: 'BALL', h: 'PLANE', m: 'MID', t: 'THREE', j: 'MATCH', c: 'paint', n: 'MAGNET', l: 'LUCKY' };
   if (k === 'e' && tool === 'paint') { const c = $('paint-erase'); c.checked = !c.checked; toast(c.checked ? 'Erasing back to bare plastic.' : 'Painting.'); return; }
+  if (k === 'k' && !e.shiftKey) { setFitPinned(!(fit.pinned || !$('fitcheck').hidden)); toast(fit.pinned ? 'Fit check on: cross-sections through the selected part where it meets its neighbour. K hides it.' : 'Fit check hidden. K brings it back.'); return; }
+  if (e.shiftKey && k === 'm') { openMarr('mirror'); return; }
+  if (e.shiftKey && k === 'a') { openMarr('linear'); return; }
+  if (k === 'escape' && !$('marr').hidden) { if (marr.picking) { marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false'); } else closeMarr(); return; }
+  if (k === 'enter' && !$('marr').hidden && !e.target.closest?.('#marr')) { applyMarr(); return; }
   if (map[k]) { setTool(map[k]); return; }
   if (k === 'escape' && benchSel) { select(null); syncGizmo(); renderPartPanel(); return; }
   if (k === 'escape' && magPending) { magPending = null; rebuildMagnets(); updateStep(); toast('Cancelled that magnet.'); return; }
@@ -4546,7 +4831,7 @@ function rebuildPickFx() {
 // ---------------------------------------------------------------------------
 // Projects: autosave to this browser (IndexedDB) and project files (.zip)
 // ---------------------------------------------------------------------------
-const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
+const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
 const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
 let idb = null;
 const idbReady = new Promise(res => {
@@ -4795,7 +5080,7 @@ function refreshMenus() {
   $('menu-undo').disabled = !undoStack.length; $('menu-redo').disabled = !redoStack.length;
   $('menu-selall').disabled = !any; $('menu-selnone').disabled = !selection.length && !selected; $('menu-delete').disabled = !selected && !benchSel;
   $('btn-arrange').disabled = $('btn-sprue').disabled = $('btn-autorig').disabled = !any; $('menu-unsprue').disabled = !sprues; $('menu-unbox').disabled = kit?.state !== 'sealed';
-  $('menu-slot').disabled = selection.length < 2; $('menu-pockets').disabled = !liveParts().length; $('menu-nomagnets').disabled = !magnets.length; $('menu-clearpaint').disabled = !liveParts().some(m => m.userData.part.paint || m.userData.part.fill); $('menu-export').disabled = !any; $('menu-frame').disabled = !any;
+  $('menu-slot').disabled = selection.length < 2; $('menu-mirror').disabled = $('menu-array').disabled = !selection.length && !selected; $('menu-pockets').disabled = !liveParts().length; $('menu-nomagnets').disabled = !magnets.length; $('menu-clearpaint').disabled = !liveParts().some(m => m.userData.part.paint || m.userData.part.fill); $('menu-export').disabled = !any; $('menu-frame').disabled = !any;
   $('menu-joints').setAttribute('aria-checked', String($('set-joints').checked));
   $('menu-seams').setAttribute('aria-checked', $('exp-preview').getAttribute('aria-pressed')); $('menu-seams').disabled = liveParts().length < 2;
 }
@@ -4846,6 +5131,9 @@ function bindChrome() {
   on('menu-front', () => navCube.goTo(V(0, -1, 0))); on('menu-right', () => navCube.goTo(V(1, 0, 0))); on('menu-top', () => navCube.goTo(V(0, 0, 1)));
   on('menu-frame', () => frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox()));
   on('menu-ortho', () => setOrtho(!camera.isOrthographicCamera));
+  on('menu-fit', () => setFitPinned(!(fit.pinned || !$('fitcheck').hidden)));
+  $('fit-close').addEventListener('click', e => { e.stopPropagation(); setFitPinned(false); });
+  on('menu-mirror', () => openMarr('mirror')); on('menu-array', () => openMarr('linear'));
   on('menu-addref', () => $('ref-input').click());
   $('ref-input').addEventListener('change', async () => { for (const f of [...$('ref-input').files]) await addRefImage(f); $('ref-input').value = ''; });
   on('menu-joints', () => { const c = $('set-joints'); c.checked = !c.checked; c.dispatchEvent(new Event('change', { bubbles: true })); });
@@ -4901,7 +5189,7 @@ new ResizeObserver(resize).observe(view);
 bindAdjust();
 bindFit();
 bindProject();
-bindAutorig(); bindTreeDnD();
+bindAutorig(); bindTreeDnD(); bindMarr();
 bindOrient();
 bindOptions();
 bindKit(); bindLinkAsk(); bindChrome(); bindPaint(); bindMagnets();
