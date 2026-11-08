@@ -10,6 +10,7 @@ import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { computeBoundsTree, acceleratedRaycast, INTERSECTED, NOT_INTERSECTED } from 'three-mesh-bvh';
 import { soupFromSTL, stlFromSoup } from './solid.js';
+import { inkField, blurField, otsu, traceOutline } from './relief.js';
 import {
   V,
   buildTopo,
@@ -785,9 +786,10 @@ function reroot(part) {
 const undoStack = [], redoStack = [];
 function snapshot() {
   const snap = [...parts, ...joints].filter(o => o.parent).map(o => ({
-    o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name,
+    o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name, g: o.isMesh ? o.geometry : null, gk: o.userData.part?.geomKey,
     rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null, axisName: o.userData.joint.axisName || '', pointOff: o.userData.joint.pointOff || null, partOff: o.userData.joint.partOff || null } : null, off: !!o.userData.optOff,
-    paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null }));
+    paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null,
+    mods: o.userData.part?.mods ? JSON.parse(JSON.stringify(o.userData.part.mods)) : null, base: o.userData.part?.base || null, owner: o.userData.part?.owner || null }));
   snap.options = JSON.parse(JSON.stringify(options));
   snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
   snap.kit = kit ? JSON.parse(JSON.stringify(kit)) : null;
@@ -800,10 +802,12 @@ function restore(snap) {
   [...parts, ...joints].forEach(o => o.parent && o.parent.remove(o));
   for (const e of snap) {
     e.p.add(e.o); e.o.position.copy(e.pos); e.o.quaternion.copy(e.q); e.o.scale.copy(e.s); e.o.visible = e.vis; e.o.name = e.name;
+    if (e.g && e.o.geometry !== e.g) { e.o.geometry = e.g; const pt = e.o.userData.part; pt.geomKey = e.gk; pt.topo = null; pt.tris = e.g.index.count / 3; }
     if (e.rest) e.o.userData.joint.rest.copy(e.rest);
     if (e.jd) Object.assign(e.o.userData.joint, { ...e.jd, restPos: e.jd.restPos.clone() });
     if (e.o.userData.part) { e.o.userData.optOff = e.off;
-      const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); } }
+      const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); }
+      pt.mods = e.mods ? JSON.parse(JSON.stringify(e.mods)) : null; pt.base = e.base; if (e.owner) pt.owner = e.owner; else delete pt.owner; }
   }
   if (snap.options) options = JSON.parse(JSON.stringify(snap.options));
   if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
@@ -2499,11 +2503,15 @@ function renderPartPanel() {
   }
   b('Mirror…', () => openMarr('mirror')); row.lastChild.title = 'Mirror it, or make a mirrored copy, across a plane through any centre (Shift+M)';
   b('Array…', () => openMarr('linear')); row.lastChild.title = 'Copies along a line or round an axis (Shift+A)';
+  b('Scatter…', () => startScatter()); row.lastChild.title = 'Scatter copies of this over a face of another part, at random';
+  b('Crack…', () => startCrack(p)); row.lastChild.title = 'Crack it and cave it in where you click, as if it was punched';
+  b('Split…', () => startSplit(p)); row.lastChild.title = 'Cut it in two where you click: snapped, torn, melted by a lance, or clean';
   b('Drop to grid', () => { pushUndo(); applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); });
   b('Square up', () => openOrient(p, { kind: 'auto' }));
   if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
   b('Delete', () => deleteSelected());
   el.append(name, dl, row);
+  modifierRows(p, el);
   connectionRows(p, el);
   magnetRows(p, el);
 }
@@ -2690,7 +2698,7 @@ function renderMultiPanel(el) {
   b('Detach', () => { pushUndo(); list.filter(m => parentPart(m)).forEach(m => detach(m)); afterHierarchyChange(); }, !list.some(m => parentPart(m)));
   b('Drop to grid', () => { pushUndo(); const dz = -lowestZ(list); roots.forEach(m => applyWorld(m, Tr(V(0, 0, dz)))); afterHierarchyChange(); }, false, 'Lowers them together until the lowest touches the grid');
   b('Square up together', () => openOrient(selected, { kind: 'auto' }));
-  b('Mirror…', () => openMarr('mirror'), false, 'Mirror them, or make mirrored copies (Shift+M)'); b('Array…', () => openMarr('linear'), false, 'Copies along a line or round an axis (Shift+A)');
+  b('Mirror…', () => openMarr('mirror'), false, 'Mirror them, or make mirrored copies (Shift+M)'); b('Array…', () => openMarr('linear'), false, 'Copies along a line or round an axis (Shift+A)'); b('Scatter…', () => startScatter(), false, 'Scatter copies of these, mixed at random, over a face of another part');
   const allShown = list.every(m => m.visible);
   b(allShown ? 'Hide' : 'Show', () => { list.forEach(m => { m.visible = !allShown; }); renderOutliner(); renderPartPanel(); markDirty(); });
   b('Delete', () => deleteSelected());
@@ -3843,6 +3851,7 @@ function refPanel(el, o) {
   b('Look straight at it', () => lookAtRef(r), 'Turn the view to face it square on, in orthographic, framed');
   b(r.visible === false ? 'Show' : 'Hide', () => upd(() => { r.visible = r.visible === false; }));
   b('Delete', () => removeRef(r.id));
+  b('Make a relief…', () => openRelief(assetBlob(r.asset), r.name), 'Turn this picture into a raised 3D relief (a logo, an emblem) you can put on a part');
   const ap = document.createElement('div'); ap.className = 'conn'; ap.id = 'autopose-box';
   head.append(nm); const sm = document.createElement('small'); sm.textContent = 'Reference image. Move (G) slides it, Rotate (R) turns it.'; head.append(sm);
   el.append(head, sec, row, ap);
@@ -4131,6 +4140,1244 @@ function shiftConn(ci, which, d) {
 }
 /** After a connection changed: close the loops again and re-seat its magnets. */
 function connChanged(c) { if (links.length) solveLinks(c.kind === 'joint' ? jointById(c.id) : null); scene.updateMatrixWorld(true); placeConnMagnets(c); afterHierarchyChange(); }
+
+/*
+ * Image to relief: a picture (a logo) becomes a solid. The picture is read as numbers, no AI: how much "ink" each
+ * pixel has (dark on light, light on dark, or a cut-out PNG's see-through background). The outline is traced where
+ * that crosses the threshold; the height is flat (with an optional rounded bevel) or follows the brightness (a depth
+ * map). It's built in the background with Manifold, so it comes out as one clean closed solid.
+ * Then it can go on a part: click the spot, and it lies on the surface there, wrapped to its shape if you like,
+ * sunk in a little so it joins up when exported, and fixed to that part so it poses with it.
+ */
+const rl = { img: null, name: '', field: null, w: 0, h: 0, t: 0.5, autoT: 0.5, raise: 'auto', mode: 'flat', busy: false };
+async function openRelief(blob = null, name = '') {
+  $('relief').hidden = false; syncReliefSegs();
+  if (blob) await reliefPicture(blob, name);
+}
+function closeRelief() { $('relief').hidden = true; }
+async function reliefPicture(blob, name) {
+  try { rl.img?.close?.(); rl.img = await createImageBitmap(blob); } catch (e) { toast(`Couldn't read ${name || 'that'} as a picture.`, 'bad'); return; }
+  rl.name = (name || 'Relief').replace(/\.[^.]+$/, ''); $('rl-name').textContent = `${rl.name} · ${rl.img.width} × ${rl.img.height} px`;
+  rl.tAuto = true; reliefField(); $('rl-make').disabled = $('rl-place').disabled = false;
+}
+/** Read the picture into the ink field at the chosen detail, then preview. */
+function reliefField() {
+  if (!rl.img) return;
+  const D = +$('rl-detail').value, sc = Math.min(1, D / Math.max(rl.img.width, rl.img.height)) || 1;
+  const w = Math.max(8, Math.round(rl.img.width * sc)), h = Math.max(8, Math.round(rl.img.height * sc));
+  const cv = new OffscreenCanvas(w, h), cx = cv.getContext('2d'); cx.drawImage(rl.img, 0, 0, w, h);
+  const { field, raise } = inkField(cx.getImageData(0, 0, w, h).data, w, h, rl.raise);
+  rl.field = blurField(field, w, h, +$('rl-blur').value); rl.w = w; rl.h = h; rl.found = raise;
+  rl.autoT = otsu(rl.field); if (rl.tAuto) { rl.t = rl.autoT; $('rl-t').value = Math.round(rl.t * 100); }
+  reliefPreview();
+}
+function reliefPreview() {
+  const cv = $('rl-prev'), { w, h, field: f } = rl; if (!f) return;
+  const W = cv.width, H = Math.round(W * h / w); cv.height = H;
+  const cx = cv.getContext('2d'), im = cx.createImageData(w, h), mode = rl.mode, t = mode === 'image' ? -1 : rl.t;
+  for (let i = 0; i < w * h; i++) {
+    const v = f[i], inside = v >= t, g = mode === 'flat' ? (inside ? 40 : 238) : inside ? Math.round(230 - 200 * (mode === 'image' ? v : Math.min(1, (v - t) / Math.max(1e-6, 1 - t)))) : 238;
+    im.data[4 * i] = g; im.data[4 * i + 1] = g; im.data[4 * i + 2] = g + (inside ? 0 : 4); im.data[4 * i + 3] = 255;
+  }
+  const tmp = new OffscreenCanvas(w, h); tmp.getContext('2d').putImageData(im, 0, 0);
+  cx.imageSmoothingEnabled = true; cx.clearRect(0, 0, W, H); cx.drawImage(tmp, 0, 0, W, H);
+  if (mode !== 'image') {                                             // the traced outline
+    const loops = traceOutline(f, w, h, t), k = W / w; cx.strokeStyle = '#2f8fc0'; cx.lineWidth = 1.2;
+    for (const l of loops) { cx.beginPath(); l.forEach(([x, y], i) => i ? cx.lineTo((x + 0.5) * k, (y + 0.5) * k) : cx.moveTo((x + 0.5) * k, (y + 0.5) * k)); cx.closePath(); cx.stroke(); }
+    $('rl-note').textContent = `${loops.length} outline${loops.length === 1 ? '' : 's'} traced${rl.raise === 'auto' ? `, ${rl.found} parts raised` : ''}. The picture is read as is: no AI.`;
+  } else $('rl-note').textContent = 'The whole picture becomes a panel, its brightness the height. The picture is read as is: no AI.';
+  const wmm = +$('rl-w').value || 30; $('rl-size').textContent = `× ${(wmm * h / w).toFixed(1)} mm`;
+}
+function syncReliefSegs() {
+  document.querySelectorAll('#rl-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === rl.mode)));
+  document.querySelectorAll('#rl-raise button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === rl.raise)));
+  $('rl-t').disabled = $('rl-tauto').disabled = rl.mode === 'image';
+}
+async function makeRelief(place) {
+  if (!rl.field || rl.busy) return;
+  const p = { field: rl.field, w: rl.w, h: rl.h, t: rl.t, mode: rl.mode, width: Math.max(1, +$('rl-w').value || 30), height: Math.max(0.1, +$('rl-h').value || 1),
+    low: Math.max(0.05, +$('rl-lo').value || 0.3), bevel: Math.max(0, +$('rl-bev').value || 0), base: Math.max(0, +$('rl-base').value || 0) };
+  p.cell = Math.max(0.08, p.width / (+$('rl-detail').value * 0.5));      // fine enough to wrap and to print, no finer
+  if (p.bevel > 0 || p.mode !== 'flat') p.cell = Math.min(p.cell, Math.max(0.03, (p.bevel || p.cell * 3) / 4));   // a slope needs a few rows to look smooth
+  rl.busy = true; loading.show('Making the relief'); loading.set(0.3, 'Tracing the outline and building the solid…'); await nextFrame();
+  let r;
+  try { r = await solidJob({ relief: { ...p, field: Float32Array.from(p.field) } }); }
+  catch (e) { console.warn(e); toast(`Couldn't make the relief (${e.message || e}).`, 'bad'); return; }
+  finally { rl.busy = false; loading.hide(); }
+  if (!r.positions.length) { toast('Nothing to raise at that threshold. Move the Threshold, or switch Raised part.', 'bad'); return; }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
+  pushUndo();
+  const m = addPart(`${rl.name} relief`, g);
+  // flat on the bench, beside everything else
+  scene.updateMatrixWorld(true);
+  const others = liveParts().filter(x => x !== m), mb = worldBox(m);
+  if (others.length) { const sb = sceneBox(others); applyWorld(m, Tr(V(sb.max.x + 8 - mb.min.x, (sb.min.y + sb.max.y) / 2 - (mb.min.y + mb.max.y) / 2, -mb.min.z))); }
+  m.userData.part.relief = { flat: m.geometry, size: r.size, params: p };       // params: to lay it out again as copies, trimmed to a face
+  afterHierarchyChange(); select(m); closeRelief();
+  toast(`${m.name}: ${r.size[0].toFixed(1)} × ${r.size[1].toFixed(1)} mm, ${r.size[2].toFixed(2)} mm high.` + (place ? ' Now click where it goes on a part.' : ''), 'ok');
+  if (place) startReliefPlace(m); else frame(worldBox(m));
+}
+// ---- placing a relief on a part
+// rp: { m (the relief), target, pL / nL (the spot and its normal, in the target's frame), right (the view's right, world),
+//       seedTri (the triangle clicked), baseList (the face round it, up to its sharp edges), added / removed (faces
+//       Shift-clicked in or out), face: { list, set, kind } (the faces it goes on), regionVer,
+//       uv (each of their corners laid flat, mm, in the X0/Y0 frame from the spot: seen straight on, or unfolded round
+//       the corners), dom (the triangles laid flat), off: [x, y] (mm across that flat layout from the spot),
+//       rep ('once' | 'grid' | 'fill'), cache / cacheKey (the laid-out copies), running / again, outline, before }
+let rp = null;
+function startReliefPlace(m) {
+  endReliefPlace(false);
+  rp = { kind: 'relief', m, target: null, before: snapshot(), off: [0, 0], rep: 'once', added: [], removed: new Set(), regionVer: 0 };
+  $('rlplace').dataset.kind = 'relief'; $('rp-title').textContent = 'Place the relief';
+  $('rlplace').hidden = false; $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = true; rpStatus('');
+  $('rp-note').textContent = `Click where ${m.name} goes on a part. It lies on the surface there, facing out.`;
+  $('rp-spin').value = $('rp-spin-n').value = 0; $('rp-size').value = 100; $('rp-trim').checked = false;
+  setRpOff(0, 0); syncRpRows();
+}
+function endReliefPlace(keep = true) {
+  $('rp-bake').hidden = true; $('rp-btns').hidden = false;
+  if (!rp) return;
+  rpOutline(true);
+  if (!keep && rp.target) { restore(rp.before); afterHierarchyChange(); }
+  rp = null; $('rlplace').hidden = true;
+}
+function rpStatus(t) { $('rp-status').textContent = t; $('rp-status').hidden = !t; }
+function setRpOff(x, y) {
+  if (rp) rp.off = [x, y];
+  const r = v => Math.round(v * 100) / 100;
+  for (const [id, v] of [['rp-x', x], ['rp-y', y]]) {
+    const el = $(id); if (v < +el.min) el.min = Math.floor(v); if (v > +el.max) el.max = Math.ceil(v);
+    el.value = v; $(id + '-n').value = r(v);
+  }
+}
+function syncRpRows() {
+  const rep = rp?.rep || 'once', trim = $('rp-trim').checked, corners = $('rp-corners').checked;
+  document.querySelectorAll('#rp-rep button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === rep)));
+  document.querySelectorAll('#rlplace .rp-isgrid').forEach(e => { e.hidden = rep !== 'grid'; });
+  document.querySelectorAll('#rlplace .rp-many').forEach(e => { e.hidden = rep === 'once'; });
+  document.querySelectorAll('#rlplace .rp-trimmed').forEach(e => { e.hidden = !trim; });
+  document.querySelectorAll('#rlplace .rp-cornered').forEach(e => { e.hidden = !corners; });
+  const noFace = !!rp?.target && !rp.face;
+  $('rp-trim').disabled = $('rp-centre').disabled = $('rp-square').disabled = noFace;
+  document.querySelector('#rp-rep [data-v="fill"]').disabled = noFace;
+  $('rp-wrap').disabled = corners;                                     // round corners it always follows the surface
+}
+/** The frame the relief sits in: the spot P and normal N; X0/Y0 across the surface (X0 the view's right); C its
+ *  centre (moved along the face); X/Y its own sideways and up (turned). World space. */
+function rpFrame() {
+  const t = rp.target; t.updateMatrixWorld(true);
+  const P = rp.pL.clone().applyMatrix4(t.matrixWorld), N = rp.nL.clone().transformDirection(t.matrixWorld).normalize();
+  let X0 = rp.right.clone().projectOnPlane(N); if (X0.lengthSq() < 1e-6) X0 = (Math.abs(N.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).cross(N); X0.normalize();
+  const Y0 = N.clone().cross(X0).normalize();
+  const C = P.clone().addScaledVector(X0, rp.off[0]).addScaledVector(Y0, rp.off[1]);
+  const X = X0.clone().applyAxisAngle(N, (+$('rp-spin').value || 0) * Math.PI / 180), Y = N.clone().cross(X).normalize();
+  return { P, N, X0, Y0, C, X, Y };
+}
+/** Work out which faces it goes on (the face round the spot, or on round the corners), then lay them flat. */
+function rpRegion() {
+  const t = rp.target, topo = topoOf(t), { fn, fa, eps } = topo;
+  let base = rp.baseList || [];
+  if ($('rp-corners').checked) {
+    // on across creases while the surface stays within the angle of the face you clicked
+    const s = rp.seedTri, cos = Math.cos(Math.min(175, Math.max(5, +$('rp-turn').value || 60)) * Math.PI / 180), n0 = [fn[3 * s], fn[3 * s + 1], fn[3 * s + 2]];
+    base = growRegion(topo, s, (a, n) => fa[n] < eps || fn[3 * n] * n0[0] + fn[3 * n + 1] * n0[1] + fn[3 * n + 2] * n0[2] > cos).list;
+  }
+  const set = new Set(base); for (const l of rp.added) l.forEach(x => set.add(x)); for (const x of rp.removed) set.delete(x);
+  const list = [...set];
+  rp.face = list.length ? { list, set, kind: faceAxes(t, list)?.kind || 'round' } : null;
+  rp.regionVer++; rp.cacheKey = null;
+  rpLayFlat(); rpOutline();
+  if (rp.face) {                                                     // the sliders reach across the faces
+    const { box } = faceTris2D();
+    $('rp-x').min = Math.floor(box[0] - 1); $('rp-x').max = Math.ceil(box[1] + 1); $('rp-y').min = Math.floor(box[2] - 1); $('rp-y').max = Math.ceil(box[3] + 1);
+  } else { $('rp-x').min = $('rp-y').min = -20; $('rp-x').max = $('rp-y').max = 20; }
+  setRpOff(...rp.off);
+}
+/**
+ * Lay the faces flat, in mm in the X0/Y0 frame from the spot. Straight on (each corner seen along the normal) for
+ * one face; round corners, unfolded instead: out from the clicked triangle, each next triangle hinged flat across
+ * the edge it shares with one already laid, keeping its edge lengths. A bent plate (or a tube) comes out exactly
+ * flat; a doubly curved one, near enough over the part a relief covers.
+ */
+function rpLayFlat() {
+  rp.uv = null; rp.dom = null; rp.grid = null; rp.groups = null; rp.uvFill = null; rp.domFill = null; if (!rp.face) return;
+  const t = rp.target, topo = topoOf(t), { idx, pos, nb } = topo, M = t.matrixWorld, set = rp.face.set;
+  const { P, X0, Y0 } = rpFrame(), Wc = [], W = k => (Wc[k] ||= V(pos[3 * k], pos[3 * k + 1], pos[3 * k + 2]).applyMatrix4(M));
+  const uv = new Map(), flat = k => { const q = W(k).clone().sub(P); return [q.dot(X0), q.dot(Y0)]; };
+  rp.unfoldFailed = false;
+  if (!$('rp-corners').checked) {
+    for (const tri of rp.face.list) for (let e = 0; e < 3; e++) { const k = idx[3 * tri + e]; if (!uv.has(k)) uv.set(k, flat(k)); }
+    rp.uv = uv; rp.dom = rp.face.list; rp.unfolded = false; return;
+  }
+  // what can unfold: everywhere the surface lies flat round each corner (its angles add up to a full turn, as on a
+  // plate, a fold or a tube). Round a rivet or a bump they don't; those spots are left out of the unfolding and the
+  // relief is draped over them instead.
+  const angSum = new Map(), edgeOf = new Set();
+  for (const tri of rp.face.list) {
+    const ks = [0, 1, 2].map(e => idx[3 * tri + e]);
+    for (let e = 0; e < 3; e++) {
+      const k = ks[e], p0 = W(k), ang = W(ks[(e + 1) % 3]).clone().sub(p0).angleTo(W(ks[(e + 2) % 3]).clone().sub(p0));
+      if (isFinite(ang)) angSum.set(k, (angSum.get(k) || 0) + ang);
+      if (!set.has(nb[3 * tri + e])) { edgeOf.add(ks[e]); edgeOf.add(ks[(e + 1) % 3]); }
+    }
+  }
+  const bump = k => !edgeOf.has(k) && Math.abs(2 * Math.PI - (angSum.get(k) || 0)) > 10 * Math.PI / 180;
+  const goodList = rp.face.list.filter(tri => ![0, 1, 2].some(e => bump(idx[3 * tri + e])));
+  const good = new Set(goodList);
+  // the first triangle as it is seen straight on; it's the one you clicked, or failing that the nearest
+  let seed = rp.seedTri;
+  if (!good.size) { rp.unfoldFailed = true; for (const tri of rp.face.list) for (let e = 0; e < 3; e++) { const k = idx[3 * tri + e]; if (!uv.has(k)) uv.set(k, flat(k)); } rp.uv = uv; rp.dom = rp.face.list; rp.unfolded = false; return; }
+  if (!good.has(seed)) { let bd = Infinity; for (const tri of goodList) { const d = V(topo.fc[3 * tri], topo.fc[3 * tri + 1], topo.fc[3 * tri + 2]).applyMatrix4(M).distanceTo(P); if (d < bd) { bd = d; seed = tri; } } }
+  for (let e = 0; e < 3; e++) { const k = idx[3 * seed + e]; uv.set(k, flat(k)); }
+  const orient = tri => { const [a, b, c] = [0, 1, 2].map(e => uv.get(idx[3 * tri + e])); return (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]); };
+  const sign = Math.sign(orient(seed)) || 1;
+  // the third corner of tri, from its other two already laid flat: same shape, the same way round as the first
+  const place = tri => {
+    const ks = [0, 1, 2].map(e => idx[3 * tri + e]), have = ks.map(k => uv.has(k)), nh = have.filter(Boolean).length;
+    if (nh === 3) return true; if (nh < 2) return false;
+    const ci = have.indexOf(false), ai = (ci + 1) % 3, bi = (ci + 2) % 3, a = W(ks[ai]), b = W(ks[bi]), c = W(ks[ci]);
+    const ab = b.clone().sub(a), L = ab.length(); if (L < 1e-9) return false;
+    const s = c.clone().sub(a).dot(ab) / (L * L), h = c.clone().sub(a).addScaledVector(ab, -s).length();
+    // true lengths from a (no rescaling to the laid edge: on a doubly curved patch that would snowball)
+    const a2 = uv.get(ks[ai]), b2 = uv.get(ks[bi]), dx = b2[0] - a2[0], dy = b2[1] - a2[1], L2 = Math.hypot(dx, dy); if (L2 < 1e-12) return false;
+    const ex = dx / L2, ey = dy / L2, fx = a2[0] + s * L * ex, fy = a2[1] + s * L * ey;
+    uv.set(ks[ci], [fx - ey * h, fy + ex * h]);
+    if (Math.sign(orient(tri)) !== sign) uv.set(ks[ci], [fx + ey * h, fy - ex * h]);
+    return true;
+  };
+  const done = new Set([seed]), dom = [seed], queue = [seed];
+  for (let qi = 0; qi < queue.length; qi++) {
+    const tr = queue[qi];
+    for (let e = 0; e < 3; e++) { const n = nb[3 * tr + e]; if (n < 0 || !good.has(n) || done.has(n)) continue; if (place(n)) { done.add(n); dom.push(n); queue.push(n); } }
+  }
+  // triangles reached only through a corner (a T-junction): any with two corners laid by now
+  for (let more = true, guard = 0; more && guard < 20; guard++) {
+    more = false; for (const tri of goodList) if (!done.has(tri) && place(tri)) { done.add(tri); dom.push(tri); more = true; }
+  }
+  // where the unfolding came round both sides of something and met itself (a seam), the triangles that closed it up
+  // are stretched or turned over: leave those out, as if they were bumps, rather than fold the relief there
+  {
+    const ok = tr => {
+      const ks = [0, 1, 2].map(e => idx[3 * tr + e]), q = ks.map(k => uv.get(k));
+      if (Math.sign(orient(tr)) !== sign) return false;
+      for (let e = 0; e < 3; e++) { const a = ks[e], b = ks[(e + 1) % 3], L3 = W(a).distanceTo(W(b)), L2 = Math.hypot(q[(e + 1) % 3][0] - q[e][0], q[(e + 1) % 3][1] - q[e][1]);
+        if (L3 > 1e-9 && Math.abs(L2 / L3 - 1) > 0.25) return false; }
+      return true;
+    };
+    for (let i = dom.length - 1; i > 0; i--) if (!ok(dom[i])) { done.delete(dom[i]); dom.splice(i, 1); }
+    // corners only the left-out triangles used are no longer laid
+    const used = new Set(); for (const tr of dom) for (let e = 0; e < 3; e++) used.add(idx[3 * tr + e]);
+    for (const k of [...uv.keys()]) if (!used.has(k)) uv.delete(k);
+  }
+  // a patch that won't lie flat (a dome) comes out stretched; a little (round a rivet) is fine, a lot isn't: then it's
+  // seen straight on instead
+  {
+    let bx = [Infinity, -Infinity, Infinity, -Infinity], b3 = new THREE.Box3(); for (const [u, v] of uv.values()) bx = [Math.min(bx[0], u), Math.max(bx[1], u), Math.min(bx[2], v), Math.max(bx[3], v)];
+    for (const k of uv.keys()) b3.expandByPoint(W(k));
+    let area3 = 0, area2 = 0; for (const tr of dom) { area3 += topo.fa[tr]; const [a, b, c] = [0, 1, 2].map(e => uv.get(idx[3 * tr + e])); area2 += Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2; }
+    const S3 = new THREE.Vector3().setFromMatrixScale(M), sc2 = Math.abs(S3.x * S3.y);   // topo areas are in the part's own units
+    const diag = b3.getSize(V()).length(); rp.unfoldStats = { bx, diag, area2, area3: area3 * sc2, n: dom.length, of: rp.face.list.length };
+    if (Math.max(bx[1] - bx[0], bx[3] - bx[2]) > 2.5 * diag || area2 > 2 * area3 * sc2) {
+      rp.unfoldFailed = true; uv.clear();
+      for (const tri of rp.face.list) for (let e = 0; e < 3; e++) { const k = idx[3 * tri + e]; if (!uv.has(k)) uv.set(k, flat(k)); }
+      rp.uv = uv; rp.dom = rp.face.list; rp.unfolded = false; return;
+    }
+  }
+  rp.unfoldFailed = false;
+  rp.uv = uv; rp.dom = dom; rp.unfolded = true;
+  // the faces left out (bumps) laid in roughly, each loose corner the average of its neighbours, only so the outline
+  // used for trimming runs round them rather than leaving a hole there (a real hole in the part stays a hole)
+  {
+    const holes = rp.face.list.filter(tr => !done.has(tr)), fill = new Map(uv), nbr = new Map();
+    for (const tr of holes) { const ks = [0, 1, 2].map(e => idx[3 * tr + e]); for (const k of ks) { if (!nbr.has(k)) nbr.set(k, new Set()); ks.forEach(q => q !== k && nbr.get(k).add(q)); } }
+    const loose = [...nbr.keys()].filter(k => !uv.has(k));
+    for (let it = 0; it < 60; it++) {
+      for (const k of loose) {
+        let su = 0, sv = 0, n = 0; for (const q of nbr.get(k)) { const f = fill.get(q); if (f) { su += f[0]; sv += f[1]; n++; } }
+        if (n) fill.set(k, [su / n, sv / n]);
+      }
+    }
+    // only bumps ringed all round by unfolded faces, and only if laying them in didn't turn any triangle over: one at
+    // the edge of the faces (or a tangle) is left out, and the relief stops there
+    const hset = new Set(holes), comp = new Map(), keep = [];
+    for (const h0 of holes) {
+      if (comp.has(h0)) continue;
+      const list = [h0], st = [h0]; comp.set(h0, h0); let ok = true;
+      while (st.length) { const tr = st.pop();
+        for (let e = 0; e < 3; e++) { const n = nb[3 * tr + e];
+          if (hset.has(n)) { if (!comp.has(n)) { comp.set(n, h0); list.push(n); st.push(n); } }
+          else if (!done.has(n)) ok = false; } }
+      if (ok) for (const tr of list) {
+        const q = [0, 1, 2].map(e => fill.get(idx[3 * tr + e])); if (q.some(x => !x)) { ok = false; break; }
+        const o = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]); if (Math.sign(o) !== sign || Math.abs(o) < 1e-12) { ok = false; break; }
+      }
+      if (ok) keep.push(...list);
+    }
+    rp.uvFill = fill; rp.domFill = dom.concat(keep);
+  }
+  // the flat facets (triangles within a degree or two of each other, edge to edge): the relief is cut along their
+  // creases so each piece lies flat on one. A finely curved surface has too many: then it's a fine mesh instead
+  const fn = topo.fn, cosG = Math.cos(2 * Math.PI / 180), gid = new Map(), groups = [];
+  for (const s0 of dom) {
+    if (gid.has(s0) || topo.fa[s0] < topo.eps) continue;
+    const g = groups.length, n0 = [fn[3 * s0], fn[3 * s0 + 1], fn[3 * s0 + 2]], list = [], stack = [s0]; gid.set(s0, g);
+    while (stack.length) { const tr = stack.pop(); list.push(tr);
+      for (let e = 0; e < 3; e++) { const n = nb[3 * tr + e]; if (n < 0 || !done.has(n) || gid.has(n) || topo.fa[n] < topo.eps) continue;
+        if (fn[3 * n] * n0[0] + fn[3 * n + 1] * n0[1] + fn[3 * n + 2] * n0[2] > cosG) { gid.set(n, g); stack.push(n); } } }
+    groups.push(list);
+  }
+  rp.groups = groups.length <= 60 ? groups : null;
+  // a grid over the flat layout (the bumps laid in too), to find which triangle a flat spot is on
+  const uvF = rp.uvFill, domF = rp.domFill;
+  let box = [Infinity, -Infinity, Infinity, -Infinity]; for (const [u, v] of uvF.values()) { box = [Math.min(box[0], u), Math.max(box[1], u), Math.min(box[2], v), Math.max(box[3], v)]; }
+  const cs = Math.max(1e-3, Math.sqrt((box[1] - box[0]) * (box[3] - box[2]) / Math.max(1, domF.length)) * 1.5), cells = new Map();
+  for (const tri of domF) {
+    const q = [0, 1, 2].map(e => uvF.get(idx[3 * tri + e]));
+    const i0 = Math.floor((Math.min(q[0][0], q[1][0], q[2][0]) - box[0]) / cs), i1 = Math.floor((Math.max(q[0][0], q[1][0], q[2][0]) - box[0]) / cs);
+    const j0 = Math.floor((Math.min(q[0][1], q[1][1], q[2][1]) - box[2]) / cs), j1 = Math.floor((Math.max(q[0][1], q[1][1], q[2][1]) - box[2]) / cs);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) { const key = i * 100003 + j; const c = cells.get(key); if (c) c.push(tri); else cells.set(key, [tri]); }
+  }
+  const s0 = V(topo.fn[3 * seed], topo.fn[3 * seed + 1], topo.fn[3 * seed + 2]).transformDirection(M), N = rp.nL.clone().transformDirection(M);
+  const flip = s0.dot(N) < 0 ? -1 : 1;
+  // over a bump the relief follows its shape, but stands off the way the faces round it face (so it can't fold
+  // into itself on a steep side): each bump triangle takes the normal of the nearest unfolded face
+  const holeN = new Map(), domSet = new Set(dom), vN = new Map(), fnW = x => V(topo.fn[3 * x], topo.fn[3 * x + 1], topo.fn[3 * x + 2]).transformDirection(M).normalize().multiplyScalar(flip);
+  for (const tr of dom) for (let e = 0; e < 3; e++) { const k = idx[3 * tr + e]; if (!vN.has(k)) vN.set(k, fnW(tr)); }
+  let todo = domF.filter(tr => !domSet.has(tr));
+  for (let pass = 0; pass < 200 && todo.length; pass++) {
+    const next = [];
+    for (const tr of todo) { const ks = [0, 1, 2].map(e => idx[3 * tr + e]), k = ks.find(q => vN.has(q)); if (k === undefined) { next.push(tr); continue; } holeN.set(tr, vN.get(k)); }
+    for (const tr of todo) if (holeN.has(tr)) for (let e = 0; e < 3; e++) { const k = idx[3 * tr + e]; if (!vN.has(k)) vN.set(k, holeN.get(tr)); }
+    if (next.length === todo.length) break; todo = next;
+  }
+  // and on a fine mesh, each corner's normal the average of the faces round it (angle-weighted), so the relief's top
+  // follows a smooth offset of the surface and can't fold through itself where it turns (in a concave crease)
+  const cornerN = new Map();
+  for (const tr of dom) {
+    const ks = [0, 1, 2].map(e => idx[3 * tr + e]), n = fnW(tr);
+    for (let e = 0; e < 3; e++) { const p0 = W(ks[e]), ang = W(ks[(e + 1) % 3]).clone().sub(p0).angleTo(W(ks[(e + 2) % 3]).clone().sub(p0));
+      if (!isFinite(ang)) continue; const c = cornerN.get(ks[e]) || V(); c.addScaledVector(n, ang); cornerN.set(ks[e], c); }
+  }
+  for (const c of cornerN.values()) c.normalize();
+  for (const [k, n] of vN) if (!cornerN.has(k)) cornerN.set(k, n);
+  rp.grid = { box, cs, cells, W, flip, holeN, domSet, cornerN };
+}
+/** A flat spot (u, v) back on the surface: the point, and the face's normal there (world). out: off the faces laid flat. */
+function rpUnflatten(u, v) {
+  const { box, cs, cells, W, flip, holeN, domSet, cornerN } = rp.grid, topo = topoOf(rp.target), idx = topo.idx, uv = rp.uvFill;
+  const bary = tri => {
+    const [a, b, c] = [0, 1, 2].map(e => uv.get(idx[3 * tri + e])), d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+    if (Math.abs(d) < 1e-14) return null;
+    const l0 = ((b[1] - c[1]) * (u - c[0]) + (c[0] - b[0]) * (v - c[1])) / d, l1 = ((c[1] - a[1]) * (u - c[0]) + (a[0] - c[0]) * (v - c[1])) / d;
+    return [l0, l1, 1 - l0 - l1];
+  };
+  const i = Math.floor((u - box[0]) / cs), j = Math.floor((v - box[2]) / cs);
+  let best = null, bo = Infinity;
+  for (let r = 0; r <= 3 && (!best || bo > 0); r++) {
+    for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) {
+      if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+      for (const tri of cells.get((i + di) * 100003 + (j + dj)) || []) {
+        const l = bary(tri); if (!l) continue;
+        const o = -Math.min(0, l[0]) - Math.min(0, l[1]) - Math.min(0, l[2]);       // how far outside it (0: inside)
+        if (o < bo) { bo = o; best = [tri, l]; }
+      }
+    }
+    if (best && bo <= 1e-9) break;
+  }
+  if (!best) return null;
+  // how far outside the best triangle, in mm (0 inside)
+  let outMM = 0;
+  if (bo > 0) { const [a, b2, c] = [0, 1, 2].map(e => uv.get(idx[3 * best[0] + e])); outMM = bo * Math.sqrt(Math.abs((b2[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b2[1] - a[1]))); }
+  const [tri, l] = best, p = V(), M = rp.target.matrixWorld, fnW = x => V(topo.fn[3 * x], topo.fn[3 * x + 1], topo.fn[3 * x + 2]).transformDirection(M).normalize().multiplyScalar(flip);
+  for (let e = 0; e < 3; e++) p.addScaledVector(W(idx[3 * tri + e]), l[e]);           // past the edge: the face carried on flat
+  if (!rp.groups) {                                                 // a fine mesh: the smooth normal, so it stands its height off the face
+    const n = V(); for (let e = 0; e < 3; e++) { const c = cornerN.get(idx[3 * tri + e]); if (c) n.addScaledVector(c, Math.min(1, Math.max(0, l[e]))); }
+    const f = domSet.has(tri) ? fnW(tri) : (holeN.get(tri) || fnW(tri)); if (n.lengthSq() < 1e-12) n.copy(f); n.normalize();
+    return { p, n: n.multiplyScalar(1 / Math.max(0.35, n.dot(f))), out: outMM > 0.005 };
+  }
+  if (!domSet.has(tri)) {                                            // on a bump
+    const n = holeN.get(tri) || fnW(tri);
+    if (outMM > 0.005) { const pl = n.dot(p); return { p: p.clone(), n, out: true, pl }; }
+    return { p, n, out: false };
+  }
+  const n1 = fnW(tri);
+  if (outMM > 0.005) return { p, n: n1, out: true };                 // past the edge: carried on flat
+  // on a crease (or a corner): mitred, so the relief stands its full height off each face it touches
+  if (bo <= 1e-6) {
+    const ns = [];
+    for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++) for (const t2 of cells.get((i + di) * 100003 + (j + dj)) || []) {
+      if (t2 === tri || !domSet.has(t2)) continue; const l2 = bary(t2); if (!l2 || Math.min(...l2) < -1e-5) continue;
+      const n2 = fnW(t2); if (n2.dot(n1) < 0.9998 && !ns.some(q => q.dot(n2) > 0.9998)) ns.push(n2);
+    }
+    if (ns.length) {
+      const m = n1.clone(); ns.forEach(q => m.add(q)); m.normalize();
+      const c = Math.min(m.dot(n1), ...ns.map(q => m.dot(q)));
+      return { p, n: m.multiplyScalar(1 / Math.max(0.35, c)), out: false };
+    }
+  }
+  return { p, n: n1, out: false };
+}
+/** Where a point on the target sits in the flat layout ([u, v]), or null if it isn't on the faces laid flat. */
+function rpFlatOf(worldPoint) {
+  const t = rp.target, local = worldPoint.clone().applyMatrix4(t.matrixWorld.clone().invert());
+  const h = t.geometry.boundsTree.closestPointToPoint(local); if (!h || !rp.face?.set.has(h.faceIndex)) return null;
+  const topo = topoOf(t), idx = topo.idx, ks = [0, 1, 2].map(e => idx[3 * h.faceIndex + e]); if (!ks.every(k => rp.uv.has(k))) return null;
+  const Pk = k => V(topo.pos[3 * k], topo.pos[3 * k + 1], topo.pos[3 * k + 2]);
+  const l = new THREE.Triangle(Pk(ks[0]), Pk(ks[1]), Pk(ks[2])).getBarycoord(h.point, V());
+  return [0, 1].map(c => ks.reduce((s, k, e) => s + rp.uv.get(k)[c] * l.getComponent(e), 0));
+}
+/** The faces laid flat, in the relief's own frame (its centre and turn): their triangles in 2D, and their extent. */
+function faceTris2D(off = [0, 0], deg = 0, list = rp.dom, uv = rp.uv) {
+  const t = rp.target, idx = topoOf(t).idx, a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+  const tris = new Float32Array(list.length * 6), box = [Infinity, -Infinity, Infinity, -Infinity]; let o = 0;
+  for (const tri of list) for (let e = 0; e < 3; e++) {
+    const [p, q] = uv.get(idx[3 * tri + e]), dx = p - off[0], dy = q - off[1], u = dx * c + dy * s, w = -dx * s + dy * c;
+    tris[o++] = u; tris[o++] = w;
+    if (u < box[0]) box[0] = u; if (u > box[1]) box[1] = u; if (w < box[2]) box[2] = w; if (w > box[3]) box[3] = w;
+  }
+  return { tris, box };
+}
+/** The edge of the faces it goes on, drawn on the part while placing. */
+function rpOutline(clear = false) {
+  if (rp?.outline) { rp.outline.parent?.remove(rp.outline); rp.outline.geometry.dispose(); rp.outline.material.dispose(); rp.outline = null; }
+  if (clear || !rp?.face) return;
+  const topo = topoOf(rp.target), { idx, pos, nb } = topo, set = rp.face.set, seg = [];
+  for (const tri of rp.face.list) for (let e = 0; e < 3; e++) {
+    if (set.has(nb[3 * tri + e])) continue;
+    const i = idx[3 * tri + e], j = idx[3 * tri + (e + 1) % 3]; seg.push(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2], pos[3 * j], pos[3 * j + 1], pos[3 * j + 2]);
+  }
+  if (!seg.length) return;
+  const lg = new LineSegmentsGeometry().setPositions(new Float32Array(seg));
+  const mat = new LineMaterial({ color: '#3aa6e0', linewidth: 2, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false });
+  const line = new LineSegments2(lg, mat); line.renderOrder = 998; line.onBeforeRender = r => { r.getSize(mat.resolution); };
+  rp.target.add(line); rp.outline = line;
+}
+function reliefPlaceClick(hit, shift = false) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  // Shift: take a face in, or out (it's on another part: no)
+  if (shift && rp.target) {
+    if (hit.object !== rp.target && !rp.copies?.includes(hit.object)) { toast(`Shift-click faces on ${rp.target.name}, the part it's going on.`); return; }
+    const res = pickSurface(topoOf(rp.target), rp.target.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+    const l = res.err || !res.region?.length ? [hit.faceIndex] : res.region;
+    { const lp = hit.point.clone().applyMatrix4(rp.target.matrixWorld.clone().invert()).toArray(); (rp.face?.set.has(hit.faceIndex) ? (rp.remPts ||= []) : (rp.addPts ||= [])).push(lp); }
+    if (rp.face?.set.has(hit.faceIndex)) { l.forEach(x => rp.removed.add(x)); rp.added = rp.added.map(a => a.filter(x => !rp.removed.has(x))); toast('Took that face out.'); }
+    else { l.forEach(x => rp.removed.delete(x)); rp.added.push(l); toast('Added that face.'); }
+    rpRegion(); syncRpRows(); reliefReplace(); return;
+  }
+  // on the relief, or elsewhere on the same faces: slide it there
+  if (rp.kind === 'scatter' && rp.target && (rp.copies.includes(hit.object) || (hit.object === rp.target && rp.face?.set.has(hit.faceIndex)))) {
+    toast('Shift-click faces to add them or take them out; Shuffle for a new pattern; click another face or part to start over there.'); return;
+  }
+  if (rp.target && (hit.object === rp.m || (hit.object === rp.target && rp.face?.set.has(hit.faceIndex)))) {
+    const f = rp.face ? rpFlatOf(hit.point) : null;
+    if (f) setRpOff(f[0], f[1]); else { const { P, X0, Y0 } = rpFrame(), d = hit.point.clone().sub(P); setRpOff(d.dot(X0), d.dot(Y0)); }
+    reliefReplace(); return;
+  }
+  if (rpOwns(hit.object)) { toast(rp.kind === 'scatter' ? "Click a face on another part: not one you're scattering." : 'Click a spot on another part.'); return; }
+  const t = hit.object; t.updateMatrixWorld(true);
+  const inv = t.matrixWorld.clone().invert(), n = hitNormal(hit);
+  if (n.dot(camera.position.clone().sub(hit.point)) < 0) n.negate();          // facing the way you're looking from
+  rpOutline(true);
+  rp.target = t; rp.pL = hit.point.clone().applyMatrix4(inv); rp.nL = n.clone().transformDirection(inv); rp.seedTri = hit.faceIndex;
+  rp.right = V(1, 0, 0).applyQuaternion(camera.quaternion); rp.added = []; rp.removed = new Set(); rp.addPts = []; rp.remPts = [];
+  // the face round the spot, up to its sharp edges: what Centre, Square, Fill and Trim go by
+  const res = pickSurface(topoOf(t), t.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+  rp.baseList = res.err || !res.region?.length ? null : res.region;
+  rp.off = [0, 0]; rpRegion();
+  if (!rp.face && (rp.rep === 'fill' || $('rp-trim').checked)) { rp.rep = rp.rep === 'fill' ? 'once' : rp.rep; $('rp-trim').checked = false; }
+  $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = false; syncRpRows();
+  $('rp-note').textContent = rp.kind === 'scatter' ? `On ${t.name}, over the faces outlined in blue. Shift-click faces to add or take them out; Shuffle for a new pattern; then Done.`
+    : `On ${t.name}. Click elsewhere on ${rp.face ? 'the outlined faces' : 'it'} to slide it there, Shift-click faces to add or take them out; turn, size, repeat or wrap it, then Done.`;
+  reliefReplace();
+}
+function rpCentre() {
+  if (!rp?.target || !rp.face) return;
+  const { box } = faceTris2D(); setRpOff((box[0] + box[1]) / 2, (box[2] + box[3]) / 2); reliefReplace();
+}
+function rpSquare() {
+  if (!rp?.target || !rp.face) return;
+  const cur = +$('rp-spin').value || 0;
+  // the way the outline of the faces runs, laid flat: its edges' directions folded onto a quarter turn, weighted by length
+  const t = rp.target, topo = topoOf(t), { idx, nb } = topo, set = rp.face.set, uv = rp.uv;
+  let sc = 0, ss = 0;
+  for (const tri of rp.dom) for (let e = 0; e < 3; e++) {
+    if (set.has(nb[3 * tri + e])) continue;
+    const p = uv.get(idx[3 * tri + e]), q = uv.get(idx[3 * tri + (e + 1) % 3]); if (!p || !q) continue;
+    const u = q[0] - p[0], w = q[1] - p[1], L = Math.hypot(u, w); if (!L) continue;
+    const th = Math.atan2(w, u); sc += L * Math.cos(4 * th); ss += L * Math.sin(4 * th);
+  }
+  let a;
+  if (Math.hypot(sc, ss) > 1e-6) a = Math.atan2(ss, sc) / 4 * 180 / Math.PI;
+  else { const ax = faceAxes(t, rp.face.list); if (!ax) return; const { X0, Y0 } = rpFrame(); a = Math.atan2(ax.along.dot(Y0), ax.along.dot(X0)) * 180 / Math.PI; }
+  // whichever square turn (along or across, either way round) is nearest how it sits now
+  let best = 0, bd = Infinity;
+  for (let q = -4; q <= 4; q++) { let v = a + q * 90; v = ((v + 540) % 360) - 180; const d = Math.abs(((v - cur + 540) % 360) - 180); if (d < bd) { bd = d; best = v; } }
+  best = Math.round(best * 10) / 10; $('rp-spin').value = $('rp-spin-n').value = best; reliefReplace();
+}
+/** Re-lay the relief after a change; one layout at a time, the latest settings winning. */
+function reliefReplace() {
+  if (!rp?.target) return;
+  const me = rp; if (me.running) { me.again = true; return; }
+  me.running = true; $('rp-done').disabled = true;
+  (me.kind === 'scatter' ? applyScatter() : applyReliefPlace()).catch(e => { console.warn(e); toast(`Couldn't lay it out (${e.message || e}).`, 'bad'); })
+    .finally(() => { me.running = false; if (rp !== me) return; $('rp-done').disabled = false; if (me.again) { me.again = false; reliefReplace(); } });
+}
+// ---- modifiers
+/*
+ * Like Blender's modifier stack: a part keeps its mesh as it came in (its base), and a list of modifiers worked on it
+ * in order, each one on or off, with its settings open to change, applied (made part of the base for good) or
+ * removed. What you see, export and print is the result of the stack.
+ *   crack    Crack & cave in: settings and where it got hit
+ *   relief   a relief from a picture placed on this part (the relief is its own part, kept by the modifier)
+ *   scatter  copies of other parts scattered over this part (the copies are kept by the modifier)
+ * A relief or scatter is Separate (its parts sit on this one), Merge (joined into this mesh) or Cut (taken away from it).
+ * The stack is worked out in the background; each modifier's result is kept, so changing one only redoes it and the
+ * ones after.
+ */
+const modCache = new Map();                                      // part:modifier id → { inG, key, out }
+const MOD_NAMES = { crack: 'Crack & cave in', relief: 'Relief', scatter: 'Scatter', split: 'Split' };
+function modKids(m, mod) { return (mod.kids || []).map(partById).filter(k => k && k.parent); }
+function storedGeom(m) { const pt = m.userData.part; return pt.base ? pt.base : { geometry: m.geometry, geomKey: pt.geomKey }; }
+function storedKey(m) { return storedGeom(m).geomKey; }
+/** Give a part a stack (its mesh as it is now is the base), if it hasn't one. */
+function ensureStack(m, base = m.geometry, key = m.userData.part.geomKey) {
+  const pt = m.userData.part; if (!pt.base) pt.base = { geometry: base, geomKey: key }; pt.mods ||= []; return pt.mods;
+}
+function newModId() { return 'mod-' + THREE.MathUtils.generateUUID().slice(0, 8); }
+const geomFromSoup = soup => { const g1 = new THREE.BufferGeometry(); g1.setAttribute('position', new THREE.BufferAttribute(soup, 3)); const g = weldGeometry(g1, 1e-9); g.computeBoundingBox(); g.computeBoundsTree(); return g; };
+function soupOfGeom(g, M) {
+  const pos = g.attributes.position, ix = g.index ? g.index.array : null, n = ix ? ix.length : pos.count, out = new Float32Array(n * 3), v = V();
+  for (let i = 0; i < n; i++) { v.fromBufferAttribute(pos, ix ? ix[i] : i).applyMatrix4(M); out[3 * i] = v.x; out[3 * i + 1] = v.y; out[3 * i + 2] = v.z; }
+  return out;
+}
+/** Crack a mesh (the part's g) where hit: { pL, nL, right, thick } in the part's frame; p the settings. */
+async function crackGeometry(m, g, hit, p) {
+  m.updateMatrixWorld(true);
+  const pL = V().fromArray(hit.pL), nL = V().fromArray(hit.nL), right = V().fromArray(hit.right);
+  const P = pL.applyMatrix4(m.matrixWorld), N = nL.transformDirection(m.matrixWorld).normalize();
+  let X = right.projectOnPlane(N); if (X.lengthSq() < 1e-6) X = (Math.abs(N.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).cross(N); X.normalize();
+  const Y = N.clone().cross(X).normalize(), F = new THREE.Matrix4().makeBasis(X, Y, N).setPosition(P);
+  const soup = soupOfGeom(g, F.clone().invert().multiply(m.matrixWorld));
+  const r = await solidJob({ crack: { ...p, soup, thick: hit.thick } });
+  if (!r.positions.length) throw new Error('that left nothing of it: try a smaller radius');
+  const back = m.matrixWorld.clone().invert().multiply(F), out = r.positions, v = V();
+  for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(back); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+  return { geometry: geomFromSoup(out), slabs: r.slabs, shells: r.shells };
+}
+/** A mesh (the part's g) with parts joined on (merge) or taken away (cut). */
+async function boolGeometry(m, g, kids, mode) {
+  m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert();
+  const iSoups = kids.map(k => { k.updateMatrixWorld(true); return soupOfGeom(k.geometry, inv.clone().multiply(k.matrixWorld)); });
+  const [r] = await mergeJobs([mode === 'merge' ? { soups: [soupOfGeom(g, new THREE.Matrix4()), ...iSoups], subtract: [] } : { soups: [soupOfGeom(g, new THREE.Matrix4())], subtract: iSoups }], { fillHollows: false, loose: 'keep' });
+  if (!r?.positions?.length) throw new Error('that left nothing of it');
+  return geomFromSoup(r.positions);
+}
+function modKey(m, mod) {
+  if (mod.type === 'crack') return JSON.stringify([mod.p, mod.hit]);
+  if (mod.type === 'split') return JSON.stringify([mod.p, mod.at]);
+  m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert();
+  return mod.mode + '|' + modKids(m, mod).map(k => k.uuid + k.geometry.uuid + inv.clone().multiply(k.matrixWorld).elements.map(x => Math.round(x * 1e5)).join(',')).join('|');
+}
+/** One modifier on its input mesh (kept, so it's only worked out again when its input or settings change). */
+async function evalMod(m, mod, gIn) {
+  const key = modKey(m, mod), ck = m.uuid + ':' + mod.id, c = modCache.get(ck);
+  if (c && c.inG === gIn && c.key === key) return c.out;
+  let out = gIn;
+  if (mod.type === 'crack') out = (await crackGeometry(m, gIn, mod.hit, mod.p)).geometry;
+  else if (mod.type === 'split') out = (await splitGeometry(m, gIn, mod)).geometry;
+  else if (mod.mode !== 'join') { const kids = modKids(m, mod); if (kids.length) out = await boolGeometry(m, gIn, kids, mod.mode); }
+  modCache.set(ck, { inG: gIn, key, out }); return out;
+}
+/** The mesh going into modifier i (the base, through the ones before it that are on). */
+async function stackInput(m, i) {
+  const pt = m.userData.part; let g = pt.base.geometry;
+  for (let k = 0; k < i; k++) { const mod = pt.mods[k]; if (mod.on) g = await evalMod(m, mod, g); }
+  return g;
+}
+/** Work the stack out and show the result. */
+async function evalStack(m) {
+  const pt = m.userData.part; if (!pt.base) return;
+  const ver = pt.stackVer = (pt.stackVer || 0) + 1; pt.stackBusy = true; if (selected === m) renderModBusy(m);
+  let g = pt.base.geometry;
+  for (const mod of pt.mods) {
+    if (mod.type === 'relief' || mod.type === 'scatter') modKids(m, mod).forEach(k => { k.visible = mod.on && mod.mode === 'join'; });
+    if (!mod.on) continue;
+    try { g = await evalMod(m, mod, g); mod.err = null; } catch (e) { console.warn(e); mod.err = String(e.message || e); }
+    if (pt.stackVer !== ver || !m.parent) return;
+  }
+  pt.stackBusy = false;
+  if (m.geometry !== g) {
+    m.geometry = g; pt.geomKey = g === pt.base.geometry ? pt.base.geomKey : (g.userData.key ||= THREE.MathUtils.generateUUID());
+    pt.topo = null; pt.tris = g.index.count / 3; if (pt.paint && pt.paint.length !== g.attributes.position.count * 4) pt.paint = null; refreshPaint(m);
+  }
+  if (!pt.mods.length) { pt.base = null; pt.mods = null; }
+  afterHierarchyChange();
+}
+function dropKids(m, mod, free) {
+  for (const k of modKids(m, mod)) { const kp = k.userData.part; delete kp.owner;
+    if (free) k.visible = true; else { if (selection.includes(k)) selection = selection.filter(x => x !== k); detach(k); k.parent?.remove(k); } }
+}
+function removeMod(m, mod) {
+  const pt = m.userData.part; pushUndo();
+  dropKids(m, mod, false); pt.mods = pt.mods.filter(x => x !== mod);
+  evalStack(m); toast(`Removed ${mod.name}.`);
+}
+/** Make a modifier (and the ones before it that are on) part of the base for good. */
+async function applyMod(m, mod) {
+  const pt = m.userData.part, i = pt.mods.indexOf(mod); if (i < 0) return;
+  if (!mod.on) { toast('Turn it on first: a modifier that is off has nothing to apply.', 'bad'); return; }
+  pushUndo();
+  let g;
+  try { g = await stackInput(m, i + 1); } catch (e) { toast(`Couldn't apply it (${e.message || e}).`, 'bad'); return; }
+  const done = pt.mods.slice(0, i + 1).filter(x => x.on);
+  for (const x of done) if (x.type === 'relief' || x.type === 'scatter') dropKids(m, x, x.mode === 'join');
+  pt.mods = pt.mods.filter(x => !done.includes(x));
+  // a split with both halves kept, applied last: the second half becomes a part of its own
+  let other = null;
+  const sp = g.userData.split, lastSplit = done.at(-1)?.type === 'split' && done.at(-1).p.keep === 'both';
+  if (sp && lastSplit && sp.sides.includes(1) && sp.sides.includes(0)) {
+    const pick = side => { let n = 0; for (const x of sp.sides) if (x === side) n++; const out = new Float32Array(n * 9); let o = 0;
+      for (let t = 0; t < sp.sides.length; t++) if (sp.sides[t] === side) { out.set(sp.positions.subarray(9 * t, 9 * t + 9), o); o += 9; } return geomFromSoup(out); };
+    g = pick(0); const gB = pick(1);
+    other = addPart(`${m.name} B`, gB, { welded: true, color: pt.color });
+    m.parent.add(other); other.position.copy(m.position); other.quaternion.copy(m.quaternion); other.scale.copy(m.scale);
+    if (pt.fill) other.userData.part.fill = pt.fill;
+  }
+  pt.base = { geometry: g, geomKey: g === pt.base.geometry ? pt.base.geomKey : (g.userData.key ||= THREE.MathUtils.generateUUID()) };
+  await evalStack(m);
+  if (other) { refreshPaint(other); afterHierarchyChange(); toast(`Applied ${done.map(x => x.name).join(', ')}: ${m.name} is cut in two, and the other half is its own part, ${other.name}.`, 'ok'); return; }
+  toast(done.length > 1 ? `Applied ${done.map(x => x.name).join(', ')}: they're part of ${m.name}'s mesh now.` : `Applied ${mod.name}: it's part of ${m.name}'s mesh now.`, 'ok');
+}
+function moveMod(m, mod, d) {
+  const pt = m.userData.part, i = pt.mods.indexOf(mod), j = i + d; if (j < 0 || j >= pt.mods.length) return;
+  pushUndo(); [pt.mods[i], pt.mods[j]] = [pt.mods[j], pt.mods[i]]; evalStack(m);
+}
+function setModOn(m, mod, on) { pushUndo(); mod.on = on; evalStack(m); }
+
+// "Move the hit": the next click on the part sets a crack modifier's hit
+let modHit = null;   // { m, mod }
+async function modHitClick(hit, ev) {
+  const { m, mod, kind } = modHit; modHit = null;
+  if (kind === 'split-new' || kind === 'split-move') {
+    if (!hit || hit.object !== m) { toast(`That wasn't on ${m.name}: nothing was cut.`); return; }
+    pushUndo();
+    if (kind === 'split-new') { const mods = ensureStack(m); mods.push({ id: newModId(), type: 'split', name: MOD_NAMES.split, on: true, p: { ...SPLIT_DEFAULT, seed: (Math.random() * 2 ** 31) | 0 }, at: splitAtFromView(m, hit.point) }); select(m); }
+    else { const keepView = mod.at; mod.at = { ...keepView, pL: hit.point.clone().applyMatrix4(m.matrixWorld.clone().invert()).toArray() }; }
+    evalStack(m).then(() => { const md = m.userData.part.mods?.at(-1); if (kind === 'split-new' && md?.err) toast(`Couldn't split it: ${md.err}`, 'bad'); else if (kind === 'split-new') toast(`${m.name} is split, as a modifier: set the break's style, turn, tilt and pull it apart in Properties › Modifiers; Apply makes the two halves separate parts.`, 'ok'); });
+    return;
+  }
+  if (!hit || hit.object !== m) { toast(`That wasn't on ${m.name}: the hit stays where it was.`); return; }
+  const gIn = await stackInput(m, m.userData.part.mods.indexOf(mod)), cur = m.geometry; m.geometry = gIn; m.updateMatrixWorld(true);
+  const b = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster(); rc.firstHitOnly = true;
+  rc.setFromCamera(new THREE.Vector2(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1), camera);
+  const h = rc.intersectObject(m, false)[0] || hit, n = hitNormal(h); if (n.dot(camera.position.clone().sub(h.point)) < 0) n.negate();
+  rc.set(h.point.clone().addScaledVector(n, -1e-3), n.clone().negate()); const backHit = rc.intersectObject(m, false)[0];
+  m.geometry = cur;
+  const inv = m.matrixWorld.clone().invert();
+  pushUndo();
+  mod.hit = { pL: h.point.clone().applyMatrix4(inv).toArray(), nL: n.clone().transformDirection(inv).toArray(), right: V(1, 0, 0).applyQuaternion(camera.quaternion).toArray(), thick: backHit ? backHit.distance + 1e-3 : 2 };
+  evalStack(m);
+}
+
+/** The Modifiers section of a part's panel. */
+function renderModBusy(m) { const s = document.getElementById('mods-busy'); if (s) s.hidden = !m.userData.part.stackBusy; }
+function modifierRows(p, el) {
+  const pt = p.userData.part, sec = document.createElement('div'); sec.className = 'conn mods';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = 'Modifiers';
+  const busy = document.createElement('span'); busy.id = 'mods-busy'; busy.className = 'mods-busy'; busy.textContent = ' working…'; busy.hidden = !pt.stackBusy; h.append(busy);
+  const addSel = document.createElement('select'); addSel.className = 'num osel mods-add'; addSel.setAttribute('aria-label', 'Add a modifier');
+  for (const [v, t] of [['', 'Add modifier…'], ['crack', 'Crack & cave in'], ['split', 'Split / break in two'], ['relief', 'Relief from a picture'], ['scatter', 'Scatter parts over it']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; addSel.append(o); }
+  addSel.addEventListener('change', () => { const v = addSel.value; addSel.value = '';
+    if (v === 'crack') startCrack(p);
+    else if (v === 'split') startSplit(p);
+    else if (v === 'relief') { toast(`Make the relief, then Place on a part… and click ${p.name}.`); openRelief(); }
+    else if (v === 'scatter') toast(`Select the parts to scatter (Ctrl-click them), then Scatter… and click ${p.name}'s face.`); });
+  h.append(addSel); sec.append(h);
+  if (pt.owner) { const o = partById(pt.owner.part), mo = o?.userData.part.mods?.find(x => x.id === pt.owner.mod);
+    if (o && mo) { const n = document.createElement('p'); n.className = 'note'; n.textContent = `Kept by the ${mo.name} modifier on ${o.name}. `;
+      const go = document.createElement('button'); go.type = 'button'; go.className = 'mini'; go.textContent = `Select ${o.name}`; go.addEventListener('click', () => select(o)); n.append(go); sec.append(n); } }
+  const mods = pt.mods || [];
+  if (!mods.length) { const n = document.createElement('p'); n.className = 'note'; n.textContent = 'None. Cracks, reliefs and scatters you add to this part show here, to turn on and off, change or apply.'; sec.append(n); }
+  mods.forEach((mod, i) => {
+    const card = document.createElement('div'); card.className = 'mod' + (mod.on ? '' : ' off');
+    const top = document.createElement('div'); top.className = 'mod-h';
+    const on = document.createElement('input'); on.type = 'checkbox'; on.checked = mod.on; on.title = 'On or off'; on.setAttribute('aria-label', `${mod.name} on`);
+    on.addEventListener('change', () => setModOn(p, mod, on.checked));
+    const nm = document.createElement('b'); nm.textContent = mod.name;
+    const mk = (t, title, fn, dis = false) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'mini'; b.textContent = t; b.title = title; b.disabled = dis; b.addEventListener('click', fn); return b; };
+    top.append(on, nm, mk('▲', 'Earlier in the stack', () => moveMod(p, mod, -1), i === 0), mk('▼', 'Later in the stack', () => moveMod(p, mod, 1), i === mods.length - 1),
+      mk('Apply', i ? 'Make it part of the mesh for good (with the ones above it that are on)' : 'Make it part of the mesh for good', () => applyMod(p, mod)),
+      mk('✕', 'Remove it' + (mod.type === 'crack' ? '' : ' (and its parts)'), () => removeMod(p, mod)));
+    card.append(top);
+    if (mod.err) { const e = document.createElement('p'); e.className = 'note bad'; e.textContent = mod.err; card.append(e); }
+    const grid = document.createElement('div'); grid.className = 'mod-grid'; card.append(grid);
+    const row = (label, ctl, title = '') => { const l = document.createElement('label'); l.textContent = label; if (title) l.title = title; grid.append(l, ctl); };
+    const change = fn => () => { pushUndo(); fn(); evalStack(p); };
+    if (mod.type === 'crack') {
+      const q = mod.p;
+      const num = (label, key, step, min, max, scale = 1, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
+        n.addEventListener('change', change(() => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); q[key] = key === 'rings' || key === 'cracks' ? Math.round(v) : v / scale; })); row(label, n, title); };
+      num('Radius mm', 'radius', 0.5, 0.3, 200); num('Cave in mm', 'depth', 0.1, 0, 50); num('Rings', 'rings', 1, 1, 8); num('Cracks out', 'cracks', 1, 2, 24);
+      num('Crack width mm', 'width', 0.05, 0.02, 5); num('Jagged %', 'jag', 5, 0, 100, 100); num('Tumble °', 'tumble', 1, 0, 45); num('Spider cracks %', 'spider', 10, 0, 200, 100);
+      const mid = document.createElement('select'); mid.className = 'num osel'; for (const [v, t] of [['dent', 'Caved in'], ['hole', 'Punched through']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; mid.append(o); }
+      mid.value = q.hole ? 'hole' : 'dent'; mid.addEventListener('change', change(() => { q.hole = mid.value === 'hole'; })); row('Middle', mid);
+      num('Middle size %', 'core', 5, 0, 80, 100);
+      const th = document.createElement('input'); th.type = 'checkbox'; th.checked = !!q.through; th.addEventListener('change', change(() => { q.through = th.checked; }));
+      const tl = document.createElement('label'); tl.className = 'check'; tl.append(th, ' Break right through'); row('', tl);
+      if (!q.through) num('Hold together mm', 'skin', 0.05, 0.02, 10, 1, 'Left uncracked at the back so it holds together');
+      const btns = document.createElement('span'); btns.className = 'btnrow';
+      btns.append(mk('Shuffle', 'A new crack pattern with the same settings', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })),
+        mk('Move the hit', 'Click on the part where it got hit instead', () => { modHit = { m: p, mod }; toast(`Click where ${p.name} got hit.`); }));
+      row('', btns);
+    } else if (mod.type === 'split') {
+      const q = mod.p;
+      const sel = (label, key, opts, title = '') => { const e = document.createElement('select'); e.className = 'num osel'; for (const [v, t] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; e.append(o); }
+        e.value = q[key]; e.addEventListener('change', change(() => { q[key] = e.value; })); row(label, e, title); };
+      const num = (label, key, step, min, max, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(+q[key]).toFixed(3);
+        n.addEventListener('change', change(() => { const v = +n.value; if (isFinite(v)) q[key] = Math.min(max, Math.max(min, v)); })); row(label, n, title); };
+      sel('Break', 'style', [['snapped', 'Snapped'], ['torn', 'Torn'], ['lance', 'Melted (lance)'], ['clean', 'Clean cut']], 'What the break looks like');
+      if (q.style !== 'clean') { num('Roughness mm', 'amp', 0.1, 0, 20, 'How far the break wanders off flat'); num('Feature size mm', 'size', 0.1, 0.1, 50, 'How big its teeth, facets or ripples are'); }
+      num('Cut away mm', 'kerf', 0.05, 0, 20, 'Material taken out between the halves (a lance burns a gap)');
+      num('Pull apart mm', 'gap', 0.5, 0, 200, 'How far the second half is moved off the first');
+      num('Turn °', 'angle', 5, -180, 180, 'Turn the cut on screen, round the spot (as seen when it was set)'); num('Tilt °', 'tilt', 5, -80, 80, 'Lean the cut toward or away from you');
+      sel('Keep', 'keep', [['both', 'Both halves'], ['a', 'Side A only'], ['b', 'Side B only']]);
+      if (q.style === 'lance') { const bd = document.createElement('input'); bd.type = 'checkbox'; bd.checked = !!q.beads; bd.addEventListener('change', change(() => { q.beads = bd.checked; }));
+        const bl = document.createElement('label'); bl.className = 'check'; bl.append(bd, ' Slag beads on the edges'); row('', bl); }
+      const btns = document.createElement('span'); btns.className = 'btnrow';
+      btns.append(mk('Shuffle', 'A new break with the same settings', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })),
+        mk('Move the cut', 'Click where the cut goes instead', () => { modHit = { m: p, mod, kind: 'split-move' }; toast(`Click where to cut ${p.name}.`); }),
+        mk('Line up with the view', 'Set the cut up again across the screen as you look at it now', change(() => { const at = splitAtFromView(p, V().fromArray(mod.at.pL).applyMatrix4(p.matrixWorld)); mod.at = at; q.angle = 0; q.tilt = 0; })));
+      row('', btns);
+    } else {
+      const kids = modKids(p, mod), info = document.createElement('span'); info.className = 'note';
+      info.textContent = mod.type === 'relief' ? (kids[0] ? kids[0].name : 'its relief is gone') : `${kids.length} cop${kids.length === 1 ? 'y' : 'ies'}`;
+      row(mod.type === 'relief' ? 'Relief' : 'Copies', info);
+      const seg = document.createElement('span'); seg.className = 'seg';
+      for (const [v, t, title] of [['join', 'Separate', 'Its parts sit on this one, fixed to it'], ['merge', 'Merge', 'Joined into this mesh as one solid'], ['cut', 'Cut', 'Taken away from this mesh, as deep as they sink in']]) {
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.title = title; b.setAttribute('aria-pressed', String(mod.mode === v));
+        b.addEventListener('click', change(() => { mod.mode = v; })); seg.append(b); }
+      row('Result', seg);
+      const btns = document.createElement('span'); btns.className = 'btnrow';
+      btns.append(mk('Change placement…', 'Open the placing card again: move, turn, size, repeat, spacing…', () => editPlacement(p, mod), !kids.length));
+      if (mod.type === 'scatter') btns.append(mk('Shuffle', 'A new random pattern with the same settings', () => editPlacement(p, mod, { shuffle: true }), !kids.length));
+      row('', btns);
+    }
+    sec.append(card);
+  });
+  el.append(sec);
+}
+
+
+// ---- the Split modifier: a part cut in two, the break melted, torn, snapped or clean
+const SPLIT_DEFAULT = { style: 'snapped', amp: 0.6, size: 1.5, kerf: 0.1, gap: 1, angle: 0, tilt: 0, keep: 'both', beads: true };
+/** The cut's frame (world): through the spot, its normal turned and tilted from the view it was set up in. */
+function splitFrame(m, mod) {
+  m.updateMatrixWorld(true);
+  const at = mod.at, q = mod.p, W = a => V().fromArray(a).transformDirection(m.matrixWorld).normalize();
+  const P = V().fromArray(at.pL).applyMatrix4(m.matrixWorld), R0 = W(at.R0), D0 = W(at.D0);
+  const n = R0.clone().applyAxisAngle(D0, (q.angle || 0) * Math.PI / 180);
+  let X = D0.clone().cross(n); if (X.lengthSq() < 1e-8) X = W(at.U0); X.normalize();
+  n.applyAxisAngle(X, (q.tilt || 0) * Math.PI / 180).normalize();
+  X = X.projectOnPlane(n).normalize(); const Y = n.clone().cross(X).normalize();
+  return new THREE.Matrix4().makeBasis(X, Y, n).setPosition(P);
+}
+async function splitGeometry(m, g, mod) {
+  const F = splitFrame(m, mod), soup = soupOfGeom(g, F.clone().invert().multiply(m.matrixWorld));
+  const r = await solidJob({ split: { ...mod.p, soup, seed: mod.p.seed | 0 } });
+  const back = m.matrixWorld.clone().invert().multiply(F), out = r.positions, v = V();
+  for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(back); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+  const geometry = geomFromSoup(out.slice());
+  geometry.userData.split = { positions: out, sides: r.sides };             // which side each triangle is on, for Apply
+  return { geometry };
+}
+/** Start a Split: the next click on the part is where it's cut (across, as the cut looks on screen). */
+function startSplit(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part to split first, then Split.', 'bad'); return; }
+  endCrack(false); endReliefPlace(false);
+  modHit = { m, kind: 'split-new' }; toast(`Click where to cut ${m.name}. The cut runs up the screen through that spot; turn and tilt it after.`);
+}
+function splitAtFromView(m, point) {
+  const inv = m.matrixWorld.clone().invert(), loc = a => a.clone().transformDirection(inv).toArray();
+  return { pL: point.clone().applyMatrix4(inv).toArray(), R0: loc(V(1, 0, 0).applyQuaternion(camera.quaternion)), U0: loc(V(0, 1, 0).applyQuaternion(camera.quaternion)), D0: loc(V(0, 0, 1).applyQuaternion(camera.quaternion)) };
+}
+
+// ---- placing settings, kept on a relief or scatter modifier so its placement can be changed later
+const RP_VALS = ['rp-spin', 'rp-spin-n', 'rp-size', 'rp-sink', 'rp-cols', 'rp-rows', 'rp-gap', 'rp-margin', 'rp-turn', 'sc-n', 'sc-gap', 'sc-smin', 'sc-smax', 'sc-jit', 'sc-tilt', 'sc-axis', 'sc-margin', 'sc-poke'];
+const RP_CHECKS = ['rp-wrap', 'rp-trim', 'rp-corners', 'sc-inside', 'sc-through'];
+function rpSettings() {
+  return { pL: rp.pL.toArray(), nL: rp.nL.toArray(), right: rp.right.toArray(), off: [...rp.off], rep: rp.rep, turn: rp.turn || 'random', seed: rp.seed ?? 0,
+    addPts: rp.addPts || [], remPts: rp.remPts || [], v: Object.fromEntries(RP_VALS.map(id => [id, $(id).value])), c: Object.fromEntries(RP_CHECKS.map(id => [id, $(id).checked])) };
+}
+function applyRpSettings(s) {
+  for (const [id, v] of Object.entries(s.v || {})) if ($(id)) $(id).value = v;
+  for (const [id, v] of Object.entries(s.c || {})) if ($(id)) $(id).checked = !!v;
+  document.querySelectorAll('#sc-turn button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === (s.turn || 'random'))));
+}
+/** A relief made in an earlier session: build its flat original again from the picture kept with it. */
+async function ensureReliefFlat(k) {
+  const info = k.userData.part.relief; if (!info || info.flat || !info.params) return;
+  const r = await solidJob({ relief: { ...info.params, field: Float32Array.from(info.params.field) } });
+  info.flat = geomFromSoup(r.positions); info.size = r.size;
+}
+const b64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 32768) s += String.fromCharCode.apply(null, u8.subarray(i, i + 32768)); return btoa(s); };
+const unb64 = s => { const t = atob(s), u = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) u[i] = t.charCodeAt(i); return u; };
+function encodeRelief(info) {
+  if (!info?.params?.field) return null;
+  const f = info.params.field, q = new Uint8Array(f.length); for (let i = 0; i < f.length; i++) q[i] = Math.round(Math.min(1, Math.max(0, f[i])) * 255);
+  const { field, ...rest } = info.params; return { size: info.size, params: rest, field8: b64(q) };
+}
+function decodeRelief(rec) {
+  if (!rec?.field8) return null;
+  const q = unb64(rec.field8), f = new Float32Array(q.length); for (let i = 0; i < q.length; i++) f[i] = q[i] / 255;
+  return { flat: null, size: rec.size, params: { ...rec.params, field: f } };
+}
+/** Open the placing card on a relief or scatter modifier again, as it was set, to change it. */
+async function editPlacement(t, mod, { shuffle = false } = {}) {
+  const kids = modKids(t, mod), s = mod.place; if (!kids.length || !s) { toast("There's no placement kept for it to change.", 'bad'); return; }
+  const src = mod.type === 'scatter' ? (mod.sources || []).map(partById).filter(Boolean) : null;
+  if (mod.type === 'scatter' && !src.length) { toast(`The parts it scatters are gone, so it can't be laid out again: Apply or remove it.`, 'bad'); return; }
+  endCrack(false); endReliefPlace(false);
+  const before = snapshot(), i = t.userData.part.mods.indexOf(mod);
+  let gIn; try { gIn = await stackInput(t, i); if (mod.type === 'relief') await ensureReliefFlat(kids[0]); } catch (e) { toast(`Couldn't open it (${e.message || e}).`, 'bad'); return; }
+  // while placing: the mesh as it goes into this modifier, with the modifier's own parts showing
+  const pt = t.userData.part; t.geometry = gIn; pt.topo = null; kids.forEach(k => { k.visible = true; });
+  rp = { kind: mod.type, m: mod.type === 'relief' ? kids[0] : null, src, copies: mod.type === 'scatter' ? kids : [], target: t, before, off: [...(s.off || [0, 0])], rep: s.rep || 'once',
+    turn: s.turn || 'random', seed: shuffle ? (Math.random() * 2 ** 31) | 0 : s.seed, added: [], removed: new Set(), addPts: [...(s.addPts || [])], remPts: [...(s.remPts || [])], regionVer: 0, mod };
+  applyRpSettings(s);
+  $('rlplace').dataset.kind = mod.type; $('rp-title').textContent = mod.type === 'scatter' ? `Change the scatter on ${t.name}` : `Change ${kids[0].name}`;
+  $('rlplace').hidden = false; $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = false; rpStatus('');
+  rp.pL = V().fromArray(s.pL); rp.nL = V().fromArray(s.nL); rp.right = V().fromArray(s.right);
+  t.updateMatrixWorld(true);
+  const W = q => q.clone().applyMatrix4(t.matrixWorld), near = q => gIn.boundsTree.closestPointToPoint(q)?.faceIndex ?? 0;
+  const regionAt = q => { const f = near(q), res = pickSurface(topoOf(t), t.matrixWorld.clone(), f, W(q), settings()); return res.err || !res.region?.length ? [f] : res.region; };
+  rp.seedTri = near(rp.pL);
+  { const res = pickSurface(topoOf(t), t.matrixWorld.clone(), rp.seedTri, W(rp.pL), settings()); rp.baseList = res.err || !res.region?.length ? null : res.region; }
+  rp.added = rp.addPts.map(a => regionAt(V().fromArray(a)));
+  for (const a of rp.remPts) regionAt(V().fromArray(a)).forEach(x => rp.removed.add(x));
+  rpRegion(); syncRpRows();
+  $('rp-note').textContent = mod.type === 'scatter' ? `Changing the scatter on ${t.name}. Shift-click faces in or out; click another face to start over there; then Done.`
+    : `Changing ${kids[0].name} on ${t.name}. Click elsewhere on the outlined faces to slide it there; then Done.`;
+  reliefReplace();
+}
+
+// ---- crack & cave in
+/*
+ * A part made to look punched: click where it got hit, and round that spot it's cracked into slabs (rings round the
+ * hit, cracks running out), each slab tipped and pushed in, deepest in the middle, with hairline cracks running on
+ * past the edge. Worked out in the background from the part as it was, so every change starts afresh; Done keeps it
+ * (one Undo takes it back), Cancel puts the part back as it was.
+ */
+let dm = null;     // { m, g0 (its mesh before), pL / nL (the hit and its normal, in the part's frame), right, thick, seed, before, running, again }
+function startCrack(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part to crack first, then Crack & cave in.', 'bad'); return; }
+  endCrack(false); endReliefPlace(false);
+  dm = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: (Math.random() * 2 ** 31) | 0 };
+  $('dmg').hidden = false; $('dm-ctl').hidden = $('dm-done').hidden = true; dmStatus('');
+  $('dm-note').textContent = `Click where ${m.name} got hit.`;
+  syncDmRows();
+}
+function endCrack(keep = true) {
+  if (!dm) return;
+  if (!keep && dm.pL) { restore(dm.before); afterHierarchyChange(); }
+  dm = null; $('dmg').hidden = true;
+}
+function dmStatus(t) { $('dm-status').textContent = t; $('dm-status').hidden = !t; }
+function syncDmRows() { document.querySelectorAll('#dmg .dm-held').forEach(e => { e.hidden = $('dm-through').checked; }); }
+function crackClick(hit, ev) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  const m = hit.object;
+  if (m !== dm.m) {                                             // another part: that one gets it instead
+    if (dm.pL) { restore(dm.before); afterHierarchyChange(); }
+    dm = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: dm.seed };
+  }
+  // the hit as it is on the part before any cracking (the preview's slabs have moved)
+  m.updateMatrixWorld(true);
+  const cur = m.geometry; m.geometry = dm.g0;
+  let h = hit;
+  if (cur !== dm.g0 && ev) { const b = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster(); rc.setFromCamera(new THREE.Vector2(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1), camera); h = rc.intersectObject(m, false)[0] || hit; }
+  const n = hitNormal(h); if (n.dot(camera.position.clone().sub(h.point)) < 0) n.negate();
+  // how thick the part is there: straight in to its back
+  const rc = new THREE.Raycaster(); rc.firstHitOnly = true; rc.set(h.point.clone().addScaledVector(n, -1e-3), n.clone().negate()); const back = rc.intersectObject(m, false)[0];
+  m.geometry = cur;
+  const inv = m.matrixWorld.clone().invert();
+  dm.pL = h.point.clone().applyMatrix4(inv); dm.nL = n.clone().transformDirection(inv); dm.thick = back ? back.distance + 1e-3 : 2;
+  dm.right = V(1, 0, 0).applyQuaternion(camera.quaternion);
+  $('dm-ctl').hidden = $('dm-done').hidden = false;
+  $('dm-note').textContent = `Hit on ${m.name} (${dm.thick.toFixed(2)} mm thick there). Click elsewhere to hit it there instead; Shuffle for new cracks; then Done.`;
+  crackRedo();
+}
+function crackRedo() {
+  if (!dm?.pL) return;
+  const me = dm; if (me.running) { me.again = true; return; }
+  me.running = true; $('dm-done').disabled = true;
+  applyCrack().catch(e => { console.warn(e); dmStatus(`Couldn't crack it: ${e.message || e}`); })
+    .finally(() => { me.running = false; if (dm !== me) return; $('dm-done').disabled = false; if (me.again) { me.again = false; crackRedo(); } });
+}
+function crackCardParams(seed) {
+  const num = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
+  return { radius: Math.max(0.3, num('dm-r', 5)), depth: Math.max(0, num('dm-d', 1)), rings: Math.round(num('dm-rings', 3)), cracks: Math.round(num('dm-cracks', 7)),
+    width: Math.max(0.02, num('dm-w', 0.25)), jag: Math.min(1, Math.max(0, num('dm-jag', 60) / 100)), tumble: Math.max(0, num('dm-tum', 8)), spider: Math.max(0, num('dm-sp', 60) / 100),
+    hole: document.querySelector('#dm-mid [aria-pressed="true"]')?.dataset.v === 'hole', core: Math.min(0.8, Math.max(0, num('dm-core', 25) / 100)),
+    through: $('dm-through').checked, skin: Math.max(0.02, num('dm-skin', 0.4)), seed };
+}
+const dmHit = me => ({ pL: me.pL.toArray(), nL: me.nL.toArray(), right: me.right.toArray(), thick: me.thick });
+async function applyCrack() {
+  const me = dm, m = me.m, p = crackCardParams(me.seed);
+  dmStatus(`Cracking ${Math.round((me.g0.index ? me.g0.index.count : me.g0.attributes.position.count) / 3 / 1000)}k triangles…`);
+  const r = await crackGeometry(m, me.g0, dmHit(me), p);
+  if (dm !== me) return;
+  const g = r.geometry, pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null;
+  refreshPaint(m); afterHierarchyChange();
+  dmStatus(`${r.slabs} slab${r.slabs === 1 ? '' : 's'}` + (p.through ? `, broken right through: ${r.shells} separate piece${r.shells === 1 ? '' : 's'}` : ', held together at the back') + ` · ${Math.round(pt.tris / 1000)}k triangles`);
+}
+function bindCrack() {
+  const re = () => crackRedo();
+  ['dm-r', 'dm-d', 'dm-rings', 'dm-cracks', 'dm-w', 'dm-jag', 'dm-tum', 'dm-sp', 'dm-core', 'dm-skin'].forEach(id => $(id).addEventListener('change', re));
+  $('dm-through').addEventListener('change', () => { syncDmRows(); re(); });
+  document.querySelectorAll('#dm-mid button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#dm-mid button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); re(); }));
+  $('dm-shuffle').addEventListener('click', () => { if (!dm) return; dm.seed = (Math.random() * 2 ** 31) | 0; re(); });
+  // Done: it goes on the part as a Crack modifier, to turn off, change or apply later
+  $('dm-done').addEventListener('click', () => { if (!dm?.pL || dm.running) return;
+    const m = dm.m, mods = ensureStack(m, dm.g0, dm.gk0), mod = { id: newModId(), type: 'crack', name: MOD_NAMES.crack, on: true, p: crackCardParams(dm.seed), hit: dmHit(dm) };
+    mods.push(mod); modCache.set(m.uuid + ':' + mod.id, { inG: dm.g0, key: modKey(m, mod), out: m.geometry });
+    pushUndo(dm.before); endCrack(true); select(m); evalStack(m);
+    toast(`${m.name} is cracked and caved in, as a modifier: turn it off, change it or Apply it in Properties › Modifiers.`, 'ok'); });
+  $('dm-cancel').addEventListener('click', () => { endCrack(false); toast('Left it as it was.'); });
+}
+
+// ---- scattering parts over a face
+/*
+ * The same placing as a relief (click a face; carry on round corners; Shift-click faces in or out), but what goes on
+ * it is copies of other parts: skulls on a shield, rivets on a plate. Each copy stands straight out of the surface
+ * where it lands (or leans a little), sits its base just into it, is turned at random or lined up, sized at random
+ * in a range, kept clear of its neighbours and inside the face's edges. Copies share their part's mesh, and are fixed
+ * to the part they're on.
+ */
+function startScatter(sources) {
+  const src = (sources || selectionRoots()).filter(m => m?.parent && isPart(m));
+  if (!src.length) { toast('Select the parts to scatter first (one or several, picked at random), then Scatter on a face.', 'bad'); return; }
+  endReliefPlace(false);
+  rp = { kind: 'scatter', src, m: null, copies: [], target: null, before: snapshot(), off: [0, 0], rep: 'once', added: [], removed: new Set(), regionVer: 0, seed: (Math.random() * 2 ** 31) | 0 };
+  rp.turn = document.querySelector('#sc-turn [aria-pressed="true"]')?.dataset.v || 'random';
+  $('rlplace').dataset.kind = 'scatter'; $('rp-title').textContent = 'Scatter on a face';
+  $('rlplace').hidden = false; $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = true; rpStatus('');
+  const names = src.length === 1 ? src[0].name : `${src.length} parts (${src.map(m => m.name).slice(0, 3).join(', ')}${src.length > 3 ? '…' : ''})`;
+  $('rp-note').textContent = `Click the face to scatter ${names} over.`;
+  setRpOff(0, 0); syncRpRows();
+}
+function rpOwns(o) { return !!rp && ((rp.m && (o === rp.m || subtreeParts(rp.m).includes(o))) || rp.copies?.includes(o) || (rp.kind === 'scatter' && rp.src.includes(o))); }
+/** How a part sits for scattering: which of its axes faces out, its middle, its base along that axis, its reach round it. */
+function scatterShape(m, axisKey) {
+  m.updateMatrixWorld(true);
+  const S = V().setFromMatrixScale(m.matrixWorld), pos = m.geometry.attributes.position, b = m.geometry.boundingBox || (m.geometry.computeBoundingBox(), m.geometry.boundingBox);
+  const size = b.getSize(V()).multiply(S);
+  let key = axisKey;
+  if (key === 'auto') { const k = size.x <= size.y && size.x <= size.z ? 'x' : size.y <= size.z ? 'y' : 'z'; key = (k === 'y' ? '-' : '+') + k; }  // its thinnest way; a flat bit faces up (front for Y)
+  const a = V(); a[key[1]] = key[0] === '-' ? -1 : 1;
+  const c = b.getCenter(V()).multiply(S), v = V(); let lo = Infinity, R = 0;
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).multiply(S).sub(c); const h = v.dot(a); if (h < lo) lo = h;
+    const r = Math.sqrt(Math.max(0, v.lengthSq() - h * h)); if (r > R) R = r;
+  }
+  const ref = Math.abs(a.z) > 0.5 ? V(0, 1, 0) : V(0, 0, 1);             // the way that counts as "up" on the surface
+  return { a, ref, S, base: c.clone().addScaledVector(a, lo), R, key };
+}
+function mulberry(seed) { let s = seed >>> 0; return () => { s = (s + 0x6D2B79F5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+/** Lay the copies out afresh: random spots on the flat layout of the faces, kept apart, then stood on the surface. */
+async function applyScatter() {
+  const me = rp, t = me.target; if (!t) return;
+  for (const c of me.copies) c.parent?.remove(c); me.copies = [];
+  if (!me.face) { rpStatus("Couldn't find the face there to scatter over: click nearer its middle."); afterHierarchyChange(); return; }
+  const n = Math.max(1, Math.min(500, Math.round(+$('sc-n').value || 1))), gap = +$('sc-gap').value || 0;
+  let s0 = Math.max(0.05, (+$('sc-smin').value || 100) / 100), s1 = Math.max(0.05, (+$('sc-smax').value || 100) / 100); if (s1 < s0) [s0, s1] = [s1, s0];
+  const turnMode = me.turn || 'random', jit = Math.max(0, +$('sc-jit').value || 0), tilt = Math.max(0, +$('sc-tilt').value || 0), sink = Math.max(0, +$('rp-sink').value || 0);
+  const inside = $('sc-inside').checked, margin = inside ? Math.max(0, +$('sc-margin').value || 0) : 0;
+  const through = $('sc-through').checked, poke = Math.max(0, +$('sc-poke').value || 0);
+  const shapes = me.src.map(m => scatterShape(m, $('sc-axis').value));
+  // the faces laid flat: a grid of their triangles, to tell whether a spot is on them
+  const { tris, box } = faceTris2D(), nt = tris.length / 6;
+  const cs = Math.max(1e-3, Math.sqrt((box[1] - box[0]) * (box[3] - box[2]) / Math.max(1, nt)) * 1.5), cells = new Map();
+  for (let k = 0; k < nt; k++) {
+    const o = 6 * k, xs = [tris[o], tris[o + 2], tris[o + 4]], ys = [tris[o + 1], tris[o + 3], tris[o + 5]];
+    for (let i = Math.floor((Math.min(...xs) - box[0]) / cs); i <= Math.floor((Math.max(...xs) - box[0]) / cs); i++)
+      for (let j = Math.floor((Math.min(...ys) - box[2]) / cs); j <= Math.floor((Math.max(...ys) - box[2]) / cs); j++) { const key = i * 100003 + j; (cells.get(key) || cells.set(key, []).get(key)).push(o); }
+  }
+  const on = (u, v) => {
+    for (const o of cells.get(Math.floor((u - box[0]) / cs) * 100003 + Math.floor((v - box[2]) / cs)) || []) {
+      const ax = tris[o], ay = tris[o + 1], bx = tris[o + 2], by = tris[o + 3], cx = tris[o + 4], cy = tris[o + 5];
+      const d1 = (bx - ax) * (v - ay) - (by - ay) * (u - ax), d2 = (cx - bx) * (v - by) - (cy - by) * (u - bx), d3 = (ax - cx) * (v - cy) - (ay - cy) * (u - cx);
+      if ((d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0)) return true;
+    }
+    return false;
+  };
+  const fits = (u, v, r) => { if (!on(u, v)) return false; if (!inside) return true;
+    for (let k = 0; k < 12; k++) { const a = k * Math.PI / 6; if (!on(u + r * Math.cos(a), v + r * Math.sin(a))) return false; } return true; };
+  // spots: darts thrown at random, each kept if it lands on the faces and clear of the ones before
+  const rnd = mulberry(me.seed), placed = [];
+  for (let i = 0, tries = 0; placed.length < n && tries < n * 200; tries++) {
+    const which = Math.floor(rnd() * shapes.length), sc = s0 + (s1 - s0) * rnd(), r = shapes[which].R * sc;
+    const u = box[0] + (box[1] - box[0]) * rnd(), v = box[2] + (box[3] - box[2]) * rnd();
+    if (!fits(u, v, r + margin)) continue;
+    if (placed.some(q => Math.hypot(q.u - u, q.v - v) < q.r + r + gap)) continue;
+    placed.push({ u, v, r, which, sc, spin: rnd(), wob: rnd() * 2 - 1, tiltA: rnd() * Math.PI * 2, tiltB: rnd() });
+  }
+  // each one onto the surface: the spot and its normal, then stood up and turned
+  const { P, N, X0, Y0 } = rpFrame(), rc = new THREE.Raycaster(); rc.firstHitOnly = true;
+  const unfold = !!(me.unfolded && me.grid);
+  let k = 0, thin = 0;
+  for (const q of placed) {
+    let p, nrm;
+    if (unfold) { const r = rpUnflatten(q.u, q.v); if (!r) continue; p = r.p; nrm = r.n.clone().normalize(); }
+    else {
+      const base = P.clone().addScaledVector(X0, q.u).addScaledVector(Y0, q.v); rc.far = 1e4;
+      rc.set(base.clone().addScaledVector(N, 500), N.clone().negate()); const h = rc.intersectObject(t, false)[0]; if (!h) continue;
+      p = h.point.clone(); nrm = smoothNormalAt(t, h); if (nrm.dot(N) < 0) nrm.negate();
+    }
+    const sh = shapes[q.which], src = me.src[q.which];
+    // which way is "up" along the surface here: the way up the face looked from where you clicked
+    let up = Y0.clone().projectOnPlane(nrm); if (up.lengthSq() < 1e-8) up = X0.clone().projectOnPlane(nrm); up.normalize();
+    const ang = turnMode === 'random' ? q.spin * Math.PI * 2 : q.wob * jit * Math.PI / 180;
+    up.applyAxisAngle(nrm, ang);
+    let out = nrm.clone();
+    if (tilt > 0) { const side = up.clone().applyAxisAngle(nrm, q.tiltA); out.applyAxisAngle(side.cross(nrm).normalize(), q.tiltB * tilt * Math.PI / 180); up.projectOnPlane(out).normalize(); }
+    // its own (out, up, side) → the surface's
+    const L = new THREE.Matrix4().makeBasis(sh.a, sh.ref, sh.a.clone().cross(sh.ref)), Wb = new THREE.Matrix4().makeBasis(out, up, out.clone().cross(up));
+    const R = Wb.multiply(L.transpose()), q4 = new THREE.Quaternion().setFromRotationMatrix(R);
+    const S = sh.S.clone().multiplyScalar(q.sc), baseW = sh.base.clone().multiplyScalar(q.sc).applyQuaternion(q4);
+    // pushed through: as deep as the part is thick there (straight in, to its back face), and out the other side
+    let dep = sink;
+    if (through) {
+      rc.far = 1e4; rc.set(p.clone().addScaledVector(nrm, -1e-3), nrm.clone().negate()); const hb = rc.intersectObject(t, false)[0];
+      if (hb) dep = hb.distance + 1e-3 + poke; else thin++;
+    }
+    const T = p.clone().addScaledVector(nrm, -dep).sub(baseW);
+    const c = clonePartAlone(src, `${src.name.replace(/ \d+$/, '')} ${++k}`); c.visible = true;
+    c.position.copy(T); c.quaternion.copy(q4); c.scale.copy(S); c.updateMatrixWorld(true);
+    t.attach(c); me.copies.push(c);
+  }
+  afterHierarchyChange();
+  const msg = `${me.copies.length} of ${n} placed` + (me.copies.length < n ? ': no room for more, so make the spacing or sizes smaller, or add faces' : '') + (unfold ? ' · unfolded round the corners' : me.unfoldFailed ? ' · these faces won\'t unfold flat, so spots are seen straight on' : '');
+  rpStatus(msg + (thin ? ` · ${thin} found no back to push through to` : ''));
+}
+/** A part's triangles as a soup (9 numbers each), moved by M. */
+function soupOf(m, M) {
+  const g = m.geometry, pos = g.attributes.position, ix = g.index ? g.index.array : null, n = ix ? ix.length : pos.count, out = new Float32Array(n * 3), v = V();
+  for (let i = 0; i < n; i++) { v.fromBufferAttribute(pos, ix ? ix[i] : i).applyMatrix4(M); out[3 * i] = v.x; out[3 * i + 1] = v.y; out[3 * i + 2] = v.z; }
+  return out;
+}
+/**
+ * Make placed pieces part of the target's own mesh for good: joined on as one solid (add), or taken away from it (cut),
+ * with Manifold, in the background. The pieces go; Undo brings everything back as it was.
+ */
+async function bakeInto(t, items, mode) {
+  items = items.filter(m => m?.parent); if (!items.length) return;
+  t.updateMatrixWorld(true); const inv = t.matrixWorld.clone().invert(), tSoup = soupOf(t, new THREE.Matrix4());
+  const iSoups = items.map(m => { m.updateMatrixWorld(true); return soupOf(m, inv.clone().multiply(m.matrixWorld)); });
+  loading.show(mode === 'add' ? `Merging into ${t.name}` : `Cutting into ${t.name}`);
+  loading.set(0.3, `${items.length} piece${items.length === 1 ? '' : 's'}, ${Math.round(tSoup.length / 9 / 1000)}k triangles in ${t.name}…`); await nextFrame();
+  let r;
+  try { [r] = await mergeJobs([mode === 'add' ? { soups: [tSoup, ...iSoups], subtract: [] } : { soups: [tSoup], subtract: iSoups }], { fillHollows: false, loose: 'keep' }); }
+  catch (e) { console.warn(e); toast(`Couldn't make them part of ${t.name} (${e.message || e}). They're left as separate parts.`, 'bad'); return; }
+  finally { loading.hide(); }
+  if (!r?.positions?.length) { toast(`That left nothing of ${t.name}, so nothing was changed.`, 'bad'); return; }
+  const g0 = new THREE.BufferGeometry(); g0.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
+  const g = weldGeometry(g0, 1e-9); g.computeBoundingBox(); g.computeBoundsTree();
+  const pt = t.userData.part, hadPaint = !!pt.paint;
+  t.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; pt.paintVer = (pt.paintVer || 0) + 1;
+  for (const m of items) { if (selection.includes(m)) selection = selection.filter(x => x !== m); m.parent.remove(m); }
+  refreshPaint(t); afterHierarchyChange(); select(t);
+  const cutN = mode === 'cut' ? r.cut : items.length, skipped = mode === 'cut' ? items.length - r.cut : r.unmerged;
+  toast(`${mode === 'add' ? 'Merged' : 'Cut'} ${cutN} piece${cutN === 1 ? '' : 's'} ${mode === 'add' ? 'into' : 'into'} ${t.name}: it's one mesh now${hadPaint ? ' (its brushed paint is cleared, as the mesh changed)' : ''}.` +
+    (skipped > 0 ? ` ${skipped} ${mode === 'add' ? "weren't closed solids, so they're joined on as they are" : "weren't closed solids, so they couldn't be cut and were left out"}.` : '') + ' Undo puts it all back.', skipped > 0 ? 'bad' : 'ok');
+}
+/**
+ * The surface's normal at a ray hit, blended smoothly across the faces round it (so a relief wrapped over a faceted
+ * curve doesn't kink at every facet), but never across a crease: each corner of the hit triangle averages only the
+ * faces round it within 50° of that triangle (angle-weighted), so a panel's edge keeps its own face's normal.
+ */
+function smoothNormalAt(m, h) {
+  const topo = topoOf(m), { idx, pos, fn, vtOff, vtList } = topo, f = h.faceIndex, cos = Math.cos(50 * Math.PI / 180);
+  const cache = m.geometry.userData.cornerN ||= new Map();
+  const n0 = V(fn[3 * f], fn[3 * f + 1], fn[3 * f + 2]), out = V();
+  const P = k => V(pos[3 * k], pos[3 * k + 1], pos[3 * k + 2]);
+  const local = h.point.clone().applyMatrix4(m.matrixWorld.clone().invert());
+  const a = idx[3 * f], b = idx[3 * f + 1], c = idx[3 * f + 2], bc = new THREE.Triangle(P(a), P(b), P(c)).getBarycoord(local, V());
+  [a, b, c].forEach((k, i) => {
+    const key = f * 3 + i; let cn = cache.get(key);
+    if (!cn) {
+      cn = V();
+      for (let j = vtOff[k]; j < vtOff[k + 1]; j++) {
+        const t = vtList[j], nt = V(fn[3 * t], fn[3 * t + 1], fn[3 * t + 2]); if (nt.dot(n0) < cos) continue;
+        const o = [idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]].indexOf(k); if (o < 0) continue;
+        const p0 = P(k), ang = P(idx[3 * t + (o + 1) % 3]).sub(p0).angleTo(P(idx[3 * t + (o + 2) % 3]).sub(p0));
+        if (isFinite(ang)) cn.addScaledVector(nt, ang);
+      }
+      if (cn.lengthSq() < 1e-12) cn.copy(n0); cn.normalize(); cache.set(key, cn);
+    }
+    out.addScaledVector(cn, bc.getComponent(i));
+  });
+  if (out.lengthSq() < 1e-10) out.copy(n0);
+  return out.transformDirection(m.matrixWorld).normalize();
+}
+/**
+ * Put the relief on the target: lying on the surface, turned, sized, sunk in, wrapped or not. Once and untrimmed it's
+ * the flat original as it is; as copies, or trimmed to the face, it's laid out again first (in the background, in 2D:
+ * the copies on a lattice, cut to the face's outline seen straight on, then built as one solid).
+ */
+async function applyReliefPlace() {
+  const me = rp, { m, target: t } = me, info = m.userData.part.relief; if (!t || !info) return;
+  const F = rpFrame(), { N, C, X, Y } = F;
+  const k = Math.max(0.05, (+$('rp-size').value || 100) / 100), sink = Math.max(0, +$('rp-sink').value || 0), unfold = !!(me.unfolded && me.grid), wrap = unfold || $('rp-wrap').checked;
+  const spin = +$('rp-spin').value || 0, ca = Math.cos(spin * Math.PI / 180), sa = Math.sin(spin * Math.PI / 180);
+  const rep = me.rep, trim = $('rp-trim').checked && !!me.face;
+  let src = info.flat, sc = k;
+  if (rep !== 'once' || trim || unfold) {
+    const p0 = info.params;
+    if (!p0) { toast('This relief was made in an earlier session, so it can only go on once, on one face: make it again from the picture to repeat, trim or fold it.', 'bad'); me.rep = 'once'; $('rp-trim').checked = false; $('rp-corners').checked = false; syncRpRows(); rpRegion(); return applyReliefPlace(); }
+    else {
+      const pw = p0.width * k, ph = p0.width * p0.h / p0.w * k, gap = Math.max(-0.9 * Math.min(pw, ph), +$('rp-gap').value || 0), px = pw + gap, py = ph + gap;
+      const face = me.face ? (unfold && me.domFill ? faceTris2D(me.off, spin, me.domFill, me.uvFill) : faceTris2D(me.off, spin)) : null;
+      let at = [[0, 0]];
+      if (rep === 'grid') {
+        const cols = Math.max(1, Math.min(50, Math.round(+$('rp-cols').value || 1))), rows = Math.max(1, Math.min(50, Math.round(+$('rp-rows').value || 1)));
+        at = []; for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) at.push([(i - (cols - 1) / 2) * px, (j - (rows - 1) / 2) * py]);
+      } else if (rep === 'fill' && face) {                       // every copy that reaches the face; the pattern runs through the centre
+        const [u0, u1, v0, v1] = face.box, i0 = Math.ceil((u0 - pw / 2) / px), i1 = Math.floor((u1 + pw / 2) / px), j0 = Math.ceil((v0 - ph / 2) / py), j1 = Math.floor((v1 + ph / 2) / py);
+        const n = (i1 - i0 + 1) * (j1 - j0 + 1);
+        if (n > 3000) { rpStatus(`That would be ${n} copies: make it bigger, or the gap wider.`); return; }
+        at = []; for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) at.push([i * px, j * py]);
+      }
+      const margin = trim ? Math.max(0, +$('rp-margin').value || 0) : 0;
+      // fine enough to follow a curve and to print, but no finer than a few hundred thousand triangles in all
+      const pieces = unfold && me.groups ? me.groups.map(l => faceTris2D(me.off, spin, l).tris) : null;
+      const curved = (unfold && !pieces) || (!unfold && wrap && me.face?.kind !== 'flat'), slopes = p0.mode !== 'flat' || p0.bevel > 0;
+      const area = trim ? Math.min(at.length * pw * ph, (face.box[1] - face.box[0]) * (face.box[3] - face.box[2])) : at.length * pw * ph;
+      let cell = slopes || curved ? Math.max(p0.cell, 0.03, Math.sqrt(4 * area / 400000)) : 1e4;
+      const r4 = v => Math.round(v * 1e4) / 1e4;
+      const key = JSON.stringify([k, gap, at.length, at[0], cell, (trim || unfold) && [margin, t.uuid, me.regionVer, ...me.off.map(r4), r4(spin)]]);
+      if (me.cacheKey !== key) {
+        rpStatus(`Laying out ${at.length} cop${at.length === 1 ? 'y' : 'ies'}${trim ? ', trimmed to the face' : ''}…`);
+        // (size changes how big it is across, not how high it stands)
+        let r;
+        for (let tries = 0; ; tries++) {
+          r = await solidJob({ relief: { ...p0, field: Float32Array.from(p0.field), width: pw, cell,
+            tiles: { at, pitch: rep === 'once' ? [Infinity, Infinity] : [px, py] }, clip: trim ? face.tris : null, margin, pieces } });
+          if (rp !== me) return;
+          if (r.positions.length / 9 <= 400000 || cell >= 1e4 || tries >= 3) break;
+          cell *= 1.8; rpStatus(`That came out heavy; laying it out again a little coarser…`);     // a fine outline refines into a lot of triangles
+        }
+        if (!r.positions.length) { rpStatus('Nothing of it lands on the faces there: slide it onto them, or make the margin smaller.'); return; }
+        const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
+        me.cache = weldGeometry(g, 1e-9); me.cacheKey = key; me.cacheN = at.length;     // welded exactly: corners are shared already, near ones must stay apart
+      }
+      src = me.cache; sc = 1;
+      rpStatus(`${me.cacheN} cop${me.cacheN === 1 ? 'y' : 'ies'}${trim ? ', trimmed to the face' : ''} · ${(src.index.count / 3 / 1000).toFixed(0)}k triangles` +
+        (me.unfoldFailed ? ' · these faces won\'t unfold flat (too curved or too much detail), so it\'s laid on seen straight on: lower "Up to", or Shift-click faces out' : unfold ? ' · unfolded round the corners' : ''));
+    }
+  } else rpStatus('');
+  t.updateMatrixWorld(true);
+  const pos = src.attributes.position, idx = src.index, n = pos.count, out = new Float32Array(n * 3);
+  src.computeBoundingBox(); const bb = src.boundingBox;
+  const R = Math.hypot(bb.max.x - bb.min.x, bb.max.y - bb.min.y) * sc * 0.5 + Math.hypot(...me.off) + 2;
+  const rc = new THREE.Raycaster(); rc.firstHitOnly = true; rc.far = 3 * R;
+  const inv = t.matrixWorld.clone().invert(), v = V(), base = V(), w = V();
+  let missed = 0;
+  // the back of the relief is z = 0; every corner at the same spot on the back lands on the same point of the surface
+  const memo = new Map();
+  for (let i = 0; i < n; i++) {
+    v.fromBufferAttribute(pos, i); const x = v.x * sc, y = v.y * sc, z = v.z;            // size is across; the height stays
+    base.copy(C).addScaledVector(X, x).addScaledVector(Y, y);
+    if (unfold) {                                                   // laid flat round the corners: back onto the faces
+      const key = x + ',' + y; let q = memo.get(key);
+      if (!q) {
+        const r = rpUnflatten(me.off[0] + x * ca - y * sa, me.off[1] + x * sa + y * ca);
+        if (!r) { missed++; q = [base.clone(), N.clone()]; } else { if (r.out) missed++; q = [r.p, r.n]; }
+        memo.set(key, q);
+      }
+      w.copy(q[0]).addScaledVector(q[1], z - sink);
+    } else if (wrap) {
+      const key = x + ',' + y; let q = memo.get(key);
+      if (!q) {
+        rc.set(base.clone().addScaledVector(N, R), N.clone().negate()); const h = rc.intersectObject(t, false)[0];
+        let hh = h;
+        if (!hh) {                                                  // just past an edge (a trimmed outline's own corner): the nearest spot
+          const c = t.geometry.boundsTree.closestPointToPoint(base.clone().applyMatrix4(inv));
+          if (c && c.distance < 0.05) hh = { point: c.point.clone().applyMatrix4(t.matrixWorld), faceIndex: c.faceIndex };
+        }
+        if (hh) { const fn = smoothNormalAt(t, hh); if (fn.dot(N) < 0) fn.negate(); q = [hh.point.clone(), fn]; }
+        else { missed++; q = [base.clone(), N.clone()]; }
+        memo.set(key, q);
+      }
+      w.copy(q[0]).addScaledVector(q[1], z - sink);
+    } else w.copy(base).addScaledVector(N, z - sink);
+    w.applyMatrix4(inv); out[3 * i] = w.x; out[3 * i + 1] = w.y; out[3 * i + 2] = w.z;
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(out, 3)); g.setIndex(idx.clone());
+  g.computeBoundingBox(); g.computeBoundsTree();
+  // it rides on the target, fixed, in the target's own frame
+  detach(m); t.add(m); m.position.set(0, 0, 0); m.quaternion.identity(); m.scale.set(1, 1, 1);
+  m.geometry = g; const pt = m.userData.part; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = idx.count / 3;
+  afterHierarchyChange();
+  if (missed && !(unfold && trim)) toast(unfold ? `${missed} spots ran past the outlined faces and carry on flat there. Trim to the faces' edges, raise "Up to", or Shift-click more faces in.` : `${missed} spots ran off the edge of ${t.name} and stayed flat there. Make it smaller, move it in, or Trim to the face's edges.`, 'bad');
+}
+function bindRelief() {
+  $('rl-file').addEventListener('click', () => $('rl-input').click());
+  $('rl-input').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) reliefPicture(f, f.name); });
+  $('rl-close').addEventListener('click', closeRelief); $('rl-cancel').addEventListener('click', closeRelief);
+  document.querySelectorAll('#rl-mode button').forEach(b => b.addEventListener('click', () => { rl.mode = b.dataset.v; syncReliefSegs(); reliefPreview(); }));
+  document.querySelectorAll('#rl-raise button').forEach(b => b.addEventListener('click', () => { rl.raise = b.dataset.v; rl.tAuto = true; syncReliefSegs(); reliefField(); }));
+  $('rl-t').addEventListener('input', () => { rl.t = +$('rl-t').value / 100; rl.tAuto = false; reliefPreview(); });
+  $('rl-tauto').addEventListener('click', () => { rl.tAuto = true; rl.t = rl.autoT; $('rl-t').value = Math.round(rl.t * 100); reliefPreview(); });
+  $('rl-blur').addEventListener('input', () => { $('rl-blur-n').textContent = $('rl-blur').value; reliefField(); });
+  $('rl-detail').addEventListener('change', reliefField);
+  $('rl-w').addEventListener('input', reliefPreview);
+  $('rl-make').addEventListener('click', () => makeRelief(false)); $('rl-place').addEventListener('click', () => makeRelief(true));
+  const re = () => reliefReplace();
+  $('rp-spin').addEventListener('input', () => { $('rp-spin-n').value = $('rp-spin').value; re(); });
+  $('rp-spin-n').addEventListener('change', () => { $('rp-spin').value = $('rp-spin-n').value; re(); });
+  ['rp-size', 'rp-sink'].forEach(id => $(id).addEventListener('change', re)); $('rp-wrap').addEventListener('change', re);
+  for (const ax of ['x', 'y']) {
+    const sl = $('rp-' + ax), nb = $('rp-' + ax + '-n'), set = v => { if (!rp) return; const o = [...rp.off]; o[ax === 'x' ? 0 : 1] = v; setRpOff(...o); re(); };
+    sl.addEventListener('input', () => set(+sl.value)); nb.addEventListener('change', () => set(+nb.value || 0));
+  }
+  $('rp-centre').addEventListener('click', rpCentre); $('rp-square').addEventListener('click', rpSquare);
+  document.querySelectorAll('#rp-rep button').forEach(b => b.addEventListener('click', () => {
+    if (!rp) return; rp.rep = b.dataset.v; if (rp.rep === 'fill' && rp.face) $('rp-trim').checked = true;      // a pattern stops at the face's edges
+    syncRpRows(); re(); }));
+  ['rp-cols', 'rp-rows', 'rp-gap', 'rp-margin'].forEach(id => $(id).addEventListener('change', re));
+  $('rp-trim').addEventListener('change', () => { syncRpRows(); re(); });
+  $('rp-corners').addEventListener('change', () => { if (!rp) return; syncRpRows(); if (rp.target) { rpRegion(); re(); } });
+  $('rp-turn').addEventListener('change', () => { if (rp?.target && $('rp-corners').checked) { rpRegion(); re(); } });
+  $('rp-again').addEventListener('click', () => { if (!rp) return; restore(rp.before); afterHierarchyChange(); rpOutline(true); rp.target = null; rp.face = null; rp.cacheKey = null; rpStatus(''); $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = true; $('rp-note').textContent = rp.kind === 'scatter' ? 'Click the face to scatter them over.' : `Click where ${rp.m.name} goes on a part.`; if (rp.copies) rp.copies = []; });
+  // Done: the relief or scatter goes on its part as a modifier (Separate, Merge or Cut), to change, turn off or apply later
+  const finish = how => { if (!rp) return; const t = rp.target, kind = rp.kind, kids = kind === 'scatter' ? (rp.copies || []) : [rp.m], mode = { keep: 'join', add: 'merge', cut: 'cut' }[how];
+    $('rp-bake').hidden = true; $('rp-btns').hidden = false;
+    const place = rpSettings();
+    let mod = rp.mod;
+    if (mod && !t.userData.part.mods?.includes(mod)) mod = null;          // started over on another part
+    if (mod) { Object.assign(mod, { mode, place, kids: kids.map(k => k.uuid) }); if (kind === 'scatter') mod.sources = rp.src.map(x => x.uuid); }
+    else { mod = { id: newModId(), type: kind, name: MOD_NAMES[kind], on: true, mode, place, kids: kids.map(k => k.uuid), sources: kind === 'scatter' ? rp.src.map(x => x.uuid) : undefined }; ensureStack(t).push(mod); }
+    for (const k of kids) k.userData.part.owner = { part: t.uuid, mod: mod.id };
+    const editing = !!rp.mod; pushUndo(rp.before); endReliefPlace(true); select(t); evalStack(t);
+    const what = kind === 'scatter' ? `${kids.length} cop${kids.length === 1 ? 'y' : 'ies'}` : kids[0].name;
+    toast(`${editing ? 'Changed' : 'Added'} ${what} on ${t.name} as a ${MOD_NAMES[kind]} modifier (${{ join: 'separate parts', merge: 'merged in', cut: 'cut in' }[mode]}): turn it off, change it or Apply it in Properties › Modifiers.`, 'ok'); };
+  $('rp-done').addEventListener('click', () => { if (!rp?.target || rp.running) return;
+    const what = rp.kind === 'scatter' ? `these ${rp.copies.length} copies` : rp.m.name;
+    $('rp-bake-q').textContent = `How should ${what} go on ${rp.target.name}? As separate parts fixed to it, merged into its mesh, or cut into it (as deep as they sink in). It's a modifier either way: you can switch, turn it off or apply it later.`;
+    $('rp-merge').textContent = `Merge into ${rp.target.name}`; $('rp-cut').textContent = `Cut into ${rp.target.name}`;
+    $('rp-btns').hidden = true; $('rp-bake').hidden = false; });
+  $('rp-keep').addEventListener('click', () => finish('keep'));
+  $('rp-merge').addEventListener('click', () => finish('add'));
+  $('rp-cut').addEventListener('click', () => finish('cut'));
+  $('rp-back').addEventListener('click', () => { $('rp-bake').hidden = true; $('rp-btns').hidden = false; });
+  $('rp-cancel').addEventListener('click', () => { const kind = rp?.kind; endReliefPlace(false); toast(kind === 'scatter' ? 'Scattered nothing.' : 'Left the relief where it was.'); });
+  // scattering
+  ['sc-n', 'sc-gap', 'sc-smin', 'sc-smax', 'sc-jit', 'sc-tilt', 'sc-axis', 'sc-margin'].forEach(id => $(id).addEventListener('change', re));
+  $('sc-inside').addEventListener('change', re); $('sc-through').addEventListener('change', re); $('sc-poke').addEventListener('change', re);
+  $('sc-shuffle').addEventListener('click', () => { if (!rp) return; rp.seed = (Math.random() * 2 ** 31) | 0; re(); });
+  document.querySelectorAll('#sc-turn button').forEach(b => b.addEventListener('click', () => { if (!rp) return; rp.turn = b.dataset.v;
+    document.querySelectorAll('#sc-turn button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); re(); }));
+}
 
 // skeleton: joint to joint lines, drawn every frame
 const linkLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: '#7fd3c4', depthTest: false, transparent: true, opacity: .95 }));
@@ -4737,14 +5984,15 @@ function filledMesh(m, positions) {
  */
 let solidWorker = null, solidSeq = 0;
 const solidWaits = new Map();
-function mergeJobs(jobs, opts) {
+function mergeJobs(jobs, opts) { return solidJob({ jobs, opts }); }
+function solidJob(msg) {
   if (!solidWorker) {
     solidWorker = new Worker(new URL('./solid-worker.js', import.meta.url), { type: 'module' });
     solidWorker.onmessage = e => { const w = solidWaits.get(e.data.id); solidWaits.delete(e.data.id); if (!w) return; e.data.error ? w.no(new Error(e.data.error)) : w.ok(e.data.out); };
     solidWorker.onerror = e => { for (const w of solidWaits.values()) w.no(new Error(e.message || 'The merge helper failed to start')); solidWaits.clear(); solidWorker = null; };
   }
   const id = ++solidSeq;
-  return new Promise((ok, no) => { solidWaits.set(id, { ok, no }); solidWorker.postMessage({ id, jobs, opts }); });
+  return new Promise((ok, no) => { solidWaits.set(id, { ok, no }); solidWorker.postMessage({ id, ...msg }); });
 }
 /** Merge each STL (ArrayBuffer) into one solid. Returns { files: [ArrayBuffer], note } — the originals if merging is off or fails. */
 async function mergeSTLs(bufs, title = 'Merging into one solid', holes = []) {
@@ -5164,6 +6412,9 @@ renderer.domElement.addEventListener('pointerup', e => {
   const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
   if (moved > 5) return;                          // that was an orbit drag
   if (dirPick) { dirPickClick(raycast(e)); return; }  // picking faces for a direction
+  if (modHit) { modHitClick(raycast(e), e); return; }                // a crack modifier's new hit
+  if (dm) { crackClick(raycast(e), e); return; }                      // cracking: where it got hit
+  if (rp) { reliefPlaceClick(raycast(e), e.shiftKey); return; }                   // placing a relief, or sliding it along the face
   if (!SNAP_STEPS[tool] && tool !== 'ORIENT' && tool !== 'pose' && !(e.ctrlKey || e.metaKey || e.shiftKey)) {
     const bh = benchHit(e);
     if (bh) { if (bh.kind === 'book' && tool === 'select') { openBook(); return; } selectBench(bh.kind, bh.k); return; }
@@ -5489,6 +6740,8 @@ window.addEventListener('keydown', e => {
   if (e.shiftKey && k === 'm') { openMarr('mirror'); return; }
   if (e.shiftKey && k === 'a') { openMarr('linear'); return; }
   if (k === 'escape' && dirPick) { cancelDirPick(); return; }
+  if (k === 'escape' && dm) { endCrack(false); toast('Left it as it was.'); return; }
+  if (k === 'escape' && rp) { endReliefPlace(false); toast('Left the relief where it was.'); return; }
   if (k === 'escape' && !$('marr').hidden) { if (marr.picking) { marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false'); } else closeMarr(); return; }
   if (k === 'enter' && !$('marr').hidden && !e.target.closest?.('#marr')) { applyMarr(); return; }
   if (map[k]) { setTool(map[k]); return; }
@@ -5545,7 +6798,9 @@ function serializeProject() {
   return {
     format: 'kitbash-bench', version: 1, id: project.id, name: project.name, updated: Date.now(),
     parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
-      geom: m.userData.part.geomKey, tris: m.userData.part.tris, parent: parentId(m), ...tr(m) })),
+      geom: storedKey(m), tris: m.userData.part.tris, parent: parentId(m), ...tr(m),
+      mods: m.userData.part.mods?.length ? JSON.parse(JSON.stringify(m.userData.part.mods, (k, v) => k === 'err' ? undefined : v)) : undefined,
+      owner: m.userData.part.owner || undefined, relief: m.userData.part.relief ? encodeRelief(m.userData.part.relief) || undefined : undefined })),
     joints: joints.filter(j => j.parent).map(j => { const jd = j.userData.joint; return { id: j.uuid, parent: parentId(j), size: jd.size, rest: jd.rest.toArray(),
       type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, axisName: jd.axisName || '', pointOff: jd.pointOff || null, partOff: jd.partOff || null, ...tr(j) }; }),
     links: JSON.parse(JSON.stringify(links)),
@@ -5559,7 +6814,7 @@ function serializeProject() {
   };
 }
 function geomBuffers(m) {
-  const g = m.geometry;
+  const g = storedGeom(m).geometry;                      // a part with modifiers: its mesh as it came in (the stack is worked out again on opening)
   return { pos: g.attributes.position.array.slice().buffer, idx: Uint32Array.from(g.index.array).buffer };
 }
 function geomFrom(rec) {
@@ -5585,6 +6840,9 @@ function buildProject(data, geoms, paints = new Map()) {
     const m = addPart(p.name, g, { welded: true, color: p.color, id: p.id, geomKey: p.geom });
     m.visible = p.visible !== false; byId.set(p.id, m);
     const pt = m.userData.part, pb = paints.get(p.id); pt.fill = p.fill || null;
+    if (p.mods?.length) { pt.base = { geometry: g, geomKey: p.geom }; pt.mods = JSON.parse(JSON.stringify(p.mods)); }
+    if (p.owner) pt.owner = p.owner;
+    if (p.relief) pt.relief = decodeRelief(p.relief);
     if (pb && pb.byteLength === g.attributes.position.count * 4) { pt.paint = new Uint8Array(pb.slice(0)); pt.paintVer = pt.paintSaved = 1; }
     refreshPaint(m);
   }
@@ -5608,6 +6866,7 @@ function buildProject(data, geoms, paints = new Map()) {
   afterHierarchyChange(); updateButtons();
   project.loading = false; project.dirty = false; project.pristine = false;
   if (missing.length) toast(`Couldn't find the mesh for ${missing.join(', ')}.`, 'bad');
+  for (const m of liveParts()) if (m.userData.part.mods?.length) evalStack(m);          // modifiers: worked out again in the background
 }
 
 function markDirty() {
@@ -5625,7 +6884,7 @@ async function saveToBrowser() {
   try {
     const data = serializeProject();
     for (const m of liveParts()) {                         // meshes never change after import, so each is stored once
-      const k = m.userData.part.geomKey; if (project.saved.has(k)) continue;
+      const k = storedKey(m); if (project.saved.has(k)) continue;
       await idbReq('geoms', 'readwrite', st => st.put(geomBuffers(m), k)); project.saved.add(k);
     }
     for (const m of liveParts()) {                         // brushed paint, saved again only after it changes
@@ -5670,7 +6929,7 @@ async function deleteSaved(id) {
   try {
     const all = await listProjects(), gone = all.find(p => p.id === id); if (!gone) return;
     const keep = new Set(all.filter(p => p.id !== id).flatMap(p => p.parts.map(q => q.geom)));
-    if (id === project.id) liveParts().forEach(m => keep.add(m.userData.part.geomKey));
+    if (id === project.id) liveParts().forEach(m => keep.add(storedKey(m)));
     await idbReq('projects', 'readwrite', st => st.delete(id));
     for (const k of new Set(gone.parts.map(q => q.geom))) if (!keep.has(k)) await idbReq('geoms', 'readwrite', st => st.delete(k));
     for (const q of gone.parts) if (q.paint && id !== project.id) await idbReq('geoms', 'readwrite', st => st.delete('paint:' + q.id));
@@ -5712,7 +6971,7 @@ async function saveProjectFile() {
   if (!liveParts().length) { toast('Nothing to save yet.'); return; }
   const data = serializeProject(), files = [{ name: 'scene.json', data: JSON.stringify(data, null, 1) }];
   const seen = new Set();
-  for (const m of liveParts()) { const k = m.userData.part.geomKey; if (seen.has(k)) continue; seen.add(k);
+  for (const m of liveParts()) { const k = storedKey(m); if (seen.has(k)) continue; seen.add(k);
     const { pos, idx } = geomBuffers(m), head = new Uint32Array([pos.byteLength, idx.byteLength]);
     files.push({ name: `meshes/${k}.bin`, data: new Blob([head, pos, idx]) }); }
   for (const k of [kit?.image, kit?.pdf, ...refs.map(r => r.asset)].filter(Boolean)) { const a = assets.get(k); if (a) files.push({ name: `assets/${k.slice(6)}`, data: new Blob([a.data]) }); }
@@ -5820,8 +7079,12 @@ function bindChrome() {
   on('menu-ortho', () => setOrtho(!camera.isOrthographicCamera));
   on('menu-fit', () => setFitPinned(!(fit.pinned || !$('fitcheck').hidden)));
   $('fit-close').addEventListener('click', e => { e.stopPropagation(); setFitPinned(false); });
+  on('menu-scatter', () => startScatter());
+  on('menu-crack', () => startCrack());
+  on('menu-split', () => startSplit());
   on('menu-mirror', () => openMarr('mirror')); on('menu-array', () => openMarr('linear'));
   on('menu-addref', () => $('ref-input').click());
+  on('menu-relief', () => openRelief());
   $('ref-input').addEventListener('change', async () => { for (const f of [...$('ref-input').files]) await addRefImage(f); $('ref-input').value = ''; });
   on('menu-joints', () => { const c = $('set-joints'); c.checked = !c.checked; c.dispatchEvent(new Event('change', { bubbles: true })); });
   on('menu-seams', () => $('exp-preview').click());
@@ -5874,7 +7137,7 @@ function resize() {
 }
 new ResizeObserver(resize).observe(view);
 bindAdjust();
-bindFit(); bindDirPick();
+bindFit(); bindDirPick(); bindCrack(); bindRelief();
 document.querySelectorAll('#move-frame button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === moveFrame)); b.addEventListener('click', () => setMoveFrame(b.dataset.v)); });
 document.querySelectorAll('#pose-mode button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)); b.addEventListener('click', () => setPoseMode(b.dataset.v)); });
 bindProject();
@@ -5906,4 +7169,4 @@ $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   
 })();
 renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
 // automated tests only (a query string never reaches the page inside claude.ai)
-if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf }; }
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf, get rp() { return rp; } }; }

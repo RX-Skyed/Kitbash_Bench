@@ -520,3 +520,41 @@ kbd { font-family: var(--font-mono); font-size: 10px; color: var(--muted); borde
 .off-ax .ax { font: 600 11px var(--mono, monospace); width: 12px; text-align: center; }
 .off-ax .ax.x { color: #e36b6b; } .off-ax .ax.y { color: #7fc77f; } .off-ax .ax.z { color: #6fa3dd; }
 .conn-off .btnrow { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+
+/* image to relief */
+.relief { width: min(520px, calc(100% - 32px)); }
+.rl-body { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 10px; }
+.rl-pic canvas { width: 100%; height: auto; background: #f3f1ec; border-radius: 6px; display: block; }
+.rl-pic .btnrow { margin-top: 6px; display: flex; gap: 8px; align-items: center; }
+.rl-grid, .rp-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; font-size: 12px; color: var(--muted); }
+.rl-grid .num, .rp-grid .num { width: 72px; }
+.rl-grid .ofield, .rp-grid .ofield { display: inline-flex; gap: 6px; align-items: center; }
+#rlplace .rp-grid { margin: 8px 0; }
+#rlplace { left: 84px; top: 128px; transform: none; width: min(360px, calc(100% - 100px)); max-height: calc(100% - 150px); overflow: auto; }   /* to the side, so the face stays in view */
+#rlplace .rp-grid .btnrow { gap: 4px; }
+#rlplace .rp-grid .btnrow .btn { font-size: 11.5px; padding: 3px 8px; }
+#rlplace .rp-grid input[type=range] { flex: 1; min-width: 90px; }
+.dirpick p.rp-status { margin: 0 0 6px; color: var(--accent); }
+.relief header b { flex: 1; }
+#rl-detail { width: auto; text-align: left; }
+
+/* one placing card for reliefs and scatters: the rows that aren't for this one are left out */
+#rlplace[data-kind="scatter"] .rp-rel, #rlplace[data-kind="relief"] .rp-sc { display: none !important; }
+#rlplace .rp-grid select.num { width: auto; }
+#rlplace .rp-bake { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 8px; }
+#rlplace .rp-bake p { margin: 0 0 8px; color: var(--text, inherit); font-size: 12.5px; }
+#rlplace .rp-sc .check { display: inline-flex; gap: 6px; align-items: center; }
+#dmg { left: 84px; top: 128px; transform: none; width: min(340px, calc(100% - 100px)); max-height: calc(100% - 150px); overflow: auto; }
+/* modifier stack in the part panel */
+.mods .conn-h { display: flex; align-items: center; gap: 6px; }
+.mods .mods-add { margin-left: auto; width: auto; }
+.mods .mods-busy { color: var(--accent); font-weight: 400; text-transform: none; letter-spacing: 0; }
+.mods .mod { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 6px 0; background: rgba(255,255,255,.02); }
+.mods .mod.off { opacity: .55; }
+.mods .mod-h { display: flex; align-items: center; gap: 4px; }
+.mods .mod-h b { flex: 1; font-weight: 600; font-size: 12.5px; }
+.mods .mod-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 8px; align-items: center; margin-top: 6px; font-size: 12px; }
+.mods .mod-grid .num { width: 72px; }
+.mods .mod-grid select.num { width: auto; }
+.mods .mod-grid .btnrow { gap: 4px; flex-wrap: wrap; }
+.mods .note.bad { color: var(--bad, #e66); }

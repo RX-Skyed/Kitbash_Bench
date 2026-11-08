@@ -201,7 +201,8 @@ export function mergeSolid(M, soups, opts = {}) {
   const read = m => {
     const mesh = m.getMesh(), P = mesh.vertProperties, np = mesh.numProp, T = mesh.triVerts;
     const V = new Float32Array(P.length / np * 3); for (let i = 0, j = 0; i < P.length; i += np, j += 3) { V[j] = P[i]; V[j + 1] = P[i + 1]; V[j + 2] = P[i + 2]; }
-    return { V, T, parts: shells(T, V.length / 3).map(list => ({ list, sv: signedVolume(V, T, list) })) };
+    // strictly split, so a fleck folded onto the surface (sharing an edge with it) is its own piece and gets dropped
+    return { V, T, parts: shells(T, V.length / 3, true).map(list => ({ list, sv: signedVolume(V, T, list) })) };
   };
   let looseBits = [], dropped = 0, bridged = 0;
   let R = out ? read(out) : null;
@@ -230,9 +231,22 @@ export function mergeSolid(M, soups, opts = {}) {
       if (sv < 0) { hollowsLeft++; hollowLeftVolume -= sv; }
       if (sv > 0) shellsOut++; volume += sv; keep.push(list);
     }
-    let n = 0; for (const l of keep) n += l.length;
-    positions = new Float32Array(n * 9); let o = 0;
-    for (const l of keep) for (const t of l) for (let e = 0; e < 3; e++) { const i = 3 * T[3 * t + e]; positions[o++] = V[i]; positions[o++] = V[i + 1]; positions[o++] = V[i + 2]; }
+    // needle triangles: corners a few µm apart (they'd round together in the STL and leave a zero-area fold that
+    // slicers call non-manifold). Pull such corners together and drop the triangles that vanish.
+    const rep = snapClose(V, opts.snap ?? 2e-5);
+    let n = 0; const tris = [];
+    for (const l of keep) for (const t of l) { const a = rep[T[3 * t]], b = rep[T[3 * t + 1]], c = rep[T[3 * t + 2]]; if (a !== b && b !== c && a !== c) tris.push(a, b, c); }
+    // a triangle and its exact twin (the same three corners, either way round) are a fold of zero thickness: both go
+    {
+      // (only a pair facing opposite ways: anything else is left as it is)
+      const key = i => { const v = [tris[i], tris[i + 1], tris[i + 2]].sort((x, y) => x - y); return v[0] + ',' + v[1] + ',' + v[2]; }, seen = new Map();
+      const turn = i => { const a = tris[i], b = tris[i + 1], c = tris[i + 2]; return (a < b) + (b < c) + (c < a) === 2 ? 1 : -1; };   // which way round
+      for (let i = 0; i < tris.length; i += 3) { const k = key(i), e = seen.get(k); if (e) e.push(i); else seen.set(k, [i]); }
+      const drop = new Set(); for (const l of seen.values()) if (l.length === 2 && turn(l[0]) !== turn(l[1])) { drop.add(l[0]); drop.add(l[1]); }
+      if (drop.size) { let o = 0; for (let i = 0; i < tris.length; i += 3) if (!drop.has(i)) { tris[o++] = tris[i]; tris[o++] = tris[i + 1]; tris[o++] = tris[i + 2]; } tris.length = o; }
+    }
+    positions = new Float32Array(tris.length * 3); let o = 0;
+    for (const v of tris) { const i = 3 * v; positions[o++] = V[i]; positions[o++] = V[i + 1]; positions[o++] = V[i + 2]; }
     out.delete();
     hollows += hollowsIn; hollowVolume += hollowsInVol;
   }
@@ -250,6 +264,22 @@ export function mergeSolid(M, soups, opts = {}) {
   }
   const looseOut = looseBits.map(b => ({ volume: b.sv, gap: b.gap, at: b.at }));
   return { positions, cut, loose: looseOut, bridged, dropped, shells: shellsOut, inputShells, repaired, unmerged, specks, hollows, hollowVolume, hollowsLeft, hollowLeftVolume, volume };
+}
+
+// each vertex → the first vertex within tol of it (grid hashed); vertices with nothing near map to themselves
+function snapClose(V, tol) {
+  const n = V.length / 3, rep = new Int32Array(n), grid = new Map(), k = (x, y, z) => x + ',' + y + ',' + z, t2 = tol * tol;
+  for (let i = 0; i < n; i++) {
+    const x = V[3 * i], y = V[3 * i + 1], z = V[3 * i + 2], gx = Math.floor(x / tol), gy = Math.floor(y / tol), gz = Math.floor(z / tol);
+    let found = -1;
+    for (let dx = -1; dx <= 1 && found < 0; dx++) for (let dy = -1; dy <= 1 && found < 0; dy++) for (let dz = -1; dz <= 1 && found < 0; dz++) {
+      const c = grid.get(k(gx + dx, gy + dy, gz + dz)); if (!c) continue;
+      for (const j of c) { const ex = V[3 * j] - x, ey = V[3 * j + 1] - y, ez = V[3 * j + 2] - z; if (ex * ex + ey * ey + ez * ez <= t2) { found = j; break; } }
+    }
+    if (found >= 0) { rep[i] = found; continue; }
+    rep[i] = i; const key = k(gx, gy, gz), c = grid.get(key); if (c) c.push(i); else grid.set(key, [i]);
+  }
+  return rep;
 }
 
 function concat(list) {
