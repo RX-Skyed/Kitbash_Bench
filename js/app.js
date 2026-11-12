@@ -86,6 +86,7 @@ import {
   patchMesh,
   multiFit,
   parseQuantity,
+  parseMirror,
   shortLabel,
   tagWidth,
   packSprues,
@@ -789,7 +790,8 @@ function snapshot() {
     o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name, g: o.isMesh ? o.geometry : null, gk: o.userData.part?.geomKey,
     rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null, axisName: o.userData.joint.axisName || '', pointOff: o.userData.joint.pointOff || null, partOff: o.userData.joint.partOff || null } : null, off: !!o.userData.optOff,
     paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null,
-    mods: o.userData.part?.mods ? JSON.parse(JSON.stringify(o.userData.part.mods)) : null, base: o.userData.part?.base || null, owner: o.userData.part?.owner || null }));
+    mods: o.userData.part?.mods ? JSON.parse(JSON.stringify(o.userData.part.mods)) : null, base: o.userData.part?.base || null, owner: o.userData.part?.owner || null,
+    ooze: o.userData.part?.ooze ? JSON.parse(JSON.stringify(o.userData.part.ooze)) : null }));
   snap.options = JSON.parse(JSON.stringify(options));
   snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
   snap.kit = kit ? JSON.parse(JSON.stringify(kit)) : null;
@@ -807,7 +809,8 @@ function restore(snap) {
     if (e.jd) Object.assign(e.o.userData.joint, { ...e.jd, restPos: e.jd.restPos.clone() });
     if (e.o.userData.part) { e.o.userData.optOff = e.off;
       const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); }
-      pt.mods = e.mods ? JSON.parse(JSON.stringify(e.mods)) : null; pt.base = e.base; if (e.owner) pt.owner = e.owner; else delete pt.owner; }
+      pt.mods = e.mods ? JSON.parse(JSON.stringify(e.mods)) : null; pt.base = e.base; if (e.owner) pt.owner = e.owner; else delete pt.owner;
+      if (e.ooze) pt.ooze = JSON.parse(JSON.stringify(e.ooze)); else delete pt.ooze; }
   }
   if (snap.options) options = JSON.parse(JSON.stringify(snap.options));
   if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
@@ -845,13 +848,52 @@ const TOOL_NAMES = { BALL: "Ball & socket", PLANE: "Face to face", MID: "Midpoin
 let tool = 'select', picks = [], lastOp = null, luckyFirst = null, luckyStop = null;
 const settings = () => ({ smoothDeg: +$('set-smooth').value, maxRadius: +$('set-radius').value || 0, flatTol: +$('set-flat').value || 0.02, ballTol: +$('set-balltol').value || 3, creaseDeg: +$('set-crease').value || 30 });
 
+// ---- workspaces: tabs across the top, each with its own tools on the left and operations on the right
+let workspace = 'assemble';
+const WS_NAMES = { files: 'Files', assemble: 'Assemble', modify: 'Modify', prepare: 'Prepare', export: 'Export' };
+const wsHas = (el, ws = workspace) => !el?.dataset.ws || el.dataset.ws.split(' ').includes(ws);
+function setWorkspace(ws, o = {}) {
+  if (!WS_NAMES[ws]) ws = 'assemble';
+  const was = workspace; workspace = ws;
+  document.querySelectorAll('.wstab').forEach(t => { const on = t.dataset.ws === ws; t.setAttribute('aria-selected', String(on)); t.tabIndex = on ? 0 : -1; });
+  document.querySelectorAll('.tools [data-ws]').forEach(el => { el.hidden = !wsHas(el); });
+  document.querySelectorAll('.wsops').forEach(el => { el.hidden = el.dataset.ws !== ws; });
+  $('ws-title').textContent = WS_NAMES[ws];
+  const g = $('dock-ws'); g.classList.remove('folded'); g.querySelector('.dfold').setAttribute('aria-expanded', 'true');
+  if (!o.keepTool && !wsHas(document.querySelector(`.tool[data-tool="${tool}"]`))) setTool('select');
+  if (ws === 'files' && !$('tab-files').hidden) showDockTab('tab-files');
+  else if (was === 'files' && ws !== 'files') showDockTab('tab-parts');
+  if (ws === 'export' && was !== 'export' && !o.quiet && liveParts().length && $('dlg-export').hidden) openDialog('dlg-export');
+  if (was === 'export' && ws !== 'export') $('dlg-export').hidden = true;
+  syncWsOps(); renderPartPanel();
+  try { localStorage.setItem('kitbash-ws', ws); } catch (e) {}
+}
+/** The workspace buttons follow the menu items they stand for: greyed out, ticked. */
+function syncWsOps() {
+  document.querySelectorAll('.wsop[data-click]').forEach(b => {
+    const id = b.dataset.click, t = $(id);
+    if (id === 'exp-sprue') b.disabled = $('exp-sprue-f').hidden;
+    else if (id.startsWith('exp-') || id === 'ws-sets') b.disabled = !liveParts().length;
+    else if (id === 'ws-drop' || id === 'ws-square' || id === 'ws-paint' || id === 'ws-magnet') b.disabled = !liveParts().length || ((id === 'ws-drop' || id === 'ws-square') && !selected);
+    else if (t) b.disabled = t.disabled;
+    if (id === 'ws-paint' || id === 'ws-magnet') b.setAttribute('aria-pressed', String(tool === (id === 'ws-paint' ? 'paint' : 'MAGNET')));
+    else if (t && t.hasAttribute('aria-checked')) b.setAttribute('aria-pressed', t.getAttribute('aria-checked'));
+  });
+}
+/** The part's buttons in Properties: only the ones for this workspace (and the ones for every workspace). */
+const WS_BTNS = { 'Reset pose': 'assemble', 'Detach': 'assemble', 'Mirror…': 'assemble modify', 'Array…': 'assemble modify', 'Scatter…': 'modify', 'Crack…': 'modify', 'Split…': 'modify',
+  'Ooze…': 'modify', 'Change ooze…': 'modify', 'Clean inside': 'prepare', 'Drop to grid': 'assemble prepare', 'Square up': 'assemble prepare', 'Clear paint': 'modify' };
+function wsFilterButtons(row) {
+  for (const b of row.querySelectorAll('button')) { const t = b.textContent.trim(), w = WS_BTNS[t] || (/^(Swap with|Make .* the base|Make it the base)/.test(t) ? 'assemble' : null); if (w && !w.split(' ').includes(workspace)) b.hidden = true; }
+}
 function setTool(t) {
+  { const btn = document.querySelector(`.tool[data-tool="${t}"]`); if (btn && !wsHas(btn)) setWorkspace(btn.dataset.ws.split(' ')[0], { keepTool: true, quiet: true }); }
   cancelPick(); if (typeof magPending !== 'undefined' && magPending) { magPending = null; rebuildMagnets(); } if (typeof clearHover === 'function') clearHover();
   luckyFirst = null;
   if (t !== 'ORIENT' && typeof closeOrient === 'function' && !$('orient').hidden) closeOrient();
   tool = t;
   document.querySelectorAll('.tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === t ? 'true' : 'false'));
-  syncGizmo(); updateStep(); syncOptbar();
+  syncGizmo(); updateStep(); syncOptbar(); if (typeof syncWsOps === 'function' && $('dock-ws')) syncWsOps();
 }
 /** The bar under the menus shows only the current tool's settings, like Photoshop's options bar. */
 function syncOptbar() {
@@ -1309,6 +1351,21 @@ function mirrorName(n) {
   let out = n.replace(/\b(left|right|Left|Right|LEFT|RIGHT)\b/g, w => sw[w]);
   if (out === n) out = n.replace(/([ _\-.])([LR])(?=$|[ _\-.\d])/g, (m0, sep, c) => sep + (c === 'L' ? 'R' : 'L'));
   return out === n ? `${n} (mirror)` : out;
+}
+/** A mesh flipped across its own middle, square to an axis ('x', 'y' or 'z'), turned inside out the right way. */
+function mirroredGeometry(g, axis = 'x') {
+  const k = { x: 0, y: 1, z: 2 }[axis] ?? 0, out = g.clone(); if (!g.boundingBox) g.computeBoundingBox();
+  const c = g.boundingBox.min.getComponent(k) + g.boundingBox.max.getComponent(k), p = out.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setComponent(i, k, c - p.getComponent(i, k));
+  p.needsUpdate = true; out.deleteAttribute('normal');
+  const ix = out.index.array; for (let t = 0; t < ix.length; t += 3) { const q = ix[t + 1]; ix[t + 1] = ix[t + 2]; ix[t + 2] = q; }
+  out.boundingBox = null; out.boundsTree = null; out.computeBoundingBox(); out.computeBoundsTree();
+  return out;
+}
+/** What a file's mirrored copy is called: "Arm_L" → "Arm_R"; "Pad" (mirror for right arm) → "Pad (right arm)". */
+function mirrorCopyName(name, forName) {
+  const n = mirrorName(name);
+  return forName && n.endsWith(' (mirror)') ? `${name} (${forName})` : n;
 }
 /** The next free numbered name: "Rivet" → "Rivet 2", "Rivet 3" → "Rivet 4" (whatever's taken). */
 function nextName(n) {
@@ -2475,6 +2532,7 @@ function renderOutliner() {
 }
 function renderPartPanel() {
   const el = $('part-panel'); el.innerHTML = '';
+  if ($('dock-ws')) try { refreshMenus(); syncWsOps(); } catch (e) {}
   if (benchSel) return renderBenchPanel(el);
   if (connSel) { if (connInfo(connSel)) return renderConnPanel(el); connSel = null; }
   if (!selected) { el.innerHTML = '<p class="note">Select a part to see its size and attachments. Ctrl-click or Ctrl-drag to select several.</p>'; return; }
@@ -2506,11 +2564,14 @@ function renderPartPanel() {
   b('Scatter…', () => startScatter()); row.lastChild.title = 'Scatter copies of this over a face of another part, at random';
   b('Crack…', () => startCrack(p)); row.lastChild.title = 'Crack it and cave it in where you click, as if it was punched';
   b('Split…', () => startSplit(p)); row.lastChild.title = 'Cut it in two where you click: snapped, torn, melted by a lance, or clean';
+  b('Clean inside', () => startClean(p)); row.lastChild.title = 'Keep the outside skin and remove everything inside it: overlapping pieces, buried parts, sealed hollows, stray inner bits';
+  if (p.userData.part.ooze) { b('Change ooze…', () => startOoze(p)); row.lastChild.title = 'Open it again: carry it on to more spots, or change how it looks'; }
+  else { b('Ooze…', () => startOoze()); row.lastChild.title = 'String organic ooze between spots you click on the parts'; }
   b('Drop to grid', () => { pushUndo(); applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); });
   b('Square up', () => openOrient(p, { kind: 'auto' }));
   if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
   b('Delete', () => deleteSelected());
-  el.append(name, dl, row);
+  wsFilterButtons(row); el.append(name, dl, row);
   modifierRows(p, el);
   connectionRows(p, el);
   magnetRows(p, el);
@@ -3264,7 +3325,10 @@ async function startLoadPreview(entries, mode = 'spread') {
     try {
       const g = loader.parse(await e.file.arrayBuffer()); g.computeBoundingBox(); bytes += e.size;
       const q = $('set-qty').checked ? parseQuantity(e.name) : { base: e.name, count: 1 };
+      const mi = $('set-mirror').checked ? parseMirror(q.base) : { mirror: false };
       lp.items.push({ geom: g, count: q.count, color: PART_COLORS[k % PART_COLORS.length] }); pieces += q.count; if (q.count > 1) counted.push(`${q.base} ×${q.count}`);
+      if (mi.mirror && g.index) { lp.items.push({ geom: mirroredGeometry(g, $('set-mirror-axis').value), count: q.count, color: PART_COLORS[k % PART_COLORS.length] }); pieces += q.count; counted.push(`${mi.base} + mirrored`); }
+      else if (mi.mirror) { const gm = g.clone(), p = gm.attributes.position, kk = { x: 0, y: 1, z: 2 }[$('set-mirror-axis').value] ?? 0; for (let i = 0; i < p.count; i++) p.setComponent(i, kk, -p.getComponent(i, kk)); gm.computeBoundingBox(); lp.items.push({ geom: gm, count: q.count, color: PART_COLORS[k % PART_COLORS.length] }); pieces += q.count; counted.push(`${mi.base} + mirrored`); }
     } catch (err) { /* unreadable: the load itself will say so */ }
     if (k % 4 === 3) { arrangePreview(); await nextFrame(); }
   }
@@ -4411,7 +4475,7 @@ function rpLayFlat() {
         const q = [0, 1, 2].map(e => fill.get(idx[3 * tr + e])); if (q.some(x => !x)) { ok = false; break; }
         const o = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]); if (Math.sign(o) !== sign || Math.abs(o) < 1e-12) { ok = false; break; }
       }
-      if (ok) keep.push(...list);
+      if (ok) for (const tr of list) keep.push(tr);
     }
     rp.uvFill = fill; rp.domFill = dom.concat(keep);
   }
@@ -4622,6 +4686,87 @@ function reliefReplace() {
   (me.kind === 'scatter' ? applyScatter() : applyReliefPlace()).catch(e => { console.warn(e); toast(`Couldn't lay it out (${e.message || e}).`, 'bad'); })
     .finally(() => { me.running = false; if (rp !== me) return; $('rp-done').disabled = false; if (me.again) { me.again = false; reliefReplace(); } });
 }
+
+// ---- popups you can move and resize
+/*
+ * Every popup card and dialog can be dragged by its title bar and resized from its bottom-right corner. Where you
+ * leave one (and its size) is remembered, per popup, for next time it opens; double-click the title bar to put it
+ * back where it was. Popups are kept on screen when the window gets smaller.
+ */
+const FLOATS = ['ooze', 'relief', 'dmg', 'rlplace', 'dirpick', 'marr', 'orient', 'autorig', 'fitcheck', 'dlg-export', 'dlg-prefs', 'dlg-projects'];
+function floatFrame(el) {
+  const fixed = getComputedStyle(el).position === 'fixed', par = fixed ? null : el.offsetParent;
+  return par ? par.getBoundingClientRect() : { left: 0, top: 0, width: innerWidth, height: innerHeight };
+}
+function floatPin(el) {                                          // from wherever CSS put it to plain left/top, so it can move
+  const r = el.getBoundingClientRect(), f = floatFrame(el);
+  Object.assign(el.style, { left: `${r.left - f.left}px`, top: `${r.top - f.top}px`, right: 'auto', bottom: 'auto', transform: 'none', margin: '0' });
+}
+function floatClamp(el) {
+  if (el.hidden || !el.style.left) return;
+  const f = floatFrame(el), r = el.getBoundingClientRect();
+  if (el.style.height && r.height > f.height - 8) el.style.height = `${Math.max(120, f.height - 8)}px`;
+  if (el.style.width && r.width > f.width - 8) el.style.width = `${Math.max(220, f.width - 8)}px`;
+  const w = el.getBoundingClientRect().width, x = parseFloat(el.style.left) || 0, y = parseFloat(el.style.top) || 0;
+  el.style.left = `${Math.min(Math.max(x, 60 - w), f.width - 60)}px`; el.style.top = `${Math.min(Math.max(y, 0), f.height - 36)}px`;
+  // no taller than the room below it (it scrolls inside instead), so its corner stays where you can grab it
+  const room = f.height - (parseFloat(el.style.top) || 0) - 8;
+  if (el.style.height) { if (parseFloat(el.style.height) > room) el.style.height = `${Math.max(120, room)}px`; }
+  else el.style.maxHeight = `${Math.max(120, room)}px`;
+}
+function floatSave(el) {
+  try { localStorage.setItem('kitbash-pop-' + el.id, JSON.stringify({ left: el.style.left, top: el.style.top, width: el.style.width, height: el.style.height })); } catch (e) {}
+}
+function floatRestore(el) {
+  let s = null; try { s = JSON.parse(localStorage.getItem('kitbash-pop-' + el.id) || 'null'); } catch (e) {}
+  if (!s) return;
+  if (s.left) Object.assign(el.style, { left: s.left, top: s.top, right: 'auto', bottom: 'auto', transform: 'none', margin: '0' });
+  if (s.width) Object.assign(el.style, { width: s.width, maxWidth: 'none' });
+  if (s.height) Object.assign(el.style, { height: s.height, maxHeight: 'none' });
+  floatClamp(el);
+}
+function floatReset(el) {
+  for (const k of ['left', 'top', 'right', 'bottom', 'transform', 'margin', 'width', 'height', 'maxWidth', 'maxHeight']) el.style[k] = '';
+  try { localStorage.removeItem('kitbash-pop-' + el.id); } catch (e) {}
+}
+function floatFront(el) { document.querySelectorAll('.float-front').forEach(x => x !== el && x.classList.remove('float-front')); el.classList.add('float-front'); }
+function bindFloating() {
+  for (const id of FLOATS) {
+    const el = document.getElementById(id); if (!el) continue;
+    const handle = el.querySelector(':scope > header') || el.querySelector(':scope > b'); if (!handle) continue;
+    el.classList.add('floating'); handle.classList.add('float-handle'); handle.title ||= 'Drag to move it; double-click to put it back';
+    el.addEventListener('pointerdown', () => floatFront(el), true);
+    // move: drag the title bar (not its buttons)
+    handle.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.target.closest('button, input, select, a, label')) return;
+      e.preventDefault(); floatPin(el);
+      const x0 = e.clientX, y0 = e.clientY, l0 = parseFloat(el.style.left), t0 = parseFloat(el.style.top);
+      handle.setPointerCapture(e.pointerId); el.classList.add('float-moving');
+      const mv = ev => { el.style.left = `${l0 + ev.clientX - x0}px`; el.style.top = `${t0 + ev.clientY - y0}px`; floatClamp(el); };
+      const up = () => { handle.removeEventListener('pointermove', mv); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up); el.classList.remove('float-moving'); floatSave(el); };
+      handle.addEventListener('pointermove', mv); handle.addEventListener('pointerup', up); handle.addEventListener('pointercancel', up);
+    });
+    handle.addEventListener('dblclick', e => { if (e.target.closest('button, input, select, a, label')) return; floatReset(el); });
+    // resize: the grip in the bottom-right corner (it stays in view as the popup scrolls)
+    const grip = document.createElement('div'); grip.className = 'float-grip'; grip.title = 'Drag to resize'; grip.setAttribute('aria-hidden', 'true');
+    const knob = document.createElement('span'); grip.append(knob); el.append(grip);
+    knob.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return; e.preventDefault(); e.stopPropagation(); floatPin(el);
+      const r = el.getBoundingClientRect(), x0 = e.clientX, y0 = e.clientY;
+      knob.setPointerCapture(e.pointerId); el.classList.add('float-moving');
+      const mv = ev => { const f = floatFrame(el);
+        el.style.width = `${Math.min(Math.max(220, r.width + ev.clientX - x0), f.width - (r.left - f.left) - 4)}px`; el.style.maxWidth = 'none';
+        el.style.height = `${Math.min(Math.max(120, r.height + ev.clientY - y0), f.height - (r.top - f.top) - 4)}px`; el.style.maxHeight = 'none'; };
+      const up = () => { knob.removeEventListener('pointermove', mv); knob.removeEventListener('pointerup', up); knob.removeEventListener('pointercancel', up); el.classList.remove('float-moving'); floatSave(el); };
+      knob.addEventListener('pointermove', mv); knob.addEventListener('pointerup', up); knob.addEventListener('pointercancel', up);
+    });
+    // where you left it, each time it opens
+    new MutationObserver(() => { if (!el.hidden) requestAnimationFrame(() => { floatRestore(el); floatFront(el); }); }).observe(el, { attributes: true, attributeFilter: ['hidden'] });
+    if (!el.hidden) floatRestore(el);
+  }
+  addEventListener('resize', () => FLOATS.forEach(id => { const el = document.getElementById(id); if (el) floatClamp(el); }));
+}
+
 // ---- modifiers
 /*
  * Like Blender's modifier stack: a part keeps its mesh as it came in (its base), and a list of modifiers worked on it
@@ -4635,7 +4780,34 @@ function reliefReplace() {
  * ones after.
  */
 const modCache = new Map();                                      // part:modifier id → { inG, key, out }
-const MOD_NAMES = { crack: 'Crack & cave in', relief: 'Relief', scatter: 'Scatter', split: 'Split' };
+const MOD_NAMES = { crack: 'Crack & cave in', relief: 'Relief', scatter: 'Scatter', split: 'Split', clean: 'Clean out insides' };
+const CLEAN_DEFAULT = { pieces: 'all', open: 'outside', rays: 64 };
+/** The outside skin of a mesh and nothing inside it (worked out in the part's own frame). */
+async function cleanGeometry(m, g, mod) {
+  const soup = soupOfGeom(g, new THREE.Matrix4());
+  const r = await solidJob({ clean: { ...mod.p, soup } });
+  mod.stats = r.stats; return geomFromSoup(r.positions);
+}
+/** Add Clean out insides to a part's stack (or the selected one). */
+function startClean(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part to clean out first, then Clean out insides.', 'bad'); return; }
+  pushUndo(); ensureStack(m).push({ id: newModId(), type: 'clean', name: MOD_NAMES.clean, on: true, p: { ...CLEAN_DEFAULT } }); select(m);
+  toast(`Cleaning out ${m.name}… (a big messy mesh can take a minute)`);
+  evalStack(m).then(() => { const md = m.userData.part.mods?.at(-1); if (!md || md.type !== 'clean') return;
+    if (md.err) toast(`Couldn't clean it out: ${md.err}`, 'bad');
+    else toast(`${m.name} cleaned out: ${cleanSummary(md.stats)}. It's a modifier: change it, turn it off or Apply it in Properties › Modifiers.`, 'ok'); });
+}
+function cleanSummary(st) {
+  if (!st) return 'working it out…';
+  const k = n => n >= 1e4 ? Math.round(n / 1000) + 'k' : String(n), bits = [`${k(st.before)} → ${k(st.after)} triangles`];
+  if (st.inputShells > st.pieces) bits.push(`${st.inputShells} shells joined into ${st.pieces}`);
+  if (st.hollows) bits.push(`${st.hollows} sealed hollow${st.hollows === 1 ? '' : 's'} filled`);
+  if (st.piecesDropped) bits.push(`${st.piecesDropped} separate piece${st.piecesDropped === 1 ? '' : 's'} removed`);
+  const tri = n => `${k(n)} open triangle${n === 1 ? '' : 's'}`;
+  if (st.openDropped) bits.push(st.openChecked ? `${tri(st.openDropped)} inside removed` : `${tri(st.openDropped)} removed`);
+  if (st.openKept) bits.push(`${tri(st.openKept)} kept on the outside`);
+  return bits.join(', ');
+}
 function modKids(m, mod) { return (mod.kids || []).map(partById).filter(k => k && k.parent); }
 function storedGeom(m) { const pt = m.userData.part; return pt.base ? pt.base : { geometry: m.geometry, geomKey: pt.geomKey }; }
 function storedKey(m) { return storedGeom(m).geomKey; }
@@ -4675,6 +4847,7 @@ async function boolGeometry(m, g, kids, mode) {
 function modKey(m, mod) {
   if (mod.type === 'crack') return JSON.stringify([mod.p, mod.hit]);
   if (mod.type === 'split') return JSON.stringify([mod.p, mod.at]);
+  if (mod.type === 'clean') return JSON.stringify(mod.p);
   m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert();
   return mod.mode + '|' + modKids(m, mod).map(k => k.uuid + k.geometry.uuid + inv.clone().multiply(k.matrixWorld).elements.map(x => Math.round(x * 1e5)).join(',')).join('|');
 }
@@ -4685,6 +4858,7 @@ async function evalMod(m, mod, gIn) {
   let out = gIn;
   if (mod.type === 'crack') out = (await crackGeometry(m, gIn, mod.hit, mod.p)).geometry;
   else if (mod.type === 'split') out = (await splitGeometry(m, gIn, mod)).geometry;
+  else if (mod.type === 'clean') out = await cleanGeometry(m, gIn, mod);
   else if (mod.mode !== 'join') { const kids = modKids(m, mod); if (kids.length) out = await boolGeometry(m, gIn, kids, mod.mode); }
   modCache.set(ck, { inG: gIn, key, out }); return out;
 }
@@ -4786,10 +4960,11 @@ function modifierRows(p, el) {
   const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = 'Modifiers';
   const busy = document.createElement('span'); busy.id = 'mods-busy'; busy.className = 'mods-busy'; busy.textContent = ' working…'; busy.hidden = !pt.stackBusy; h.append(busy);
   const addSel = document.createElement('select'); addSel.className = 'num osel mods-add'; addSel.setAttribute('aria-label', 'Add a modifier');
-  for (const [v, t] of [['', 'Add modifier…'], ['crack', 'Crack & cave in'], ['split', 'Split / break in two'], ['relief', 'Relief from a picture'], ['scatter', 'Scatter parts over it']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; addSel.append(o); }
+  for (const [v, t] of [['', 'Add modifier…'], ['crack', 'Crack & cave in'], ['split', 'Split / break in two'], ['clean', 'Clean out insides'], ['relief', 'Relief from a picture'], ['scatter', 'Scatter parts over it']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; addSel.append(o); }
   addSel.addEventListener('change', () => { const v = addSel.value; addSel.value = '';
     if (v === 'crack') startCrack(p);
     else if (v === 'split') startSplit(p);
+    else if (v === 'clean') startClean(p);
     else if (v === 'relief') { toast(`Make the relief, then Place on a part… and click ${p.name}.`); openRelief(); }
     else if (v === 'scatter') toast(`Select the parts to scatter (Ctrl-click them), then Scatter… and click ${p.name}'s face.`); });
   h.append(addSel); sec.append(h);
@@ -4807,7 +4982,7 @@ function modifierRows(p, el) {
     const mk = (t, title, fn, dis = false) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'mini'; b.textContent = t; b.title = title; b.disabled = dis; b.addEventListener('click', fn); return b; };
     top.append(on, nm, mk('▲', 'Earlier in the stack', () => moveMod(p, mod, -1), i === 0), mk('▼', 'Later in the stack', () => moveMod(p, mod, 1), i === mods.length - 1),
       mk('Apply', i ? 'Make it part of the mesh for good (with the ones above it that are on)' : 'Make it part of the mesh for good', () => applyMod(p, mod)),
-      mk('✕', 'Remove it' + (mod.type === 'crack' ? '' : ' (and its parts)'), () => removeMod(p, mod)));
+      mk('✕', 'Remove it' + (mod.type === 'relief' || mod.type === 'scatter' ? ' (and its parts)' : ''), () => removeMod(p, mod)));
     card.append(top);
     if (mod.err) { const e = document.createElement('p'); e.className = 'note bad'; e.textContent = mod.err; card.append(e); }
     const grid = document.createElement('div'); grid.className = 'mod-grid'; card.append(grid);
@@ -4822,13 +4997,31 @@ function modifierRows(p, el) {
       const mid = document.createElement('select'); mid.className = 'num osel'; for (const [v, t] of [['dent', 'Caved in'], ['hole', 'Punched through']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; mid.append(o); }
       mid.value = q.hole ? 'hole' : 'dent'; mid.addEventListener('change', change(() => { q.hole = mid.value === 'hole'; })); row('Middle', mid);
       num('Middle size %', 'core', 5, 0, 80, 100);
-      const th = document.createElement('input'); th.type = 'checkbox'; th.checked = !!q.through; th.addEventListener('change', change(() => { q.through = th.checked; }));
-      const tl = document.createElement('label'); tl.className = 'check'; tl.append(th, ' Break right through'); row('', tl);
-      if (!q.through) num('Hold together mm', 'skin', 0.05, 0.02, 10, 1, 'Left uncracked at the back so it holds together');
+      const goes = document.createElement('select'); goes.className = 'num osel'; for (const [v, t] of [['through', 'Through the part'], ['surface', 'Surface only']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; goes.append(o); }
+      goes.value = q.surface ? 'surface' : 'through'; goes.addEventListener('change', change(() => { q.surface = goes.value === 'surface'; q.crackDepth ??= 1; q.effectDepth ??= 0.6; }));
+      row('Goes', goes, 'Surface only: just a layer at the top breaks up and caves in; the part underneath stays whole');
+      if (q.surface) {
+        num('Crack depth mm', 'crackDepth', 0.1, 0.05, 50, 1, 'How deep the cracks cut in from the surface, at most');
+        num('Effect depth mm', 'effectDepth', 0.1, 0.05, 50, 1, 'How thick the layer is that breaks into slabs and caves in');
+      } else {
+        const th = document.createElement('input'); th.type = 'checkbox'; th.checked = !!q.through; th.addEventListener('change', change(() => { q.through = th.checked; }));
+        const tl = document.createElement('label'); tl.className = 'check'; tl.append(th, ' Break right through'); row('', tl);
+        if (!q.through) num('Hold together mm', 'skin', 0.05, 0.02, 10, 1, 'Left uncracked at the back so it holds together');
+      }
       const btns = document.createElement('span'); btns.className = 'btnrow';
       btns.append(mk('Shuffle', 'A new crack pattern with the same settings', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })),
         mk('Move the hit', 'Click on the part where it got hit instead', () => { modHit = { m: p, mod }; toast(`Click where ${p.name} got hit.`); }));
       row('', btns);
+    } else if (mod.type === 'clean') {
+      const q = mod.p;
+      const sel = (label, key, opts, title = '') => { const e = document.createElement('select'); e.className = 'num osel'; for (const [v, t] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; e.append(o); }
+        e.value = String(q[key]); e.addEventListener('change', change(() => { q[key] = key === 'rays' ? +e.value : e.value; })); row(label, e, title); };
+      sel('Keep', 'pieces', [['all', 'Every outside piece'], ['largest', 'Biggest piece only']], 'Biggest piece only: just the main body, nothing else (separate bits and open bits go too)');
+      if (q.pieces !== 'largest') {
+        sel('Open bits', 'open', [['outside', 'Keep the ones outside'], ['drop', 'Remove them all']], "Triangles that aren't part of a closed solid (open sheets, broken shells): kept where they can be seen from outside, or all removed");
+        if (q.open !== 'drop') sel('Check', 'rays', [['32', 'Quick'], ['64', 'Normal'], ['128', 'Thorough']], 'How hard it looks for a way out from each open triangle: Thorough keeps more of the deep crevices, and takes longer');
+      }
+      const info = document.createElement('span'); info.className = 'note'; info.textContent = cleanSummary(mod.stats); row('Result', info);
     } else if (mod.type === 'split') {
       const q = mod.p;
       const sel = (label, key, opts, title = '') => { const e = document.createElement('select'); e.className = 'num osel'; for (const [v, t] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; e.append(o); }
@@ -4960,6 +5153,149 @@ async function editPlacement(t, mod, { shuffle = false } = {}) {
   reliefReplace();
 }
 
+// ---- ooze & growths: organic strands strung between spots clicked on the parts
+/*
+ * Click spots on any parts, one after another, and an ooze is strung between them: drooping, lumpy, with pustules,
+ * drips and a splat where it sticks. It's a part of its own, fixed to the part it starts on; the spots are kept (on
+ * the parts they're on), so Change ooze… opens it again to add spots or change how it looks, and it follows those
+ * parts if they've moved.
+ */
+let oz = null;   // { m (the ooze part, once there is one), anchors: [{ part, pL, nL }], seed, before, running, again, marks }
+const OZ_IDS = ['oz-thick', 'oz-lumpy', 'oz-sag', 'oz-strands', 'oz-twist', 'oz-pust', 'oz-pustsize', 'oz-pustsurf', 'oz-drips', 'oz-driplen', 'oz-splat', 'oz-detail', 'oz-web', 'oz-webth', 'oz-webholes', 'oz-web-joint', 'oz-web-strand', 'oz-web-surf', 'oz-stretch', 'oz-threads', 'oz-threadth', 'oz-cell'];
+function oozeParams() {
+  const n = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
+  return { thick: Math.max(0.2, n('oz-thick', 1.2)), lumpy: Math.min(1, Math.max(0, n('oz-lumpy', 45) / 100)), sag: Math.min(1, Math.max(0, n('oz-sag', 35) / 100)),
+    strands: Math.round(Math.min(4, Math.max(1, n('oz-strands', 1)))), twist: Math.max(0, n('oz-twist', 1)), pustules: Math.max(0, n('oz-pust', 3)),
+    drips: Math.round(Math.max(0, n('oz-drips', 2))), dripLen: Math.max(0.2, n('oz-driplen', 3)), splat: Math.max(0, n('oz-splat', 2.5)), detail: Math.max(0.05, n('oz-detail', 0.2)),
+    pustSize: Math.max(0.1, n('oz-pustsize', 100) / 100), pustSurf: Math.round(Math.max(0, n('oz-pustsurf', 0))),
+    webJoint: $('oz-web-joint').checked, webStrand: $('oz-web-strand').checked, webSurf: $('oz-web-surf').checked,
+    web: Math.min(1, Math.max(0.05, n('oz-web', 50) / 100)), webTh: Math.max(0.1, n('oz-webth', 0.4)), webHoles: Math.min(0.95, Math.max(0, n('oz-webholes', 30) / 100)),
+    stretch: Math.min(0.95, Math.max(0, n('oz-stretch', 0) / 100)), threads: Math.round(Math.max(0, n('oz-threads', 0))), threadTh: Math.max(0.1, n('oz-threadth', 0.25)),
+    webStyle: document.querySelector('#oz-webstyle [aria-pressed="true"]')?.dataset.v || 'torn', cell: Math.max(0.3, n('oz-cell', 2.2)) };
+}
+function setOozeParams(q) {
+  const v = { 'oz-thick': q.thick, 'oz-lumpy': q.lumpy * 100, 'oz-sag': q.sag * 100, 'oz-strands': q.strands, 'oz-twist': q.twist, 'oz-pust': q.pustules, 'oz-drips': q.drips, 'oz-driplen': q.dripLen, 'oz-splat': q.splat, 'oz-detail': q.detail,
+    'oz-pustsize': (q.pustSize ?? 1) * 100, 'oz-pustsurf': q.pustSurf ?? 0, 'oz-web': (q.web ?? 0.5) * 100, 'oz-webth': q.webTh ?? 0.4, 'oz-webholes': (q.webHoles ?? 0.3) * 100,
+    'oz-stretch': (q.stretch ?? 0) * 100, 'oz-threads': q.threads ?? 0, 'oz-threadth': q.threadTh ?? 0.25, 'oz-cell': q.cell ?? 2.2 };
+  document.querySelectorAll('#oz-webstyle button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === (q.webStyle || 'torn'))));
+  for (const [id, x] of Object.entries(v)) if (x != null) $(id).value = +(+x).toFixed(3);
+  $('oz-web-joint').checked = !!q.webJoint; $('oz-web-strand').checked = !!q.webStrand; $('oz-web-surf').checked = !!q.webSurf; syncOozeRows();
+}
+const ozMarks = new THREE.Group(); scene.add(ozMarks);
+const ozMarkMat = new THREE.MeshBasicMaterial({ color: '#9be36b', depthTest: false, transparent: true, opacity: 0.9 });
+function oozeMarks() {
+  while (ozMarks.children.length) ozMarks.children.pop();
+  if (!oz) return;
+  const r = Math.max(0.25, (+$('oz-thick').value || 1.2) * 0.35);
+  for (const a of oozeWorld()) { const s = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 8), ozMarkMat); s.position.fromArray(a.p); s.renderOrder = 999; ozMarks.add(s); }
+}
+/** The spots as they are now, in world space (each rides on its part). */
+function oozeWorld() {
+  const out = [];
+  for (const a of oz.anchors) { const m = partById(a.part); if (!m) continue; m.updateMatrixWorld(true);
+    out.push({ p: V().fromArray(a.pL).applyMatrix4(m.matrixWorld).toArray(), n: V().fromArray(a.nL).transformDirection(m.matrixWorld).normalize().toArray() }); }
+  return out;
+}
+function startOoze(m = null) {
+  endCrack(false); endReliefPlace(false); endOoze(false);
+  const kept = m?.userData.part.ooze;
+  oz = { m: kept ? m : null, anchors: kept ? JSON.parse(JSON.stringify(kept.anchors)) : [], seed: kept?.seed ?? ((Math.random() * 2 ** 31) | 0), before: snapshot() };
+  if (kept) setOozeParams(kept.params);
+  $('ooze').hidden = false; $('oz-title').textContent = kept ? `Change ${m.name}` : 'Ooze & growths';
+  $('oz-note').textContent = kept ? 'Click more spots to carry it on; change how it looks below; then Done.' : 'Click spots on the parts to string it between, one after another (two or more). Backspace takes the last one off.';
+  oozeStatus(''); oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2;
+  if (kept) oozeRedo();
+}
+function endOoze(keep = true) {
+  if (!oz) return;
+  if (!keep) { restore(oz.before); afterHierarchyChange(); }
+  oz = null; $('ooze').hidden = true; oozeMarks();
+}
+function oozeStatus(t) { $('oz-status').textContent = t; $('oz-status').hidden = !t; }
+function oozeClick(hit) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  if (hit.object === oz.m) { toast('Click on a part to stick it to, not on the ooze itself.'); return; }
+  const t = hit.object; t.updateMatrixWorld(true);
+  const n = hitNormal(hit); if (n.dot(camera.position.clone().sub(hit.point)) < 0) n.negate();
+  const inv = t.matrixWorld.clone().invert();
+  oz.anchors.push({ part: t.uuid, pL: hit.point.clone().applyMatrix4(inv).toArray(), nL: n.clone().transformDirection(inv).toArray() });
+  oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2;
+  if (oz.anchors.length < 2) { oozeStatus('One spot. Click the next one to string it to.'); return; }
+  oozeRedo();
+}
+function oozeUndo() {
+  if (!oz?.anchors.length) return;
+  oz.anchors.pop(); oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2;
+  if (oz.anchors.length >= 2) oozeRedo();
+  else if (oz.m) { oz.m.visible = false; oozeStatus('Click another spot to string it to.'); }
+}
+function oozeRedo() {
+  if (!oz || oz.anchors.length < 2) return;
+  const me = oz; if (me.running) { me.again = true; return; }
+  me.running = true; $('oz-done').disabled = true;
+  applyOoze().catch(e => { console.warn(e); oozeStatus(`Couldn't make it: ${e.message || e}`); })
+    .finally(() => { me.running = false; if (oz !== me) return; $('oz-done').disabled = me.anchors.length < 2; if (me.again) { me.again = false; oozeRedo(); } });
+}
+async function applyOoze() {
+  const me = oz, anchors = oozeWorld(); if (anchors.length < 2) return;
+  oozeStatus(`Growing it between ${anchors.length} spots…`);
+  const q = oozeParams();
+  // pustules on the surfaces: spots found on each part round where it sticks (so none hang off an edge)
+  if (q.pustSurf > 0) {
+    const rc = new THREE.Raycaster(); rc.firstHitOnly = true;
+    me.anchors.forEach((an, i) => {
+      const part = partById(an.part), a = anchors[i]; if (!part || !a) return;
+      const rnd = mulberry(me.seed + 7919 * (i + 1)), n = V().fromArray(a.n), P = V().fromArray(a.p), want = Math.round(q.pustSurf * (0.6 + rnd() * 0.8)), surf = [];
+      let x = n.clone().cross(V(0, 0, 1)); if (x.lengthSq() < 1e-6) x = n.clone().cross(V(1, 0, 0)); x.normalize(); const y = n.clone().cross(x);
+      for (let k = 0; k < want * 6 && surf.length < want; k++) {
+        const ang = rnd() * 2 * Math.PI, rr = Math.max(q.thick * 0.6, q.splat) * (0.5 + rnd() * 1.1), o = P.clone().addScaledVector(x, Math.cos(ang) * rr).addScaledVector(y, Math.sin(ang) * rr);
+        rc.set(o.clone().addScaledVector(n, 3), n.clone().negate()); rc.far = 6; const h = rc.intersectObject(part, false)[0]; if (!h) continue;
+        const hn = hitNormal(h); if (hn.dot(n) < 0.3) continue;
+        surf.push({ p: h.point.toArray(), n: hn.toArray() });
+      }
+      a.surf = surf;
+    });
+  }
+  const r = await solidJob({ ooze: { ...q, anchors, down: [0, 0, -1], seed: me.seed } });
+  if (oz !== me) return;
+  let m = me.m;
+  if (!m) { m = addPart(liveParts().some(x => /^Ooze( \d+)?$/.test(x.name)) ? nextName('Ooze') : 'Ooze', geomFromSoup(r.positions), { welded: true, color: '#7d9a3e' }); me.m = m; }
+  else {
+    m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert(), out = r.positions, v = V();       // into the ooze's own frame
+    for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(inv); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+    const g = geomFromSoup(out), pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m);
+  }
+  m.visible = true; afterHierarchyChange();
+  oozeStatus(`${anchors.length} spots · ${Math.round(m.userData.part.tris / 1000)}k triangles${r.edge > q.detail + 1e-6 ? ` · detail ${r.edge.toFixed(2)} mm (it's big, so a little coarser)` : ''}` +
+    (r.webTh && r.webTh > q.webTh + 1e-6 ? ` · webbing ${r.webTh.toFixed(2)} mm thick (as thin as this detail can show; a smaller Detail lets it be thinner)` : ''));
+}
+function syncOozeRows() {
+  const any = $('oz-web-joint').checked || $('oz-web-strand').checked || $('oz-web-surf').checked; document.querySelectorAll('#ooze .oz-webbed').forEach(e => { e.hidden = !any; });
+  document.querySelectorAll('#ooze .oz-net').forEach(e => { e.hidden = document.querySelector('#oz-webstyle [aria-pressed="true"]')?.dataset.v !== 'net'; });
+}
+// looks to start from
+const OOZE_LOOKS = {
+  ooze: { thick: 1.2, lumpy: 0.45, sag: 0.35, stretch: 0, strands: 1, twist: 1, pustules: 3, pustSize: 1, pustSurf: 0, drips: 2, dripLen: 3, splat: 2.5, detail: 0.2, threads: 0, threadTh: 0.25, webJoint: false, webStrand: false, webSurf: false, web: 0.5, webTh: 0.4, webHoles: 0.3, webStyle: 'torn', cell: 2.2 },
+  slime: { thick: 0.6, lumpy: 0.15, sag: 0.2, stretch: 0.8, strands: 1, twist: 0, pustules: 0, pustSize: 1, pustSurf: 0, drips: 1, dripLen: 2, splat: 1.4, detail: 0.12, threads: 3, threadTh: 0.22, webJoint: true, webStrand: false, webSurf: false, web: 0.9, webTh: 0.25, webHoles: 0.75, webStyle: 'net', cell: 2.2 },
+  growth: { thick: 2, lumpy: 0.9, sag: 0.15, stretch: 0, strands: 3, twist: 0.6, pustules: 8, pustSize: 1.4, pustSurf: 8, drips: 0, dripLen: 2, splat: 3.5, detail: 0.2, threads: 0, threadTh: 0.25, webJoint: false, webStrand: true, webSurf: true, web: 0.6, webTh: 0.4, webHoles: 0.2, webStyle: 'torn', cell: 2.2 },
+};
+function bindOoze() {
+  OZ_IDS.forEach(id => $(id).addEventListener('change', () => { syncOozeRows(); oozeMarks(); oozeRedo(); })); syncOozeRows();
+  document.querySelectorAll('#oz-webstyle button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#oz-webstyle button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncOozeRows(); oozeRedo(); }));
+  $('oz-preset').addEventListener('change', () => { const L = OOZE_LOOKS[$('oz-preset').value]; $('oz-preset').value = ''; if (!L) return; setOozeParams(L); oozeMarks(); oozeRedo(); });
+  $('oz-undo').addEventListener('click', oozeUndo);
+  $('oz-shuffle').addEventListener('click', () => { if (!oz) return; oz.seed = (Math.random() * 2 ** 31) | 0; oozeRedo(); });
+  $('oz-done').addEventListener('click', () => {
+    if (!oz?.m || oz.running || oz.anchors.length < 2) return;
+    const m = oz.m, first = partById(oz.anchors[0].part);
+    m.userData.part.ooze = { anchors: JSON.parse(JSON.stringify(oz.anchors)), params: oozeParams(), seed: oz.seed };
+    if (first && m.parent !== first) { detach(m); first.attach(m); }         // it rides on the part it starts from
+    pushUndo(oz.before); endOoze(true); afterHierarchyChange(); select(m);
+    toast(`${m.name} is on, fixed to ${first?.name || 'the bench'}. Change ooze… in its Properties opens it again.`, 'ok');
+  });
+  $('oz-cancel').addEventListener('click', () => { endOoze(false); toast('No ooze.'); });
+}
+
 // ---- crack & cave in
 /*
  * A part made to look punched: click where it got hit, and round that spot it's cracked into slabs (rings round the
@@ -4982,7 +5318,12 @@ function endCrack(keep = true) {
   dm = null; $('dmg').hidden = true;
 }
 function dmStatus(t) { $('dm-status').textContent = t; $('dm-status').hidden = !t; }
-function syncDmRows() { document.querySelectorAll('#dmg .dm-held').forEach(e => { e.hidden = $('dm-through').checked; }); }
+function syncDmRows() {
+  const surf = document.querySelector('#dm-goes [aria-pressed="true"]')?.dataset.v === 'surface';
+  document.querySelectorAll('#dmg .dm-thru').forEach(e => { e.hidden = surf; });
+  document.querySelectorAll('#dmg .dm-surf').forEach(e => { e.hidden = !surf; });
+  if (!surf) document.querySelectorAll('#dmg .dm-held').forEach(e => { e.hidden = $('dm-through').checked; });
+}
 function crackClick(hit, ev) {
   if (!hit) { toast('Click a spot on a part.'); return; }
   const m = hit.object;
@@ -5018,7 +5359,8 @@ function crackCardParams(seed) {
   return { radius: Math.max(0.3, num('dm-r', 5)), depth: Math.max(0, num('dm-d', 1)), rings: Math.round(num('dm-rings', 3)), cracks: Math.round(num('dm-cracks', 7)),
     width: Math.max(0.02, num('dm-w', 0.25)), jag: Math.min(1, Math.max(0, num('dm-jag', 60) / 100)), tumble: Math.max(0, num('dm-tum', 8)), spider: Math.max(0, num('dm-sp', 60) / 100),
     hole: document.querySelector('#dm-mid [aria-pressed="true"]')?.dataset.v === 'hole', core: Math.min(0.8, Math.max(0, num('dm-core', 25) / 100)),
-    through: $('dm-through').checked, skin: Math.max(0.02, num('dm-skin', 0.4)), seed };
+    through: $('dm-through').checked, skin: Math.max(0.02, num('dm-skin', 0.4)), seed,
+    surface: document.querySelector('#dm-goes [aria-pressed="true"]')?.dataset.v === 'surface', crackDepth: Math.max(0.05, num('dm-cdepth', 1)), effectDepth: Math.max(0.05, num('dm-edepth', 0.6)) };
 }
 const dmHit = me => ({ pL: me.pL.toArray(), nL: me.nL.toArray(), right: me.right.toArray(), thick: me.thick });
 async function applyCrack() {
@@ -5028,12 +5370,14 @@ async function applyCrack() {
   if (dm !== me) return;
   const g = r.geometry, pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null;
   refreshPaint(m); afterHierarchyChange();
-  dmStatus(`${r.slabs} slab${r.slabs === 1 ? '' : 's'}` + (p.through ? `, broken right through: ${r.shells} separate piece${r.shells === 1 ? '' : 's'}` : ', held together at the back') + ` · ${Math.round(pt.tris / 1000)}k triangles`);
+  dmStatus(`${r.slabs} slab${r.slabs === 1 ? '' : 's'}` + (p.surface ? `, a ${p.effectDepth} mm layer at the surface, cracks up to ${p.crackDepth} mm deep` : p.through ? `, broken right through: ${r.shells} separate piece${r.shells === 1 ? '' : 's'}` : ', held together at the back') + ` · ${Math.round(pt.tris / 1000)}k triangles`);
 }
 function bindCrack() {
   const re = () => crackRedo();
   ['dm-r', 'dm-d', 'dm-rings', 'dm-cracks', 'dm-w', 'dm-jag', 'dm-tum', 'dm-sp', 'dm-core', 'dm-skin'].forEach(id => $(id).addEventListener('change', re));
   $('dm-through').addEventListener('change', () => { syncDmRows(); re(); });
+  ['dm-cdepth', 'dm-edepth'].forEach(id => $(id).addEventListener('change', re));
+  document.querySelectorAll('#dm-goes button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#dm-goes button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncDmRows(); re(); }));
   document.querySelectorAll('#dm-mid button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#dm-mid button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); re(); }));
   $('dm-shuffle').addEventListener('click', () => { if (!dm) return; dm.seed = (Math.random() * 2 ** 31) | 0; re(); });
   // Done: it goes on the part as a Crack modifier, to turn off, change or apply later
@@ -5483,7 +5827,7 @@ const nextFrame = () => new Promise(r => { let done = false; const go = () => { 
 async function loadGroup(entries, src, opts = {}) {
   pushUndo(); lastOp = null; closeAutorig(false);
   const progress = opts.progress || (() => {});
-  const loader = new STLLoader(), added = [], failed = [], counted = []; let copies = 0;
+  const loader = new STLLoader(), added = [], failed = [], counted = [], mirrored = []; let copies = 0;
   for (const [k, e] of entries.entries()) {
     e.state = 'loading'; renderFolderStatus();
     toast(`Loading ${k + 1} of ${entries.length}: ${e.name}`); progress(k / entries.length, `Reading ${e.name} (${k + 1} of ${entries.length})`);
@@ -5492,7 +5836,9 @@ async function loadGroup(entries, src, opts = {}) {
       const geom = loader.parse(await e.file.arrayBuffer());
       if (!geom.attributes.position || geom.attributes.position.count < 3) throw new Error('empty');
       const q = $('set-qty').checked ? parseQuantity(e.name) : { base: e.name, count: 1 };
-      const m = addPart(q.count > 1 ? `${q.base} 1-${q.count}` : e.name, geom);
+      const mi = $('set-mirror').checked ? parseMirror(q.base) : { mirror: false };      // "Arm (mirror for right)": one as it is, one mirrored
+      if (mi.mirror) q.base = mi.base;
+      const m = addPart(q.count > 1 ? `${q.base} 1-${q.count}` : mi.mirror ? q.base : e.name, geom);
       m.userData.part.source = src ? { folder: src.id, path: e.path } : null;
       if (src?.offset) applyWorld(m, Tr(src.offset));
       e.partId = m.uuid; e.state = 'loaded'; added.push(m);
@@ -5502,11 +5848,20 @@ async function loadGroup(entries, src, opts = {}) {
         added.push(c); copies++;
       }
       if (q.count > 1) counted.push(`${q.base} ×${q.count}`);
+      if (mi.mirror) {                                     // each copy gets a mirrored twin, sharing one flipped mesh
+        const mg = mirroredGeometry(m.geometry, $('set-mirror-axis').value), key = THREE.MathUtils.generateUUID(), twins = added.slice(-q.count);
+        for (const o of twins) {
+          const c = addPart(mirrorCopyName(o.name, mi.forName), mg, { welded: true, geomKey: key, color: o.userData.part.color });
+          c.userData.part.source = o.userData.part.source; c.matrix.copy(o.matrix); c.matrix.decompose(c.position, c.quaternion, c.scale);
+          added.push(c); copies++;
+        }
+        mirrored.push(mi.forName ? `${q.base} (for ${mi.forName})` : q.base);
+      }
     } catch (err) { e.state = 'failed'; failed.push(e.name); }
     renderFolderStatus();
   }
   if (!added.length) { afterHierarchyChange(); toast(`Couldn't read ${failed.join(', ')}. Check they're valid STL files.`, 'bad'); return; }
-  const copyNote = counted.length ? ` Made copies from the file names: ${counted.join(', ')}.` : '';
+  const copyNote = (counted.length ? ` Made copies from the file names: ${counted.join(', ')}.` : '') + (mirrored.length ? ` Mirrored copies, as the file names ask: ${mirrored.join(', ')}.` : '');
   const mode = opts.mode || 'auto';
   // a kit on sprues: every new piece goes on the plastic
   if (mode === 'kit') {
@@ -6412,6 +6767,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
   if (moved > 5) return;                          // that was an orbit drag
   if (dirPick) { dirPickClick(raycast(e)); return; }  // picking faces for a direction
+  if (oz) { oozeClick(raycast(e)); return; }                           // stringing ooze between spots
   if (modHit) { modHitClick(raycast(e), e); return; }                // a crack modifier's new hit
   if (dm) { crackClick(raycast(e), e); return; }                      // cracking: where it got hit
   if (rp) { reliefPlaceClick(raycast(e), e.shiftKey); return; }                   // placing a relief, or sliding it along the face
@@ -6740,6 +7096,8 @@ window.addEventListener('keydown', e => {
   if (e.shiftKey && k === 'm') { openMarr('mirror'); return; }
   if (e.shiftKey && k === 'a') { openMarr('linear'); return; }
   if (k === 'escape' && dirPick) { cancelDirPick(); return; }
+  if (oz && k === 'escape') { endOoze(false); toast('No ooze.'); return; }
+  if (oz && k === 'backspace') { e.preventDefault(); oozeUndo(); return; }
   if (k === 'escape' && dm) { endCrack(false); toast('Left it as it was.'); return; }
   if (k === 'escape' && rp) { endReliefPlace(false); toast('Left the relief where it was.'); return; }
   if (k === 'escape' && !$('marr').hidden) { if (marr.picking) { marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false'); } else closeMarr(); return; }
@@ -6771,7 +7129,7 @@ function rebuildPickFx() {
 // ---------------------------------------------------------------------------
 // Projects: autosave to this browser (IndexedDB) and project files (.zip)
 // ---------------------------------------------------------------------------
-const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-loose', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
+const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-mirror', 'set-mirror-axis', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-loose', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
 const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
 let idb = null;
 const idbReady = new Promise(res => {
@@ -6800,7 +7158,7 @@ function serializeProject() {
     parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
       geom: storedKey(m), tris: m.userData.part.tris, parent: parentId(m), ...tr(m),
       mods: m.userData.part.mods?.length ? JSON.parse(JSON.stringify(m.userData.part.mods, (k, v) => k === 'err' ? undefined : v)) : undefined,
-      owner: m.userData.part.owner || undefined, relief: m.userData.part.relief ? encodeRelief(m.userData.part.relief) || undefined : undefined })),
+      owner: m.userData.part.owner || undefined, ooze: m.userData.part.ooze || undefined, relief: m.userData.part.relief ? encodeRelief(m.userData.part.relief) || undefined : undefined })),
     joints: joints.filter(j => j.parent).map(j => { const jd = j.userData.joint; return { id: j.uuid, parent: parentId(j), size: jd.size, rest: jd.rest.toArray(),
       type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, axisName: jd.axisName || '', pointOff: jd.pointOff || null, partOff: jd.partOff || null, ...tr(j) }; }),
     links: JSON.parse(JSON.stringify(links)),
@@ -6842,6 +7200,7 @@ function buildProject(data, geoms, paints = new Map()) {
     const pt = m.userData.part, pb = paints.get(p.id); pt.fill = p.fill || null;
     if (p.mods?.length) { pt.base = { geometry: g, geomKey: p.geom }; pt.mods = JSON.parse(JSON.stringify(p.mods)); }
     if (p.owner) pt.owner = p.owner;
+    if (p.ooze) pt.ooze = p.ooze;
     if (p.relief) pt.relief = decodeRelief(p.relief);
     if (pb && pb.byteLength === g.attributes.position.count * 4) { pt.paint = new Uint8Array(pb.slice(0)); pt.paintVer = pt.paintSaved = 1; }
     refreshPaint(m);
@@ -7082,6 +7441,8 @@ function bindChrome() {
   on('menu-scatter', () => startScatter());
   on('menu-crack', () => startCrack());
   on('menu-split', () => startSplit());
+  on('menu-clean', () => startClean());
+  on('menu-ooze', () => startOoze());
   on('menu-mirror', () => openMarr('mirror')); on('menu-array', () => openMarr('linear'));
   on('menu-addref', () => $('ref-input').click());
   on('menu-relief', () => openRelief());
@@ -7111,7 +7472,31 @@ function bindChrome() {
     else if (k === 'e') { e.preventDefault(); if (liveParts().length) openDialog('dlg-export'); }
     else if (k === ',') { e.preventDefault(); openDialog('dlg-prefs'); }
   });
+  bindWorkspaces();
   syncOptbar();
+}
+function bindWorkspaces() {
+  const order = Object.keys(WS_NAMES);
+  document.querySelectorAll('.wstab').forEach(t => {
+    t.addEventListener('click', () => setWorkspace(t.dataset.ws));
+    t.addEventListener('keydown', e => { if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return; e.preventDefault();
+      const i = order.indexOf(workspace), n = order[(i + (e.key === 'ArrowRight' ? 1 : -1) + order.length) % order.length]; setWorkspace(n); $('ws-' + n).focus(); });
+  });
+  const custom = {
+    'ws-paint': () => setTool('paint'), 'ws-magnet': () => setTool('MAGNET'),
+    'ws-drop': () => { const list = selection.length ? selection : selected ? [selected] : []; if (!list.length) return; pushUndo(); for (const p of list) applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); toast(`Dropped ${list.length === 1 ? list[0].name : list.length + ' parts'} onto the mat.`); },
+    'ws-square': () => { if (selected) openOrient(selected, { kind: 'auto' }); },
+    'ws-sets': () => showDockTab('tab-opts'),
+  };
+  document.querySelectorAll('.wsop[data-click]').forEach(b => b.addEventListener('click', () => { const id = b.dataset.click; if (custom[id]) custom[id](); else $(id)?.click(); syncWsOps(); }));
+  // the buttons follow the menu items they stand for
+  const mo = new MutationObserver(() => syncWsOps());
+  for (const id of new Set([...document.querySelectorAll('.wsop[data-click]')].map(b => b.dataset.click))) { const t = $(id); if (t) mo.observe(t, { attributes: true, attributeFilter: ['disabled', 'aria-checked', 'aria-pressed'] }); }
+  mo.observe($('exp-sprue-f'), { attributes: true, attributeFilter: ['hidden'] });
+  // F1–F5 switch workspace
+  window.addEventListener('keydown', e => { const m = /^F([1-5])$/.exec(e.key); if (!m || e.ctrlKey || e.metaKey || e.altKey) return; e.preventDefault(); setWorkspace(order[+m[1] - 1]); });
+  let saved = null; try { saved = localStorage.getItem('kitbash-ws'); } catch (e) {}
+  setWorkspace(saved || 'assemble', { quiet: true });
 }
 
 function bindProject() {
@@ -7137,7 +7522,7 @@ function resize() {
 }
 new ResizeObserver(resize).observe(view);
 bindAdjust();
-bindFit(); bindDirPick(); bindCrack(); bindRelief();
+bindFit(); bindDirPick(); bindCrack(); bindRelief(); bindOoze(); bindFloating();
 document.querySelectorAll('#move-frame button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === moveFrame)); b.addEventListener('click', () => setMoveFrame(b.dataset.v)); });
 document.querySelectorAll('#pose-mode button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)); b.addEventListener('click', () => setPoseMode(b.dataset.v)); });
 bindProject();
@@ -7169,4 +7554,4 @@ $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   
 })();
 renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
 // automated tests only (a query string never reaches the page inside claude.ai)
-if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf, get rp() { return rp; } }; }
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf, get rp() { return rp; }, get oz() { return oz; } }; }

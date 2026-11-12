@@ -5,15 +5,19 @@ import { mergeSolid } from './solid.js';
 import { buildRelief } from './relief.js';
 import { buildCrack } from './crack.js';
 import { buildSplit } from './split.js';
+import { buildOoze } from './ooze.js';
+import { buildClean } from './clean.js';
 const ready = (async () => {
   const M = await Module({ locateFile: f => new URL('./vendor/' + f, import.meta.url).href }); M.setup(); return M;
 })();
 self.onmessage = async e => {
-  const { id, jobs, opts, relief, crack, split } = e.data;
+  const { id, jobs, opts, relief, crack, split, ooze, clean } = e.data;
   try {
     const M = await ready;
     if (relief) { const r = buildRelief(M, relief); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
     if (crack) { const r = buildCrack(M, crack); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
+    if (clean) { const r = buildClean(M, clean); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
+    if (ooze) { const r = buildOoze(M, ooze); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
     if (split) { const r = buildSplit(M, split); self.postMessage({ id, out: r }, [r.positions.buffer, r.sides.buffer]); return; }
     const out = jobs.map(j => mergeSolid(M, j.soups, { ...opts, subtract: j.subtract }));
     self.postMessage({ id, out }, out.map(r => r.positions.buffer));

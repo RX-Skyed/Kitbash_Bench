@@ -66,10 +66,11 @@ export function buildSplit(M, p) {
   const { Manifold, Mesh } = M;
   const trash = [], keep = x => { trash.push(x); return x; };
   try {
-    const clean = mergeSolid(M, [p.soup], { fillHollows: false, loose: 'drop' });
-    if (!clean.positions.length) throw new Error("the part isn't a closed solid");
-    const w0 = weld(clean.positions, 1e-6), mesh = new Mesh({ numProp: 3, vertProperties: w0.vert, triVerts: w0.tri }); mesh.merge();
-    const part = keep(new Manifold(mesh));
+    // nothing of the part is left out: separate pieces are cut too, and triangles that aren't part of any closed
+    // solid go to whichever side they're on, as they are
+    const clean = mergeSolid(M, [p.soup], { fillHollows: false, loose: 'keep', manifold: true });
+    if (!clean.solid) throw new Error("the part has no closed solid in it to cut");
+    const part = keep(clean.solid);
     if (part.status && part.status() !== 'NoError') throw new Error("the part isn't a closed solid");
     // where the part crosses the cut (fine squares there), and how far it reaches (coarse beyond)
     const A = Math.max(0, p.amp), band = A * 1.6 + p.kerf + 0.5, bb = part.boundingBox();
@@ -111,12 +112,21 @@ export function buildSplit(M, p) {
     if (p.gap) b = keep(b.translate([0, 0, p.gap]));
     const parts = (p.keep === 'a' ? [[a, 0]] : p.keep === 'b' ? [[b, 1]] : [[a, 0], [b, 1]]).filter(([x]) => !x.isEmpty());
     if (!parts.length) throw new Error('that side is empty: the cut misses the part');
+    // the stray triangles, sorted by side (by their middle), moved with side B
+    const S = clean.strays, strayA = [], strayB = [];
+    for (let i = 0; i < S.length; i += 9) { const z = (S[i + 2] + S[i + 5] + S[i + 8]) / 3, x = (S[i] + S[i + 3] + S[i + 6]) / 3, y = (S[i + 1] + S[i + 4] + S[i + 7]) / 3; (z < hf(x, y) * taper(x, y) + kerf / 2 ? strayA : strayB).push(i); }
+    const strays = (p.keep === 'a' ? [[strayA, 0]] : p.keep === 'b' ? [[strayB, 1]] : [[strayA, 0], [strayB, 1]]);
     let n = 0; for (const [x] of parts) n += x.getMesh().triVerts.length;
+    for (const [l] of strays) n += l.length * 3;
     const positions = new Float32Array(n * 3), sides = new Uint8Array(n / 3); let o = 0, t = 0;
     for (const [x, side] of parts) {
       const ms = x.getMesh(), V = ms.vertProperties, np = ms.numProp, T = ms.triVerts;
       for (let i = 0; i < T.length; i++) { const q = T[i] * np; positions[o++] = V[q]; positions[o++] = V[q + 1]; positions[o++] = V[q + 2]; }
       sides.fill(side, t, t + T.length / 3); t += T.length / 3;
+    }
+    for (const [l, side] of strays) {
+      const dz = side === 1 ? p.gap || 0 : 0;
+      for (const i of l) { for (let k = 0; k < 9; k++) positions[o++] = S[i + k] + (k % 3 === 2 ? dz : 0); sides[t++] = side; }
     }
     return { positions, sides };
   } finally { trash.forEach(x => { try { x.delete(); } catch (e) {} }); }

@@ -1771,6 +1771,21 @@ function parseQuantity(name) {
   return { base: base || name, count };
 }
 
+/**
+ * "Pauldron mirror", "Arm_L (mirror for R)", "Shin + mirror", "mirror for left leg": a file meant to be printed as it is
+ * and mirrored. → { base (the name without it), mirror, forName (what the mirrored one is for, if it says) }.
+ * "Mirror Shield" (mirror first, nothing after "for") is a name, not an instruction.
+ */
+function parseMirror(name) {
+  const re = /(^|[\s_\-.(\[+&])(?:(?:and|plus|\+|&)[\s_\-]*)?(mirror(?:ed)?)(?:[\s_\-]+(?:for|to|as)[\s_\-]+([^()\[\]]+?))?(?=$|[)\]]|[\s_\-.]*$)/i;
+  const m = name.match(re);
+  if (!m || (m.index === 0 && !m[1] && !m[3])) return { base: name, mirror: false, forName: null };
+  const forName = m[3] ? m[3].replace(/[_\-]+/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
+  const base = (name.slice(0, m.index) + m[1] + name.slice(m.index + m[0].length)).replace(/[\s_\-+&]*[(\[]\s*[)\]]/g, '')
+    .replace(/[\s_\-+&.]+$/, '').replace(/^[\s_\-+&.]+/, '').replace(/\s{2,}/g, ' ').trim();
+  return { base: base || name, mirror: true, forName };
+}
+
 /** A piece's name for its sprue tag: the file name, shortened in the middle part if needed; "Leg 3-8" keeps its count. */
 function shortLabel(name, max = 16) {
   const n = name.replace(/\.stl$/i, '').replace(/[_]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
@@ -1937,6 +1952,7 @@ export {
   patchMesh,
   multiFit,
   parseQuantity,
+  parseMirror,
   shortLabel,
   tagWidth,
   packSprues,

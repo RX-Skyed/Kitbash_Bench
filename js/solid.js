@@ -160,7 +160,7 @@ export function mergeSolid(M, soups, opts = {}) {
   };
   // shells first as strictly separate pieces; the ones that won't close are tried again joined to whatever they touch
   const failed = [];
-  for (const list of shells(tri, nv, true)) { if (list.length < 4 || !tryShell(list)) failed.push(...list); else inputShells++; }
+  for (const list of shells(tri, nv, true)) { if (list.length < 4 || !tryShell(list)) { for (const t of list) failed.push(t); } else inputShells++; }   // (one by one: a big shell is too many to spread)
   if (failed.length) {
     const sub = new Uint32Array(failed.length * 3); failed.forEach((t, i) => { sub[3 * i] = tri[3 * t]; sub[3 * i + 1] = tri[3 * t + 1]; sub[3 * i + 2] = tri[3 * t + 2]; });
     for (const l of shells(sub, nv)) { const list = l.map(i => failed[i]); inputShells++; if (list.length < 4 || !tryShell(list)) loose.push(list); }
@@ -220,6 +220,7 @@ export function mergeSolid(M, soups, opts = {}) {
   }
   // hollows: the result's inner shells face inwards (negative volume); filling one is just leaving it out
   let hollows = 0, hollowVolume = 0, hollowsLeft = 0, hollowLeftVolume = 0, shellsOut = 0, positions = new Float32Array(0), volume = 0;
+  let solid = null;
   if (out) {
     const { V, T } = R, keep = [], skip = new Set(opts.loose === 'drop' ? looseBits.map(b => b.part) : []);
     dropped = skip.size;
@@ -247,7 +248,14 @@ export function mergeSolid(M, soups, opts = {}) {
     }
     positions = new Float32Array(tris.length * 3); let o = 0;
     for (const v of tris) { const i = 3 * v; positions[o++] = V[i]; positions[o++] = V[i + 1]; positions[o++] = V[i + 2]; }
-    out.delete();
+    // opts.manifold: hand back the solid itself (the kept shells straight from Manifold, before any snapping), so a
+    // caller that goes on cutting it never has to rebuild it from triangles that may pinch
+    if (opts.manifold) {
+      let n2 = 0; for (const l of keep) n2 += l.length;
+      const kt = new Uint32Array(n2 * 3); let k = 0; for (const l of keep) for (const t of l) { kt[k++] = T[3 * t]; kt[k++] = T[3 * t + 1]; kt[k++] = T[3 * t + 2]; }
+      try { if (n2 === T.length / 3) throw 0; solid = new Manifold(new Mesh({ numProp: 3, vertProperties: V, triVerts: kt })); out.delete(); }
+      catch (e) { solid = out; }                          // every shell kept (or the subset wouldn't build): the whole result
+    } else out.delete();
     hollows += hollowsIn; hollowVolume += hollowsInVol;
   }
   // anything that couldn't be made solid goes through untouched
@@ -256,14 +264,15 @@ export function mergeSolid(M, soups, opts = {}) {
     const ux = vert[b] - vert[a], uy = vert[b + 1] - vert[a + 1], uz = vert[b + 2] - vert[a + 2], vx = vert[c] - vert[a], vy = vert[c + 1] - vert[a + 1], vz = vert[c + 2] - vert[a + 2];
     A += Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2; } return A; };
   loose = loose.filter(l => { if (area(l) < (opts.speck ?? 0.01)) { specks++; return false; } return true; });   // flecks of loose triangles: nothing to print
+  let strays = new Float32Array(0);
   if (loose.length) {
     let n = 0; for (const l of loose) n += l.length;
     const p2 = new Float32Array(positions.length + n * 9); p2.set(positions); let o = positions.length;
     for (const l of loose) { unmerged++; for (const t of l) for (let e = 0; e < 3; e++) { const i = 3 * tri[3 * t + e]; p2[o++] = vert[i]; p2[o++] = vert[i + 1]; p2[o++] = vert[i + 2]; } }
-    positions = p2;
+    strays = p2.slice(positions.length); positions = p2;
   }
   const looseOut = looseBits.map(b => ({ volume: b.sv, gap: b.gap, at: b.at }));
-  return { positions, cut, loose: looseOut, bridged, dropped, shells: shellsOut, inputShells, repaired, unmerged, specks, hollows, hollowVolume, hollowsLeft, hollowLeftVolume, volume };
+  return { positions, solid, strays, cut, loose: looseOut, bridged, dropped, shells: shellsOut, inputShells, repaired, unmerged, specks, hollows, hollowVolume, hollowsLeft, hollowLeftVolume, volume };
 }
 
 // each vertex → the first vertex within tol of it (grid hashed); vertices with nothing near map to themselves

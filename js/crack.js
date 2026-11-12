@@ -120,10 +120,11 @@ export function buildCrack(M, p) {
   const trash = []; const keep = x => { trash.push(x); return x; };
   try {
     // the part as one clean solid
-    const clean = mergeSolid(M, [p.soup], { fillHollows: false, loose: 'drop' });
-    if (!clean.positions.length) throw new Error("the part isn't a closed solid");
-    const w0 = weld(clean.positions, 1e-6), mesh = new Mesh({ numProp: 3, vertProperties: w0.vert, triVerts: w0.tri }); mesh.merge();
-    const part = keep(new Manifold(mesh));
+    // nothing of the part is left out: separate pieces stay (and crack too, if the hit is on one), and triangles that
+    // aren't part of any closed solid go through untouched
+    const clean = mergeSolid(M, [p.soup], { fillHollows: false, loose: 'keep', manifold: true });
+    if (!clean.solid) throw new Error("the part has no closed solid in it to cut");
+    const part = keep(clean.solid);
     if (part.status && part.status() !== 'NoError') throw new Error("the part isn't a closed solid");
 
     const R = p.radius, hw = p.width / 2, pat = pattern(p);
@@ -142,20 +143,32 @@ export function buildCrack(M, p) {
 
     // 3D: what's left round about, the slabs, and (holding it together) the back of the cracks
     let body = keep(part.subtract(prism(foot)));
-    const depthCut = p.through ? Infinity : Math.max(0.05, p.thick - p.skin);
-    const topLayer = depthCut === Infinity ? null : keep(part.subtract(keep(part.translate([0, 0, -depthCut]))));
+    // how deep the cracks go: right through, all but a skin at the back, or (surface only) a set depth
+    const surface = !!p.surface, effect = Math.max(0.05, p.effectDepth || 0.6);
+    const depthCut = surface ? Math.max(0.02, p.crackDepth || 1) : p.through ? Infinity : Math.max(0.05, p.thick - p.skin);
+    const layerOf = d => keep(part.subtract(keep(part.translate([0, 0, -d]))));     // the part within d of its top
+    const topLayer = depthCut === Infinity ? null : layerOf(depthCut);
+    // surface only: just a layer at the top breaks up and moves (as deep as the effect depth); under it the part
+    // stays whole, with the cracks running on into it if they go deeper than the layer
+    const moving = surface ? layerOf(effect) : part;
     if (pat.spiders.length && topLayer) {
       const sp = pat.spiders.map(l => strip(CS, l.pts, hw * 0.8, false, l.w)), spc = keep(CS.union(sp)); sp.forEach(x => x.delete());
       body = keep(body.subtract(keep(prism(keep(spc.subtract(foot))).intersect(topLayer))));
     }
     const pieces = [body];
+    if (surface) {
+      let core = keep(keep(part.intersect(prism(foot))).subtract(moving));
+      if (depthCut > effect) core = keep(core.subtract(keep(prism(gaps).intersect(topLayer))));
+      if (hole) core = keep(core.subtract(keep(prism(hole).intersect(topLayer))));     // the hole: a pit as deep as the cracks
+      if (!core.isEmpty()) pieces.push(core);
+    }
 
     // each slab tipped toward the middle and pushed in, as the dish of the dent would have it, then knocked a little
     const r = rng(p.seed ^ 0x9e3779b9), motions = [];
     const D = rr => p.depth * Math.max(0, 1 - (rr / R) ** 2), slope = rr => 2 * p.depth * rr / (R * R);
     let n = 0;
     for (const s of slabs) {
-      const piece = keep(part.intersect(prism(s))); if (piece.isEmpty()) continue;
+      const piece = keep(moving.intersect(prism(s))); if (piece.isEmpty()) continue;
       const polys = s.toPolygons(), bb = s.bounds(), c2 = [(bb.min[0] + bb.max[0]) / 2, (bb.min[1] + bb.max[1]) / 2];
       // the slab's middle by area
       let ax = 0, ay = 0, aa = 0; for (const pl of polys) for (let i = 0, j = pl.length - 1; i < pl.length; j = i++) { const cr = pl[j][0] * pl[i][1] - pl[i][0] * pl[j][1]; aa += cr; ax += (pl[j][0] + pl[i][0]) * cr; ay += (pl[j][1] + pl[i][1]) * cr; }
@@ -173,7 +186,7 @@ export function buildCrack(M, p) {
 
     // the back of the cracks: stretched between the slabs on either side (and the part round about), so it all stays one
     if (topLayer) {
-      let g = keep(part.intersect(prism(gaps)).subtract(topLayer));
+      let g = keep(moving.intersect(prism(gaps)).subtract(topLayer));
       if (!g.isEmpty()) {
         g = keep(g.refineToLength(Math.max(0.05, Math.min(p.width, 0.25))));
         const near = hw * 3 + 0.05;
@@ -195,7 +208,9 @@ export function buildCrack(M, p) {
     }
     // all of it back together as one solid (pieces that only touch are fused)
     const out = mergeSolid(M, pieces.map(soupOf), { fillHollows: false, loose: 'keep' });
-    return { positions: out.positions, slabs: n, shells: out.shells };
+    let positions = out.positions;
+    if (clean.strays.length) { const all = new Float32Array(positions.length + clean.strays.length); all.set(positions); all.set(clean.strays, positions.length); positions = all; }
+    return { positions, slabs: n, shells: out.shells };
   } finally { trash.forEach(x => { try { x.delete(); } catch (e) {} }); }
 }
 
