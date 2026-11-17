@@ -6574,6 +6574,86 @@ function addMagnet(sides) {
                     : `Magnet ${magLabel(mg)} ${what}: holes ${(sz.d + sz.cd).toFixed(2)} mm wide, ${depth.toFixed(2)} mm deep.`, thin.length ? 'bad' : 'ok');
 }
 /*
+ * Lining the pair up: by default the two holes share one axis, square to the seam where the parts meet, so the
+ * magnets go in straight and meet face to face. The seam's direction is the average of each part's surface around
+ * the spot (area-weighted, over a patch a bit wider than the magnet), not one triangle's tilt. A hole already in
+ * either part close by (another option for the same spot) is reused, so every option lines up with the same hole.
+ */
+const magAlign = () => $('mag-align')?.value || 'seam';
+/** The average outward direction of a part's surface within r of a point (only faces turned toward `toward`). */
+function surfNormalNear(m, pW, r, toward) {
+  const bvh = m.geometry.boundsTree; if (!bvh) return null;
+  m.updateMatrixWorld(true);
+  const inv = m.matrixWorld.clone().invert(), flip = m.matrixWorld.determinant() < 0 ? -1 : 1, S = V().setFromMatrixScale(m.matrixWorld), sc = Math.max(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) || 1;
+  const pl = pW.clone().applyMatrix4(inv), rl = r / sc, nm = new THREE.Matrix3().getNormalMatrix(m.matrixWorld);
+  const gl = toward ? toward.clone().applyMatrix3(new THREE.Matrix3().copy(nm).invert()).normalize().multiplyScalar(flip) : null;
+  const box = new THREE.Box3(pl.clone().subScalar(rl), pl.clone().addScalar(rl)), acc = V(), n = V(), q = V();
+  bvh.shapecast({
+    intersectsBounds: b => b.intersectsBox(box) ? INTERSECTED : NOT_INTERSECTED,
+    intersectsTriangle: tri => {
+      if (tri.closestPointToPoint(pl, q).distanceTo(pl) > rl) return false;
+      tri.getNormal(n); if (gl && n.dot(gl) < 0.25) return false;
+      acc.addScaledVector(n, tri.getArea()); return false;
+    },
+  });
+  if (acc.lengthSq() < 1e-12) return null;
+  return acc.multiplyScalar(flip).applyMatrix3(nm).normalize();
+}
+/** Where a line meets a part: the crossing nearest `c` whose face turns toward `facing`. */
+function lineHit(m, c, ax, facing, R) {
+  const rc = new THREE.Raycaster(c.clone().addScaledVector(ax, -R), ax, 0, 2 * R), hs = rc.intersectObject(m, false);
+  let best = null, bd = Infinity;
+  for (const h of hs) { if (hitNormal(h).dot(facing) < 0.05) continue; const d = h.point.distanceTo(c); if (d < bd) { bd = d; best = h.point.clone(); } }
+  return best;
+}
+/** An existing hole in this part within reach of p (to share with another option), in world terms. */
+function holeNear(m, p, reach, skip = null) {
+  let best = null, bd = reach;
+  for (const mg of magnets) { if (mg === skip) continue; for (const sd of mg.sides) { if (sd.part !== m.uuid) continue; const w = sideWorld(sd); if (!w) continue; const d = w.o.distanceTo(p); if (d < bd) { bd = d; best = w; } } }
+  return best;
+}
+/**
+ * Two rough sides ({ m, o, n }: n out of that part, toward the other) → the pair on one shared axis, square to the
+ * seam: [{ m: A, o, n: ax }, { m: B, o, n: -ax }]. Null if the line can't be made to meet both parts.
+ */
+function alignedPair(a, b, sz = magSize(), skip = null) {
+  const r = Math.max(1.5, (sz.d + sz.cd) * 1.25), reach = Math.max(1, (sz.d + sz.cd) * 0.9);
+  let g = a.n.clone().sub(b.n); if (g.lengthSq() < 1e-8) g = b.o.clone().sub(a.o); if (g.lengthSq() < 1e-12) return null; g.normalize();   // from A toward B
+  let ax = null, centres = null;
+  // another option already has a hole here: use that very hole and its axis
+  const ha = holeNear(a.m, a.o, reach, skip), hb = holeNear(b.m, b.o, reach, skip);
+  if (ha) { ax = ha.n.clone(); centres = [ha.o]; }
+  else if (hb) { ax = hb.n.clone().negate(); centres = [hb.o]; }
+  else {
+    const na = surfNormalNear(a.m, a.o, r, g), nb = surfNormalNear(b.m, b.o, r, g.clone().negate());
+    ax = (na || g.clone()).sub(nb || g.clone().negate()); if (ax.lengthSq() < 1e-8 || ax.normalize().dot(g) < 0.2) ax = g.clone();
+    centres = [a.o, a.o.clone().add(b.o).multiplyScalar(0.5), b.o];
+  }
+  const R = Math.max(4, a.o.distanceTo(b.o) * 2 + 4, (sz.t + sz.ct) * 3);
+  for (const c of centres) {
+    const pa = ha ? ha.o.clone() : lineHit(a.m, c, ax, ax, R), pb = hb && !ha ? hb.o.clone() : lineHit(b.m, c, ax, ax.clone().negate(), R);
+    if (pa && pb && pa.distanceTo(pb) < a.o.distanceTo(b.o) + 3 * r) return [{ m: a.m, o: pa, n: ax.clone() }, { m: b.m, o: pb, n: ax.clone().negate() }];
+  }
+  return null;
+}
+/** Line a pair up again (square to the seam, or onto a hole close by). */
+function realignMagnet(mg) {
+  if (mg.sides.length < 2) return false;
+  const w = mg.sides.map(sideWorld); if (w.some(x => !x)) return false;
+  if (mg.conn) { const ci = connInfo(mg.conn); if (ci) { const dirB = seamDirAtConn(ci, mg.shift || [0, 0], mg.dir); if (dirB) { mg.dir = dirB; placeConnMagnets(mg.conn); return true; } } }
+  const pr = alignedPair({ m: w[0].m, o: w[0].o, n: w[0].n }, { m: w[1].m, o: w[1].o, n: w[1].n }, mg, mg); if (!pr) return false;
+  mg.sides = pr.map((sd, k) => ({ part: sd.m.uuid, ...toLocal(sd.m, sd.o, sd.n), pole: mg.sides[k].pole }));
+  return true;
+}
+/** At a connection: the direction square to the seam there (b → a, in b's frame), from the surfaces either side. */
+function seamDirAtConn(ci, shift, dirB) {
+  const sides = connMagnetSides(ci, shift, dirB), dir = sides[1].n.clone(), sz = magSize(), r = Math.max(1.5, (sz.d + sz.cd) * 1.25);
+  const ra = surfNormalNear(ci.a, sides[0].o, r, dir.clone().negate()), rb = surfNormalNear(ci.b, sides[1].o, r, dir);
+  if (!ra && !rb) return null;
+  let d = (rb || dir.clone()).sub(ra || dir.clone().negate()); if (d.lengthSq() < 1e-8) return null; d.normalize(); if (d.dot(dir) < 0.2) d = dir;
+  return d.transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray();
+}
+/*
  * A magnet at a connection: the pair goes where the two parts meet along the connection's axis, one hole in each,
  * found by looking from the connection point along its axis for each part's facing surface. It remembers the
  * connection (mg.conn) and a shift across it (mg.shift, mm), and is placed again whenever the connection changes.
@@ -6597,7 +6677,8 @@ function addConnMagnet(c, shift = [0, 0]) {
   try { const cc = contactBetween(contactContext([ci.b, ci.a]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); if (cc?.nOut?.[0]?.lengthSq() > 1e-9) dir = cc.nOut[0].clone().normalize(); } catch (e) {}
   if (!dir) dir = ci.axis.clone();
   if (dir.dot(worldBox(ci.a).getCenter(V()).sub(ci.point)) < 0 && dir.dot(worldBox(ci.b).getCenter(V()).sub(ci.point)) > 0) dir.negate();
-  const dirB = dir.clone().transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray();
+  let dirB = dir.clone().transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray();
+  if (magAlign() === 'seam') dirB = seamDirAtConn(ci, shift, dirB) || dirB;
   const sides = connMagnetSides(ci, shift, dirB); addMagnet(sides);
   const mg = magnets[magnets.length - 1]; mg.conn = { ...c }; mg.shift = shift.slice(); mg.dir = dirB; markDirty(); renderPartPanel(); return mg;
 }
@@ -6626,7 +6707,13 @@ function handleMagnetClick(hit) {
       if (worldBox(m).getCenter(V()).sub(worldBox(a.m).getCenter(V())).dot(dir) < 0) dir.negate();       // from the first part toward the second
       const surf = (part, from, d) => { const rc = new THREE.Raycaster(from, d, 0, 8); rc.firstHitOnly = true; return rc.intersectObject(part, false)[0]?.point || null; };
       const pa = surf(a.m, at.clone().addScaledVector(dir, 3), dir.clone().negate()) || at, pb = surf(m, at.clone().addScaledVector(dir, -3), dir) || at;
-      addMagnet([{ m: a.m, o: pa, n: dir.clone() }, { m, o: pb, n: dir.clone().negate() }]); return;
+      const rough = [{ m: a.m, o: pa, n: dir.clone() }, { m, o: pb, n: dir.clone().negate() }];
+      addMagnet(magAlign() === 'seam' ? alignedPair(...rough) || rough : rough); return;
+    }
+    if (magAlign() === 'seam') {
+      const pr = alignedPair(a, { m, o: p, n });
+      if (pr) { addMagnet(pr); return; }
+      toast(`Couldn't line the two holes up on one axis (the spots don't face each other), so they go where you clicked.`, 'bad');
     }
     addMagnet([a, { m, o: p, n }]); return;
   }
@@ -6635,7 +6722,7 @@ function handleMagnetClick(hit) {
   const rc = new THREE.Raycaster(p.clone().addScaledVector(n, -0.6), n, 0, 2.6); rc.firstHitOnly = true;
   const h2 = rc.intersectObjects(others, false)[0];
   if (h2 && !magShift) { const cs = connsBetween(m, h2.object); if (cs.length) { addConnMagnet(cs[0]); toast(`Magnet placed at the connection between ${m.name} and ${h2.object.name}: it follows if you change the connection. Shift-click to put it exactly where you click.`, 'ok'); return; } }
-  if (h2) addMagnet([{ m, o: p, n }, { m: h2.object, o: h2.point.clone(), n: n.clone().negate() }]);
+  if (h2) { const rough = [{ m, o: p, n }, { m: h2.object, o: h2.point.clone(), n: n.clone().negate() }]; addMagnet(magAlign() === 'seam' ? alignedPair(...rough) || rough : rough); }
   else { magPending = { m, o: p, n }; updateStep(); $('step-text').textContent = `No part touches ${m.name} there. Click the spot on the part it fits against (Esc to cancel)`; rebuildMagnets(); }
 }
 function holeGeometry(mg, o, n, extraOut = 0.3) {      // a cylinder from just outside the surface down to the hole's depth
@@ -6673,7 +6760,8 @@ function magnetRows(p, el) {
       const ci = connInfo(mg.conn); t.textContent += ci ? ' · at the connection' : ' · (its connection is gone)';
       if (ci) row.append(bt('⌖', 'Select the connection it sits on', () => selectConn(mg.conn)));
     }
-    row.append(t, bt('Use bar size', `Give this pair the size and fit set in the Magnet tool's bar`, () => { pushUndo(); Object.assign(mg, magSize()); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`That magnet is now ${magLabel(mg)}.`); }),
+    row.append(t, bt('Line up', 'Put both holes on one axis, square to the seam (or onto a hole close by), so the magnets go in straight', () => { pushUndo(); const ok = realignMagnet(mg); markDirty(); rebuildMagnets(); renderPartPanel(); toast(ok ? 'Lined that pair up, square to the seam.' : "Couldn't line that pair up: the two spots don't face each other.", ok ? 'ok' : 'bad'); }),
+               bt('Use bar size', `Give this pair the size and fit set in the Magnet tool's bar`, () => { pushUndo(); Object.assign(mg, magSize()); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`That magnet is now ${magLabel(mg)}.`); }),
                bt('Remove', 'Remove this pair of holes', () => { pushUndo(); magnets = magnets.filter(x => x !== mg); markDirty(); rebuildMagnets(); renderPartPanel(); toast('Removed the magnet.'); }));
     box.append(row);
   }
@@ -6681,7 +6769,9 @@ function magnetRows(p, el) {
 }
 /** At export: the holes cut into copies of the parts that carry magnets (meshes[i] is the export copy of parts[i]). */
 async function cutMagnetHoles(meshes, parts) {
-  const todo = parts.map((m, i) => ({ i, m, sides: magnets.flatMap(mg => mg.sides.filter(sd => sd.part === m.uuid).map(sd => ({ mg, sd }))) })).filter(x => x.sides.length);
+  // a hole shared by several options is cut once
+  const uniq = list => list.filter(({ mg, sd }, k) => !list.slice(0, k).some(x => x.mg.d + x.mg.cd >= mg.d + mg.cd - 1e-6 && x.mg.t + x.mg.ct >= mg.t + mg.ct - 1e-6 && V(...x.sd.o).distanceTo(V(...sd.o)) < 1e-3 && V(...x.sd.n).dot(V(...sd.n)) > 0.9999));
+  const todo = parts.map((m, i) => ({ i, m, sides: uniq(magnets.flatMap(mg => mg.sides.filter(sd => sd.part === m.uuid).map(sd => ({ mg, sd })))) })).filter(x => x.sides.length);
   if (!todo.length) return { meshes, note: '', holes: [] };
   if ($('exp-merge').checked) {          // merging: the holes are cut by the merge itself, exactly, so the result stays one clean solid
     const byPart = meshes.map(() => []);
@@ -6718,6 +6808,9 @@ function bindMagnets() {
   ['mag-d', 'mag-t'].forEach(id => $(id).addEventListener('change', () => { const v = `${+$('mag-d').value}x${+$('mag-t').value}`; $('mag-size').value = [...$('mag-size').options].some(o => o.value === v) ? v : 'custom'; rebuildMagnets(); }));
   $('mag-fit').addEventListener('change', () => { const f = { resin: 0.15, fdm: 0.3 }[$('mag-fit').value]; if (f != null) { $('mag-cd').value = f; $('mag-ct').value = f; } });
   ['mag-cd', 'mag-ct'].forEach(id => $(id).addEventListener('change', () => { const a = +$('mag-cd').value, b = +$('mag-ct').value; $('mag-fit').value = a === b && a === 0.15 ? 'resin' : a === b && a === 0.3 ? 'fdm' : 'custom'; }));
+  $('mag-lineup').addEventListener('click', () => { if (!magnets.length) { toast('No magnets yet. Click where two parts meet.'); return; }
+    pushUndo(); let ok = 0; for (const mg of magnets) if (realignMagnet(mg)) ok++; markDirty(); rebuildMagnets(); renderPartPanel();
+    toast(`Lined up ${ok} of ${magnets.length} magnet pair${magnets.length > 1 ? 's' : ''}, square to their seams.` + (ok < magnets.length ? " The rest don't face each other." : ''), ok === magnets.length ? 'ok' : 'bad'); });
   $('mag-apply').addEventListener('click', () => { if (!magnets.length) { toast('No magnets yet. Click where two parts meet.'); return; }
     pushUndo(); magnets.forEach(mg => Object.assign(mg, magSize())); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`All ${magnets.length} magnet${magnets.length > 1 ? 's are' : ' is'} now ${magLabel(magSize())}.`, 'ok'); });
 }
