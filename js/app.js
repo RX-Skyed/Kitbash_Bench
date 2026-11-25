@@ -5938,18 +5938,40 @@ function refreshGrowersNow() {
     if (changed || sig !== pt.growSig) { pt.growSig = sig; if (pt.mods) evalStack(m); }
   }
 }
+/** The parts within a growth's reach (whether or not they're left alone). */
+function growReachParts(gr) {
+  const q = gr.userData.part.grower, room = growRoom(gr), c = V().setFromMatrixPosition(room), S = V().setFromMatrixScale(room), rr = Math.max(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) * (q.reach || 2.6);
+  return liveParts().filter(o => o !== gr && !o.userData.part.grower && isVisibleChain(o) && exactBox(o).distanceToPoint(c) < rr);
+}
+/** Ticks for the parts a growth reaches: untick a part and the growth leaves it alone (only the door bends, say). */
+function growTargetRows(gr, box) {
+  const list = growReachParts(gr), wrap = document.createElement('div'); wrap.className = 'grow-targets'; box.append(wrap);
+  const head = document.createElement('div'); head.className = 'gt-head'; wrap.append(head);
+  const on = o => !(o.userData.part.noGrow || []).includes(gr.uuid);
+  const n = list.filter(on).length;
+  const t = document.createElement('span'); t.textContent = list.length ? `Bends ${n} of ${list.length} part${list.length === 1 ? '' : 's'} in reach` : 'Nothing in reach yet: move it into or against a part.'; head.append(t);
+  if (!list.length) return;
+  const set = (parts, want) => { pushUndo(); for (const o of parts) { const pt = o.userData.part, ids = new Set(pt.noGrow || []); if (want) ids.delete(gr.uuid); else ids.add(gr.uuid); if (ids.size) pt.noGrow = [...ids]; else delete pt.noGrow; } refreshGrowersNow(); markDirty(); renderPartPanel(); };
+  const mini = (txt, fn, title) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'linkbtn'; b.textContent = txt; b.title = title; b.addEventListener('click', fn); head.append(b); };
+  mini('All', () => set(list, true), 'Bend every part in reach'); mini('None', () => set(list, false), 'Leave them all alone, then tick just the ones to bend');
+  const ul = document.createElement('div'); ul.className = 'gt-list'; wrap.append(ul);
+  for (const o of list) {
+    const l = document.createElement('label'); l.className = 'check gt-row';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = on(o); cb.addEventListener('change', () => set([o], cb.checked));
+    const nm = document.createElement('span'); nm.textContent = o.name;
+    l.append(cb, nm);
+    l.addEventListener('mouseenter', () => { paintSelection(); o.material.emissive?.set('#3d2c0f'); }); l.addEventListener('mouseleave', () => paintSelection()); ul.append(l);
+  }
+}
 function growerRows(p, el) {
   const q = p.userData.part.grower; if (!q) return;
   const box = document.createElement('div'); box.className = 'mods grower'; el.append(box);
   const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = 'Growth'; box.append(h);
-  const pushed = liveParts().filter(o => o.userData.part.mods?.some(x => x.type === 'grow' && x.grower === p.uuid && x.on));
   const note = document.createElement('p'); note.className = 'note';
-  if (q.draft) {
-    const reach = liveParts().filter(o => o !== p && !o.userData.part.grower && isVisibleChain(o)), room = growRoom(p), c = V().setFromMatrixPosition(room), S = V().setFromMatrixScale(room), rr = Math.max(S.x, S.y, S.z) * (q.reach || 2.6);
-    const will = reach.filter(o => exactBox(o).distanceToPoint(c) < rr).map(o => o.name);
-    note.textContent = `Outline: drag it into place (Move, G) and size it${q.kind === 'ball' ? ' ([ and ], or Size)' : ''}; the faint ball is how far it will bend things. ${will.length ? `It will push ${will.join(', ')}.` : 'It isn\'t near anything yet.'} Then Grow it.`;
-  } else note.textContent = (pushed.length ? `Pushing ${pushed.map(o => o.name).join(', ')} out of its way.` : 'Not touching anything: move it into or against a part.') + ' Back to outline to move it about quickly.';
+  note.textContent = q.draft ? `Outline: drag it into place (Move, G) and size it${q.kind === 'ball' ? ' ([ and ], or Size)' : ''}; the faint ball is how far it will bend things. Untick any part below it should leave alone, then Grow it.`
+    : 'Back to outline to move it about quickly. Untick any part below it should leave alone.';
   box.append(note);
+  growTargetRows(p, box);
   const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
   const row = (label, ctl, title = '') => { const l = document.createElement('label'); l.textContent = label; if (title) l.title = title; grid.append(l, ctl); };
   const regrow = async () => { if (q.kind !== 'ball') return; if (q.draft) { const g = weldGeometry(draftGeom(q.r)), pt = p.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); p.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.tris = g.index.count / 3; styleDraft(p, true); return; } const g = await growBallGeometry(q); const pt = p.userData.part; p.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(p); };
