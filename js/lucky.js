@@ -408,12 +408,108 @@ export function pickStarts(ctx, mine, best, max = 900) {
   }
   return out;
 }
-/** The best few distinct fits, best first. The leaders get a last, finer settle on every sample point. */
+/* ------------------------------------------------------------------------------ shape: how it locks in -- */
+// A real fit doesn't just touch a lot: its contact wraps round, so the fixed part's surface pushes back against
+// most ways the moving part could slide or turn (a peg in a socket, a plate in a recess, a backpack slot on a
+// peg). A part resting on a curve or nestled against a wall is only held one way. `lock` measures that.
+const LOCK_DIRS = (() => { const out = []; for (let i = 0; i < 27; i++) { if (i === 13) continue; const a = [(i % 3) - 1, ((i / 3 | 0) % 3) - 1, ((i / 9 | 0) % 3) - 1], l = Math.hypot(...a); out.push(a.map(v => v / l)); } return out; })();
+/** A's points sitting flush on B in this pose: [x, y, z, B's facing x, y, z] each. */
+export function contactSet(ctx, R, t) {
+  const { F, SA, params } = ctx, P = SA.P, N = SA.N, f = {}, out = [];
+  for (let i = 0; i < SA.n; i++) {
+    const x0 = P[3 * i], y0 = P[3 * i + 1], z0 = P[3 * i + 2], x = R[0] * x0 + R[1] * y0 + R[2] * z0 + t[0], y = R[3] * x0 + R[4] * y0 + R[5] * z0 + t[1], z = R[6] * x0 + R[7] * y0 + R[8] * z0 + t[2];
+    fieldAt(F, x, y, z, f); if (f.s !== f.s || f.s < -params.sink || f.s > params.tol * 1.5) continue;
+    const nx = N[3 * i], ny = N[3 * i + 1], nz = N[3 * i + 2];
+    if (f.nx * (R[0] * nx + R[1] * ny + R[2] * nz) + f.ny * (R[3] * nx + R[4] * ny + R[5] * nz) + f.nz * (R[6] * nx + R[7] * ny + R[8] * nz) < -0.5) out.push([x, y, z, f.nx, f.ny, f.nz]);
+  }
+  return out;
+}
+/** 0..1: the share of the 26 ways to slide and 6 ways to turn that the contact pushes back against (each needs 4% of it facing squarely against). */
+export function lockOf(ctx, R, t, C = contactSet(ctx, R, t)) {
+  const n = C.length; if (n < 6) return 0;
+  let cx = 0, cy = 0, cz = 0; for (const c of C) { cx += c[0]; cy += c[1]; cz += c[2]; } cx /= n; cy /= n; cz /= n;
+  let rr = 0; for (const c of C) rr += (c[0] - cx) ** 2 + (c[1] - cy) ** 2 + (c[2] - cz) ** 2; const rad = Math.sqrt(rr / n) || 1, need = 0.04 * n;
+  let slides = 0, turns = 0;
+  for (const d of LOCK_DIRS) {
+    let k = 0; for (const c of C) if (-(c[3] * d[0] + c[4] * d[1] + c[5] * d[2]) > 0.5) k++;
+    if (k >= need) slides++;
+    if (Math.abs(d[0]) + Math.abs(d[1]) + Math.abs(d[2]) > 1.01) continue;            // turns: about the six axis directions
+    k = 0;
+    for (const c of C) { const px = c[0] - cx, py = c[1] - cy, pz = c[2] - cz, vx = d[1] * pz - d[2] * py, vy = d[2] * px - d[0] * pz, vz = d[0] * py - d[1] * px, vl = Math.hypot(vx, vy, vz);
+      if (vl >= 0.3 * rad && -(c[3] * vx + c[4] * vy + c[5] * vz) / vl > 0.5) k++; }
+    if (k >= need) turns++;
+  }
+  return (slides / 26) * 0.7 + (turns / 6) * 0.3;
+}
+/** How much overlap to forgive as sampling noise: a couple of samples' worth, never more than 0.3 mm². */
+const noiseSunk = ctx => Math.min(2 * ctx.wA, 0.3);
+/** A settled pose's final score: flush area, overlap counted hard (a couple of samples' worth forgiven as noise), times how well it locks in. */
+export function fitScore(ctx, o) { return (o.contact - 20 * Math.max(0, o.sunk - noiseSunk(ctx))) * o.lock ** 3; }
+/**
+ * Seat a pose: a peg that lands a few degrees or a fraction of a millimetre off its socket hits the walls, and settling
+ * alone pushes it back out. Turn it about the contact's mean facing (up to 30° each way) and shift it across, settle
+ * each, and keep the best.
+ */
+export function seatPose(ctx, o) {
+  const C = contactSet(ctx, o.R, o.t); if (C.length < 8) return o;
+  let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0; for (const c of C) { cx += c[0]; cy += c[1]; cz += c[2]; nx += c[3]; ny += c[4]; nz += c[5]; }
+  cx /= C.length; cy /= C.length; cz /= C.length; let nl = Math.hypot(nx, ny, nz); if (nl < 1e-6) { nx = 0; ny = 0; nz = 1; nl = 1; } nx /= nl; ny /= nl; nz /= nl;
+  const W = ctx.params.sinkWeight; let best = { ...o, s: o.contact - W * o.sunk };
+  const tries = [[-30, 0], [-20, 0], [-12, 0], [-6, 0], [6, 0], [12, 0], [20, 0], [30, 0], [0, 0.4], [0, -0.4]];
+  const u = Math.abs(nz) < 0.9 ? [ny, -nx, 0] : [0, nz, -ny], ul = Math.hypot(...u);
+  for (const [a, d] of tries) {
+    const dR = axisAngle(nx, ny, nz, a * Math.PI / 180), R = mulMM(dR, o.R), q = mulMV(dR, o.t[0] - cx, o.t[1] - cy, o.t[2] - cz);
+    const t = [q[0] + cx + d * u[0] / ul, q[1] + cy + d * u[1] / ul, q[2] + cz + d * u[2] / ul];
+    const r = refinePose(ctx, R, t, { iters: 30 }), m = measure(ctx, r.R, r.t), sc = (m.touch - W * m.sunk) * ctx.wA;
+    if (sc > best.s) best = { ...o, R: r.R, t: r.t, contact: m.touch * ctx.wA, sunk: m.sunk * ctx.wA, s: sc };
+  }
+  return best.R === o.R ? o : best;
+}
+/**
+ * A settled pose that's wedged: plenty touching but some of it sunk, as a peg is that went in at a slant or a fraction
+ * off its socket. Try a grid of turns about the contact's mean facing and shifts across it (measured on a spread of
+ * A's points), settle the best few, and keep the cleanest.
+ */
+export function gridSeat(ctx, o, opts = {}) {
+  const C = contactSet(ctx, o.R, o.t); if (C.length < 8) return o;
+  let cx = 0, cy = 0, cz = 0, nx = 0, ny = 0, nz = 0; for (const c of C) { cx += c[0]; cy += c[1]; cz += c[2]; nx += c[3]; ny += c[4]; nz += c[5]; }
+  cx /= C.length; cy /= C.length; cz /= C.length; const nl = Math.hypot(nx, ny, nz); if (nl < 1e-6) return o; nx /= nl; ny /= nl; nz /= nl;
+  const u0 = Math.abs(nz) < 0.9 ? [ny, -nx, 0] : [0, nz, -ny], ul = Math.hypot(...u0), u = u0.map(v => v / ul), v = [ny * u[2] - nz * u[1], nz * u[0] - nx * u[2], nx * u[1] - ny * u[0]];
+  const W = ctx.params.sinkWeight, span = opts.span ?? 2, step = opts.step ?? Math.max(0.2, 0.45 * Math.sqrt(ctx.wA / 0.12)), ids = ctx.seatIdx ||= spreadPick(ctx.SA.P, Math.min(350, ctx.SA.n), 1), g = [];
+  for (let a = -30; a <= 30; a += 7.5) {
+    const dR = axisAngle(nx, ny, nz, a * Math.PI / 180), R = mulMM(dR, o.R), q = mulMV(dR, o.t[0] - cx, o.t[1] - cy, o.t[2] - cz);
+    for (let i = -span; i <= span; i++) for (let j = -span; j <= span; j++) {
+      const t = [q[0] + cx + (i * u[0] + j * v[0]) * step, q[1] + cy + (i * u[1] + j * v[1]) * step, q[2] + cz + (i * u[2] + j * v[2]) * step];
+      const m = measure(ctx, R, t, ids); g.push({ R, t, s: m.touch - W * m.sunk });
+    }
+  }
+  g.sort((x, y) => y.s - x.s);
+  let best = o, bs = o.contact - 20 * o.sunk;
+  for (const c of g.slice(0, 3)) { const r = refinePose(ctx, c.R, c.t), m = measure(ctx, r.R, r.t), x = { ...o, R: r.R, t: r.t, contact: m.touch * ctx.wA, sunk: m.sunk * ctx.wA }; if (x.contact - 20 * x.sunk > bs) { best = x; bs = x.contact - 20 * x.sunk; } }
+  return best;
+}
+/** Which settled poses to grid-seat: the wedged ones (something sunk) with the most touching. */
+export function wedged(ctx, refined, max = 700) {
+  const top = Math.max(0, ...refined.map(o => o.contact)), floor = 0.25 * top, out = [];
+  for (const o of refined.filter(o => o.sunk > noiseSunk(ctx) && o.contact > floor).sort((a, b) => b.contact - a.contact)) {
+    if (out.length >= max) break; if (out.some(q => samePose(ctx, q, o, 1.0, 10))) continue; out.push(o);
+  }
+  return out;
+}
+/** The best few distinct fits, best first: the leaders are seated, and every pose is scored by flush area, overlap and how it locks in. */
 export function rankFits(ctx, refined, max = 8) {
-  const W = ctx.params.sinkWeight, sc = o => o.contact - W * o.sunk;
+  const W = ctx.params.sinkWeight, base = o => o.contact - W * o.sunk;
+  for (const o of refined) o.lock = lockOf(ctx, o.R, o.t);
+  // seat the most promising: the best by flush area, and the best locked in of those with a fair share of contact
+  const byBase = [...refined].sort((x, y) => base(y) - base(x)), floor = Math.max(1, 0.15 * Math.max(0, base(byBase[0] || { contact: 0, sunk: 0 })));
+  const pick = new Set([...byBase.slice(0, 40), ...refined.filter(o => o.contact > floor).sort((x, y) => y.lock - x.lock).slice(0, 40)]);
+  for (const o of pick) { const st = seatPose(ctx, o); if (st !== o) { st.lock = lockOf(ctx, st.R, st.t); refined.push(st); } }
+  const sc = o => fitScore(ctx, o);
   refined.sort((x, y) => sc(y) - sc(x));
   const lead = [];
   for (const o of refined) { if (o.contact <= 0 || lead.some(q => samePose(ctx, q, o, 1.5, 15))) continue; lead.push(o); if (lead.length >= max * 2) break; }
+  // the leaders get a grid seat too: one that stopped a little off its socket drops in
+  for (const o of lead) { const g = gridSeat(ctx, o, { span: 3 }); if (g !== o) { g.lock = lockOf(ctx, g.R, g.t); if (sc(g) > sc(o)) Object.assign(o, { R: g.R, t: g.t, contact: g.contact, sunk: g.sunk, lock: g.lock }); } }
   // settling can stop in a dip a few degrees short of the seat: restart it from small tilts and shifts around
   // each leader and keep whichever lands best
   const all = Array.from({ length: ctx.SA.n }, (_, i) => i), c0 = ctx.params.centre, nudges = [[0, 0, 0, 0]];
@@ -421,20 +517,29 @@ export function rankFits(ctx, refined, max = 8) {
   for (const ax of [0, 1, 2]) for (const d of [-0.3, 0.3]) nudges.push([2, ax, 0, d]);
   for (const o of lead.slice(0, Math.max(3, Math.ceil(max / 2)))) {
     const pc = mulMV(o.R, ...c0).map((v, d) => v + o.t[d]);        // the part's centre, where it sits now
-    let best = { R: o.R, t: o.t, s: sc(o) };
+    let best = { R: o.R, t: o.t, s: sc(o) };      // (scored the same way as the ranking)
     for (const [kind, ax, ang, d] of nudges) {
       let R = o.R, t = o.t;
       if (kind === 1) { const u = [0, 0, 0]; u[ax] = 1; const dR = axisAngle(u[0], u[1], u[2], ang); R = mulMM(dR, o.R); const q = mulMV(dR, t[0] - pc[0], t[1] - pc[1], t[2] - pc[2]); t = [q[0] + pc[0], q[1] + pc[1], q[2] + pc[2]]; }
       if (kind === 2) { t = t.slice(); t[ax] += d; }
       const r = refinePose(ctx, R, t, { iters: 40, thr0: 3 * ctx.F.cell, thr1: 0.5 * ctx.F.cell, ids: all }), m = measure(ctx, r.R, r.t);
-      const s = (m.touch - W * m.sunk) * ctx.wA;
-      if (s > best.s + 1e-9) best = { R: r.R, t: r.t, s, contact: m.touch * ctx.wA, sunk: m.sunk * ctx.wA };
+      const cand = { R: r.R, t: r.t, contact: m.touch * ctx.wA, sunk: m.sunk * ctx.wA }; cand.lock = lockOf(ctx, cand.R, cand.t); cand.s = sc(cand);
+      if (cand.s > best.s + 1e-9) best = cand;
     }
-    if (best.contact != null) Object.assign(o, { R: best.R, t: best.t, contact: best.contact, sunk: best.sunk });
+    if (best.contact != null) Object.assign(o, { R: best.R, t: best.t, contact: best.contact, sunk: best.sunk, lock: best.lock });
   }
   lead.forEach(o => { o.score = sc(o); }); lead.sort((x, y) => y.score - x.score);
   const out = [];
   for (const o of lead) { if (out.some(q => samePose(ctx, q, o, 1.5, 15))) continue; out.push(o); if (out.length >= max) break; }
+  // a keyed joint can touch less than a part nestled somewhere it doesn't go: make sure the cleanest, most locked-in
+  // fits are among the guesses (overlap-free, ranked by contact × lock), even if they don't come first
+  const clean = refined.filter(o => o.sunk <= noiseSunk(ctx) && o.contact > 0).sort((x, y) => y.contact * y.lock ** 3 - x.contact * x.lock ** 3);
+  let added = 0;
+  for (const o of clean) {
+    if (added >= 2 || max < 4) break;
+    if (out.some(q => samePose(ctx, q, o, 1.5, 15))) continue;
+    o.score = sc(o); if (out.length >= max) out.pop(); out.push(o); added++;
+  }
   return out;
 }
 /**
@@ -474,7 +579,9 @@ export function contactOf(ctx, fit, A, B) {
 export function luckyFits(A, B, opts = {}) {
   const t0 = performance.now(), ctx = prepare(A, B, opts), t1 = performance.now();
   const all = [...ctx.anchors.keys()], s = searchAnchors(ctx, all, opts.progress), t2 = performance.now();
-  const starts = pickStarts(ctx, s.mine, s.best, opts.nRefine ?? 900), fits = rankFits(ctx, refineAll(ctx, starts), opts.results ?? 8);
+  const starts = pickStarts(ctx, s.mine, s.best, opts.nRefine ?? 900), refined = refineAll(ctx, starts);
+  refined.push(...wedged(ctx, refined).map(o => gridSeat(ctx, o)));
+  const fits = rankFits(ctx, refined, opts.results ?? 8);
   for (const fit of fits) Object.assign(fit, contactOf(ctx, fit, A, B));
   return { fits, ctx, stats: { cell: ctx.params.cell, poses: s.poses, passed: s.passed, anchors: ctx.anchors.length, targets: ctx.targets.length, refined: starts.length, prepare: (t1 - t0) / 1000, search: (t2 - t1) / 1000, refine: (performance.now() - t2) / 1000 } };
 }

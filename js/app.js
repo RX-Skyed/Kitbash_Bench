@@ -105,7 +105,7 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 // ---------------------------------------------------------------------------
 const $ = id => document.getElementById(id);
 const view = $('view');
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true }); renderer.localClippingEnabled = true;
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 view.prepend(renderer.domElement);
 const scene = new THREE.Scene();
@@ -212,7 +212,9 @@ function setBench(style) {
   matSeeThrough = null;
 }
 /** Resize (and re-centre) the mat when the bench's contents call for it. */
+let matHold = 0;                     // while a kit is coming in and the box opens, the mat waits and is sized once at the end
 function fitMat(force = false) {
+  if (matHold) return;
   const style = $('set-bench').value; if (!MAT_STYLES[style]) return;
   const box = benchBox(), want = matFor($('set-mat').value, box);
   const c = box.isEmpty() ? V() : box.getCenter(V()), m = matMargin(MAT.w, MAT.h);
@@ -270,6 +272,13 @@ skeleton.renderOrder = 998; scene.add(skeleton);
 
 const tc = new TransformControls(camera, renderer.domElement);
 tc.setSize(0.8); scene.add(tc);
+// the square plane handles sit out from the corner (three.js puts them almost on top of where the arrows meet)
+{ const gz = tc._gizmo || tc.children.find(c => c.isTransformControlsGizmo), out = 2.1;
+  for (const grp of [gz?.gizmo?.translate, gz?.picker?.translate]) grp?.children.forEach(h => {
+    if (!['XY', 'YZ', 'XZ'].includes(h.name)) return;
+    h.geometry.computeBoundingBox(); const c = h.geometry.boundingBox.getCenter(new THREE.Vector3());
+    h.geometry.translate(c.x * (out - 1), c.y * (out - 1), c.z * (out - 1));
+  }); }
 const proxy = new THREE.Object3D(); scene.add(proxy);
 tc.addEventListener('dragging-changed', e => { orbit.enabled = !e.value; });
 
@@ -503,7 +512,79 @@ const AXIS_V = { x: V(1, 0, 0), y: V(0, 1, 0), z: V(0, 0, 1) };
 const railAxisLocal = l => Array.isArray(l.axis) ? V(...l.axis).normalize() : AXIS_V[l.axis || 'z'].clone();
 const railLabel = l => Array.isArray(l.axis) ? (l.axisName || 'the picked faces') : `its ${String(l.axis).toUpperCase()}`;
 /** One of a part's own axes, in world space. */
-function partAxis(part, ax) { part.updateMatrixWorld(true); return AXIS_V[ax].clone().transformDirection(part.matrixWorld); }
+function partAxis(part, ax) { part.updateMatrixWorld(true); const a = part.userData.part?.axes, d = AXIS_V[ax].clone(); if (a) d.applyQuaternion(new THREE.Quaternion().fromArray(a)); return d.transformDirection(part.matrixWorld).normalize(); }
+/*
+ * Each part has its own X, Y and Z (and an origin, the point it turns about), like an object in Blender. They start as
+ * the file had them; Edit axes turns or moves them without moving the mesh. Kept as a turn (and a point) in the part's
+ * own frame, so they ride along wherever the part goes.
+ */
+function partFrameQ(m) { m.updateMatrixWorld(true); const q = m.getWorldQuaternion(new THREE.Quaternion()), a = m.userData.part?.axes; return a ? q.multiply(new THREE.Quaternion().fromArray(a)) : q; }
+function partPivot(m) { const p = m.userData.part?.pivot; if (!p) return null; m.updateMatrixWorld(true); return V(...p).applyMatrix4(m.matrixWorld); }
+function setPartFrame(m, qWorld) {
+  const pt = m.userData.part, a = m.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(qWorld).normalize();
+  if (Math.abs(a.w) > 1 - 1e-9) delete pt.axes; else pt.axes = a.toArray().map(v => +v.toFixed(9));
+}
+let axesEdit = false, axesDrag = null;
+const axesFx = new THREE.Group(); axesFx.visible = false; axesFx.renderOrder = 998; scene.add(axesFx);
+for (const [d, col] of [[V(1, 0, 0), '#e5534b'], [V(0, 1, 0), '#5fbf4f'], [V(0, 0, 1), '#4f86e5']]) {
+  const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), d]), new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true, linewidth: 2 }));
+  ln.renderOrder = 998; axesFx.add(ln);
+  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 8), new THREE.MeshBasicMaterial({ color: col, depthTest: false, transparent: true })); tip.position.copy(d); tip.renderOrder = 998; axesFx.add(tip);
+}
+{ const o = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 8), new THREE.MeshBasicMaterial({ color: '#f1d08f', depthTest: false, transparent: true })); o.renderOrder = 998; axesFx.add(o); }
+/** The selected part's axes, drawn from its origin (or its middle). */
+function showAxesFx(m) {
+  if (!m) { axesFx.visible = false; return; }
+  const at = partPivot(m) || sceneBox([m]).getCenter(V()), L = Math.max(exactBox(m).getSize(V()).length() * 0.35, 2);
+  axesFx.position.copy(at); axesFx.quaternion.copy(partFrameQ(m)); axesFx.scale.setScalar(L); axesFx.visible = true;
+}
+function setAxesEdit(on) {
+  axesEdit = on; document.querySelectorAll('#affect button').forEach(b => b.setAttribute('aria-pressed', String((b.dataset.v === 'axes') === on)));
+  if (on && !['move', 'rotate'].includes(tool)) setTool('rotate');
+  syncGizmo(); renderPartPanel();
+  if (on) toast('Editing axes: Rotate (R) turns the part\'s X, Y and Z, Move (G) moves its origin. The part stays where it is.');
+}
+function axesSquareToWorld(m) { pushUndo(); setPartFrame(m, new THREE.Quaternion()); afterAxes(m); toast(`${m.name}'s axes now line up with the world's.`); }
+function axesReset(m) { pushUndo(); delete m.userData.part.axes; delete m.userData.part.pivot; afterAxes(m); toast(`${m.name}'s axes and origin are back as the file had them.`); }
+function originToCentre(m) { pushUndo(); delete m.userData.part.pivot; afterAxes(m); }
+function axesFromFaces(m) {
+  startDirPick(`Pick faces on ${m.name} for its Z axis`, r => {
+    const ax = r.axes, Z = ax[r.which].clone().normalize(); let X = (r.which === 'along' ? ax.out : ax.along).clone();
+    X.addScaledVector(Z, -X.dot(Z)); if (X.lengthSq() < 1e-8) X = jointBasis(Z).X; X.normalize();
+    const Y = Z.clone().cross(X).normalize();
+    pushUndo(); setPartFrame(m, new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(X, Y, Z)));
+    m.updateMatrixWorld(true); m.userData.part.pivot = ax.centre.clone().applyMatrix4(m.matrixWorld.clone().invert()).toArray();
+    afterAxes(m); toast(`${m.name}'s Z now runs ${r.which === 'out' ? 'straight out of' : r.which} those faces, with its origin on them.`, 'ok');
+  }, { mesh: m });
+}
+function afterAxes(m) { markDirty(); syncGizmo(); renderPartPanel(); if (axesEdit) showAxesFx(m); }
+function axesRows(p, el) {
+  const pt = p.userData.part, box = document.createElement('div'); box.className = 'mods'; el.append(box);
+  const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = 'Axes & origin'; box.append(h);
+  const e = new THREE.Euler().setFromQuaternion(partFrameQ(p), 'XYZ'), deg = THREE.MathUtils.radToDeg;
+  const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
+  const ins = ['X', 'Y', 'Z'].map((k, i) => {
+    const l = document.createElement('label'); l.textContent = `Turned ${k}°`; l.title = `How far the part's axes are turned about the world's ${k}`;
+    const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = 1; n.value = +deg([e.x, e.y, e.z][i]).toFixed(2);
+    grid.append(l, n); return n;
+  });
+  ins.forEach(n => n.addEventListener('change', () => {
+    const v = ins.map(x => THREE.MathUtils.degToRad(+x.value || 0)); pushUndo();
+    setPartFrame(p, new THREE.Quaternion().setFromEuler(new THREE.Euler(v[0], v[1], v[2], 'XYZ'))); afterAxes(p);
+  }));
+  const note = document.createElement('p'); note.className = 'note';
+  note.textContent = (pt.axes ? 'Turned from how the file had them.' : 'As the file had them.') + (pt.pivot ? ' Its origin has been moved.' : ' Its origin is its middle.') + ' The mesh never moves.';
+  box.append(note);
+  const row = document.createElement('div'); row.className = 'btnrow'; box.append(row);
+  const b = (txt, fn, title, dis) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.title = title; x.disabled = !!dis; x.addEventListener('click', fn); row.append(x); };
+  b(axesEdit ? 'Done editing' : 'Edit axes', () => setAxesEdit(!axesEdit), 'Turn (R) or move (G) the axes and origin with the gizmo, leaving the part where it is');
+  if (axesEdit) row.lastChild.classList.add('primary');
+  b('Square to world', () => axesSquareToWorld(p), "Line its X, Y and Z up with the world's (like Apply rotation in Blender)");
+  b('From faces…', () => axesFromFaces(p), 'Click faces: Z runs along, across or straight out of them, with the origin on them');
+  b('Origin to middle', () => originToCentre(p), 'Put the origin back in the middle of the part', !pt.pivot);
+  b('Reset', () => axesReset(p), 'Axes and origin as the file had them', !pt.axes && !pt.pivot);
+}
+
 /** Turn a joint so its Z points along `dir` (world), without moving anything hanging off it; that becomes its rest. */
 function reframeJoint(j, dir) {
   const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
@@ -726,6 +807,7 @@ function groupLabel(part) {
 }
 function askLink(part, verb, { fixed = null } = {}) {
   if (!part || !parentPart(part)) return Promise.resolve('alone');
+  if (part.userData.part?.grower) return Promise.resolve('alone');                // a growth is moved on its own: that's the point of it
   if (fixed && rootOf(fixed) === rootOf(part)) return Promise.resolve('alone');    // fitting it within its own group: the group can't come along
   if (rerootCheck(part)) return Promise.resolve('alone');
   const pref = $('set-linkmove').value; if (pref !== 'ask') return Promise.resolve(pref);
@@ -760,7 +842,7 @@ function makeBase(part, quiet) {
 
 function linkPath(part) { const path = []; for (let c = part, p; (p = parentPart(c)); c = p) path.push({ p, c, j: jointOf(c) }); return path; }
 function rerootCheck(part) {
-  for (const e of linkPath(part)) if (e.j && e.j.children.filter(isPart).length > 1) return `${e.c.name} shares its joint with other options, so that link can't turn round. Pick the option slot's base instead.`;
+  for (const e of linkPath(part)) if (e.j && e.j.children.filter(isPart).length > 1) return `${e.c.name} shares its joint with its alternates, so that link can't turn round. Pick the alternates' base instead.`;
   return null;
 }
 function reroot(part) {
@@ -791,7 +873,7 @@ function snapshot() {
     rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null, axisName: o.userData.joint.axisName || '', pointOff: o.userData.joint.pointOff || null, partOff: o.userData.joint.partOff || null } : null, off: !!o.userData.optOff,
     paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null,
     mods: o.userData.part?.mods ? JSON.parse(JSON.stringify(o.userData.part.mods)) : null, base: o.userData.part?.base || null, owner: o.userData.part?.owner || null,
-    ooze: o.userData.part?.ooze ? JSON.parse(JSON.stringify(o.userData.part.ooze)) : null }));
+    ooze: o.userData.part?.ooze ? JSON.parse(JSON.stringify(o.userData.part.ooze)) : null, grower: o.userData.part?.grower ? JSON.parse(JSON.stringify(o.userData.part.grower)) : null, prim: o.userData.part?.prim ? { ...o.userData.part.prim } : null, axes: o.userData.part?.axes ? [...o.userData.part.axes] : null, pivot: o.userData.part?.pivot ? [...o.userData.part.pivot] : null, noGrow: o.userData.part?.noGrow ? [...o.userData.part.noGrow] : null }));
   snap.options = JSON.parse(JSON.stringify(options));
   snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
   snap.kit = kit ? JSON.parse(JSON.stringify(kit)) : null;
@@ -810,7 +892,10 @@ function restore(snap) {
     if (e.o.userData.part) { e.o.userData.optOff = e.off;
       const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); }
       pt.mods = e.mods ? JSON.parse(JSON.stringify(e.mods)) : null; pt.base = e.base; if (e.owner) pt.owner = e.owner; else delete pt.owner;
-      if (e.ooze) pt.ooze = JSON.parse(JSON.stringify(e.ooze)); else delete pt.ooze; }
+      if (e.ooze) pt.ooze = JSON.parse(JSON.stringify(e.ooze)); else delete pt.ooze;
+      if (e.prim) pt.prim = { ...e.prim }; else delete pt.prim;
+      if (e.axes) pt.axes = [...e.axes]; else delete pt.axes; if (e.pivot) pt.pivot = [...e.pivot]; else delete pt.pivot;
+      if (e.grower) pt.grower = JSON.parse(JSON.stringify(e.grower)); else delete pt.grower; styleDraft(e.o, !!pt.grower?.draft); if (e.noGrow) pt.noGrow = [...e.noGrow]; else delete pt.noGrow; }
   }
   if (snap.options) options = JSON.parse(JSON.stringify(snap.options));
   if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
@@ -858,12 +943,11 @@ function setWorkspace(ws, o = {}) {
   document.querySelectorAll('.wstab').forEach(t => { const on = t.dataset.ws === ws; t.setAttribute('aria-selected', String(on)); t.tabIndex = on ? 0 : -1; });
   document.querySelectorAll('.tools [data-ws]').forEach(el => { el.hidden = !wsHas(el); });
   document.querySelectorAll('.wsops').forEach(el => { el.hidden = el.dataset.ws !== ws; });
-  $('ws-title').textContent = WS_NAMES[ws];
+  $('ws-title').textContent = WS_NAMES[ws]; $('ws-title').title = document.querySelector(`.wsops[data-ws="${ws}"] .wsnote`)?.textContent || '';
   const g = $('dock-ws'); g.classList.remove('folded'); g.querySelector('.dfold').setAttribute('aria-expanded', 'true');
   if (!o.keepTool && !wsHas(document.querySelector(`.tool[data-tool="${tool}"]`))) setTool('select');
   if (ws === 'files' && !$('tab-files').hidden) showDockTab('tab-files');
   else if (was === 'files' && ws !== 'files') showDockTab('tab-parts');
-  if (ws === 'export' && was !== 'export' && !o.quiet && liveParts().length && $('dlg-export').hidden) openDialog('dlg-export');
   if (was === 'export' && ws !== 'export') $('dlg-export').hidden = true;
   syncWsOps(); renderPartPanel();
   try { localStorage.setItem('kitbash-ws', ws); } catch (e) {}
@@ -873,15 +957,16 @@ function syncWsOps() {
   document.querySelectorAll('.wsop[data-click]').forEach(b => {
     const id = b.dataset.click, t = $(id);
     if (id === 'exp-sprue') b.disabled = $('exp-sprue-f').hidden;
-    else if (id.startsWith('exp-') || id === 'ws-sets') b.disabled = !liveParts().length;
+    else if (id.startsWith('exp-') || id === 'ws-sets' || id === 'ws-glue') b.disabled = !liveParts().length;
     else if (id === 'ws-drop' || id === 'ws-square' || id === 'ws-paint' || id === 'ws-magnet') b.disabled = !liveParts().length || ((id === 'ws-drop' || id === 'ws-square') && !selected);
     else if (t) b.disabled = t.disabled;
+    if (b.classList.contains('ctx')) b.hidden = b.disabled;              // (only there when it can be used)
     if (id === 'ws-paint' || id === 'ws-magnet') b.setAttribute('aria-pressed', String(tool === (id === 'ws-paint' ? 'paint' : 'MAGNET')));
     else if (t && t.hasAttribute('aria-checked')) b.setAttribute('aria-pressed', t.getAttribute('aria-checked'));
   });
 }
 /** The part's buttons in Properties: only the ones for this workspace (and the ones for every workspace). */
-const WS_BTNS = { 'Reset pose': 'assemble', 'Detach': 'assemble', 'Mirror…': 'assemble modify', 'Array…': 'assemble modify', 'Scatter…': 'modify', 'Crack…': 'modify', 'Split…': 'modify',
+const WS_BTNS = { 'Reset pose': 'assemble', 'Detach': 'assemble', 'Mirror…': 'assemble modify', 'Array…': 'assemble modify', 'Scatter…': 'modify', 'Crack…': 'modify', 'Burst…': 'modify', 'Use as growth': 'modify', 'Split…': 'modify',
   'Ooze…': 'modify', 'Change ooze…': 'modify', 'Clean inside': 'prepare', 'Drop to grid': 'assemble prepare', 'Square up': 'assemble prepare', 'Clear paint': 'modify' };
 function wsFilterButtons(row) {
   for (const b of row.querySelectorAll('button')) { const t = b.textContent.trim(), w = WS_BTNS[t] || (/^(Swap with|Make .* the base|Make it the base)/.test(t) ? 'assemble' : null); if (w && !w.split(' ').includes(workspace)) b.hidden = true; }
@@ -953,7 +1038,7 @@ function raycast(ev) {
   const ndc = new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const hits = raycaster.intersectObjects(liveParts().filter(p => p.visible && isVisibleChain(p)), false);
-  return hits[0] || null;
+  return (secCutting() ? hits.find(h => secClip.distanceToPoint(h.point) >= -1e-6) : hits[0]) || null;      // the section's cut-away side can't be clicked
 }
 function isVisibleChain(o) { for (let p = o; p; p = p.parent) if (!p.visible) return false; return true; }
 
@@ -1167,9 +1252,11 @@ function finishMatch(op, results, keepChoice) {
   const b = list[0];
   toast(matchVerdict(b).good ? `Fitted: ${matchVerdict(b).text}` : `Best fit is loose: ${matchVerdict(b).text}. Check the other fits in Adjust.`, matchVerdict(b).good ? 'ok' : 'bad');
 }
+/** How well a Lucky guess locks in, in words: a peg in its socket is held every way but out; a part resting on a curve isn't. */
+function lockWords(l) { return l >= 0.88 ? 'locks in' : ''; }
 function matchVerdict(r) {
   if (r.lucky) { const { contact, sunk } = r.lucky;
-    return { text: `${contact.toFixed(1)} mm² sitting flush` + (sunk >= 0.05 ? `, ${sunk.toFixed(1)} mm² overlapping` : ', nothing overlapping'), good: contact >= 2 && sunk < Math.max(0.3, contact * 0.05) }; }
+    return { text: `${contact.toFixed(1)} mm² sitting flush` + (sunk >= 0.05 ? `, ${sunk.toFixed(1)} mm² overlapping` : ', nothing overlapping') + (lockWords(r.lucky.lock ?? 0) ? `, ${lockWords(r.lucky.lock)}` : ''), good: contact >= 2 && sunk < Math.max(0.3, contact * 0.05) }; }
   if (r.seated) return { text: `seated: ${seatSummary(r.seated)}`, good: seatGood(r.seated, r.seatArea || 0) };
   const parts = [`typical gap ${r.gap.toFixed(2)} mm`, `${Math.round(r.coverage * 100)}% within ${r.covTol.toFixed(2)} mm`];
   if (r.ringErr != null) parts.push(`${r.rings > 1 ? 'pegs and holes' : 'peg and hole'} within ${r.ringErr.toFixed(2)} mm`);
@@ -1268,6 +1355,11 @@ async function luckySearch(child, fixed, effort, progress) {
     const starts = Lucky.pickStarts(ctx, found.flatMap(f => f.mine), found.flatMap(f => f.best), Math.round(900 * Math.sqrt(effort)));
     const chunks = workers.map((_, i) => starts.filter((s2, k) => k % workers.length === i));
     const refined = (await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'refine', starts: chunks[i] }, 'refined'))))).flatMap(r => r.out);
+    // pegs that landed a little off their sockets (wedged: touching but partly sunk): grid-seat them, shared out
+    progress(0.88, 'Seating pegs in their sockets…');
+    const wed = Lucky.wedged(ctx, refined);
+    const seated = (await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'seat', wedged: wed.filter((_, k) => k % workers.length === i) }, 'seated'))))).flatMap(r => r.out);
+    refined.push(...seated);
     progress(0.93, 'Settling the best few into place…');
     const { fits } = await phase(ask(workers[0], { type: 'rank', refined, max: 6 }, 'ranked'));
     progress(0.97, 'Marking where they touch…');
@@ -1291,6 +1383,9 @@ async function luckyHere(A, B, opts, progress, stopped) {
     if (stopped()) throw new Error('stopped');
     refined.push(...Lucky.refineAll(ctx, starts.slice(i, i + 25))); progress(0.83 + 0.13 * i / starts.length, 'Settling the best few into place…'); await nextFrame();
   }
+  progress(0.9, 'Seating pegs in their sockets…'); await nextFrame();
+  const wed = Lucky.wedged(ctx, refined);
+  for (let i = 0; i < wed.length; i += 40) { if (stopped()) throw new Error('stopped'); refined.push(...wed.slice(i, i + 40).map(o => Lucky.gridSeat(ctx, o))); await nextFrame(); }
   const fits = Lucky.rankFits(ctx, refined, 6);
   fits.forEach(f => Object.assign(f, Lucky.contactOf(ctx, f, A, B)));
   return fits;
@@ -1299,7 +1394,7 @@ function luckyResult(f, k) {
   const R = f.R, t = f.t;
   const T = new THREE.Matrix4().set(R[0], R[1], R[2], t[0], R[3], R[4], R[5], t[1], R[6], R[7], R[8], t[2], 0, 0, 0, 1);
   return { T, joint: V(...f.joint), axis: V(...f.axis).normalize(), label: k ? `guess ${k + 1}` : 'best guess', regionA: f.regionA, regionB: f.regionB,
-           sig: 'lucky' + k, lucky: { contact: f.contact, sunk: f.sunk }, coverage: 1, covTol: 0, gap: 0, size: 1, inside: 0, score: -f.score };
+           sig: 'lucky' + k, lucky: { contact: f.contact, sunk: f.sunk, lock: f.lock ?? null }, coverage: 1, covTol: 0, gap: 0, size: 1, inside: 0, score: -f.score };
 }
 function handleLuckyClick(hit) {
   if (!hit) { toast(luckyFirst ? `Missed. Click the part ${luckyFirst.name} fits onto.` : 'Missed. Click the part that moves.'); return; }
@@ -1376,7 +1471,7 @@ function nextName(n) {
 /** A copy of one part: same mesh (shared), its own colour, fill and brushed paint. */
 function clonePartAlone(m, name) {
   const pt = m.userData.part, c = addPart(name, m.geometry, { welded: true, geomKey: pt.geomKey, color: pt.color }), ct = c.userData.part;
-  ct.topo = pt.topo; ct.fill = pt.fill || null;
+  ct.topo = pt.topo; ct.fill = pt.fill || null; if (pt.prim && !pt.mods?.length) ct.prim = { ...pt.prim }; if (pt.axes) ct.axes = [...pt.axes]; if (pt.pivot) ct.pivot = [...pt.pivot];
   if (pt.paint) { ownGeometry(c); ct.paint = pt.paint.slice(); ct.paintVer = 1; }
   refreshPaint(c); c.visible = m.visible;
   return c;
@@ -1935,153 +2030,192 @@ function channelEnds(op, target, dir) {
 }
 
 // ---------------------------------------------------------------------------
-// Fit check: three cross-sections through the joint
+// Section view: a plane you move and turn like a part. It cuts the view open (with solid caps where it cuts
+// through a part, red where two solids overlap) and draws three cross-sections: on the plane, and square to it.
 // ---------------------------------------------------------------------------
-const fit = { zoom: 1, op: null, cuts: null, R: 5, pending: false, depthFrac: 0 };
+const fit = { zoom: 1, cuts: null, R: 5, pending: false, pinned: false };       // the panel's state (the name is from the old fit check)
+const sec = { on: false, cut: true, show: true, size: 40, helpers: new Map() };
+const secObj = new THREE.Group(); secObj.name = 'section-plane'; secObj.visible = false; scene.add(secObj);
+const secGfx = new THREE.Group(); secObj.add(secGfx);
+const secQuad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .12, side: THREE.DoubleSide, depthWrite: false }));
+secQuad.userData.section = true; secQuad.renderOrder = 996; secGfx.add(secQuad);
+const secEdge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([V(-.5, -.5), V(.5, -.5), V(.5, .5), V(-.5, .5)]), new THREE.LineBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .9 }));
+secQuad.add(secEdge);
+const secCross = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints([V(-.5, 0), V(.5, 0), V(0, -.5), V(0, .5)]), new THREE.LineBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .35 }));
+secQuad.add(secCross);
+const secArrow = new THREE.ArrowHelper(V(0, 0, 1), V(), 1, 0xd6a24a, 0.25, 0.14); secGfx.add(secArrow);     // points to the side that stays
+const secClip = new THREE.Plane(), secPlanes = [secClip];
+// caps: every part is drawn again into the stencil (back faces add, front faces take away), so wherever the plane cuts
+// through solid the count is 1, and 2 or more where solids overlap. The caps fill those in.
+const secStBack = new THREE.MeshBasicMaterial({ side: THREE.BackSide, colorWrite: false, depthWrite: false, depthTest: false, clippingPlanes: secPlanes,
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc, stencilFail: THREE.IncrementWrapStencilOp, stencilZFail: THREE.IncrementWrapStencilOp, stencilZPass: THREE.IncrementWrapStencilOp });
+const secStFront = secStBack.clone(); secStFront.side = THREE.FrontSide; secStFront.clippingPlanes = secPlanes;
+secStFront.stencilFail = secStFront.stencilZFail = secStFront.stencilZPass = THREE.DecrementWrapStencilOp;
+const secCapMat = new THREE.MeshStandardMaterial({ color: '#c8a35e', roughness: 0.9, metalness: 0, side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp });
+const secOverMat = new THREE.MeshBasicMaterial({ color: '#e36b6b', side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 2, stencilFunc: THREE.LessEqualStencilFunc, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp });
+const secCap = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), secCapMat), secOver = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), secOverMat);
+secCap.renderOrder = 2; secOver.renderOrder = 3; secOver.onAfterRender = r => r.clearStencil();
+secObj.add(secCap, secOver);
+const secHelpers = new THREE.Group(); secHelpers.name = 'section-stencil'; scene.add(secHelpers);
 const cutPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .14, side: THREE.DoubleSide, depthWrite: false }));
 const cutEdge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([V(-.5,-.5), V(.5,-.5), V(.5,.5), V(-.5,.5)]), new THREE.LineBasicMaterial({ color: '#d6a24a', depthTest: false }));
 cutPlane.add(cutEdge); cutPlane.visible = false; cutPlane.renderOrder = 997; scene.add(cutPlane);
 
-function fitRadius(op) {
-  if (op.mode === 'BALL' && op.a[0].radius) return op.a[0].radius * 2.2;
-  const d = Math.min(worldBox(op.child).getSize(V()).length(), worldBox(op.fixed).getSize(V()).length());
-  return Math.min(Math.max(d * 0.3, 1.5), 60);
+const secCutting = () => sec.on && sec.cut;
+/** Every frame: the clip plane follows the plane object, parts get (or lose) the clip, and the stencil copies follow their parts. */
+function updateSection() {
+  const cutting = secCutting();
+  if (sec.on) { secObj.updateMatrixWorld(true); const n = V(0, 0, 1).transformDirection(secObj.matrixWorld); secClip.setFromNormalAndCoplanarPoint(n, secObj.position); }
+  const live = liveParts();
+  for (const m of live) { const want = cutting ? secPlanes : null, mat = m.material;
+    if (mat && (mat.clippingPlanes || null) !== want) { mat.clippingPlanes = want; mat.needsUpdate = true; } }
+  secCap.visible = secOver.visible = cutting;
+  if (!cutting) { if (sec.helpers.size) { secHelpers.clear(); sec.helpers.clear(); } return; }
+  const alive = new Set(live);
+  for (const [m, h] of sec.helpers) if (!alive.has(m)) { secHelpers.remove(h.back, h.front); sec.helpers.delete(m); }
+  for (const m of live) {
+    let h = sec.helpers.get(m);
+    if (!h) { h = { back: new THREE.Mesh(m.geometry, secStBack), front: new THREE.Mesh(m.geometry, secStFront) };
+      for (const x of [h.back, h.front]) { x.matrixAutoUpdate = false; x.renderOrder = 1; x.raycast = () => {}; secHelpers.add(x); } sec.helpers.set(m, h); }
+    m.updateWorldMatrix(true, false); const vis = isVisibleChain(m);
+    for (const x of [h.back, h.front]) { if (x.geometry !== m.geometry) x.geometry = m.geometry; x.matrix.copy(m.matrixWorld); x.matrixWorldNeedsUpdate = true; x.visible = vis; }
+  }
+  const big = Math.max(sceneBox().getSize(V()).length() * 3, sec.size * 4, 100); secCap.scale.set(big, big, 1); secOver.scale.copy(secCap.scale);
 }
-function defaultDepthFrac(op) { return op.mode === 'PLANE' || (op.mode === 'MATCH' && op.match?.flat) ? -0.15 : 0; }   // flat contact: look just inside the fixed part     // faces: look just inside the fixed part, where a peg sits in its hole
-function scheduleFit() { if (fit.pending) return; fit.pending = true; requestAnimationFrame(() => { fit.pending = false; drawFit(); }); }
-
-/*
- * The fit check shows by itself right after a snap. K (or View › Fit check) keeps it up any time: then it cuts through
- * whatever you're working on — the selected part where it hangs off its parent (at the joint), two selected parts where
- * they meet, or a loose part where it meets its nearest neighbour — and follows them live while you move or pose.
- */
-fit.pinned = (() => { try { return localStorage.getItem('kitbash-fit') === '1'; } catch (e) { return false; } })();
-fit.hiddenFor = null;                // × hides the snap's own fit check until the next snap
-function setFitPinned(on) {
-  fit.pinned = on; try { localStorage.setItem('kitbash-fit', on ? '1' : '0'); } catch (e) {}
-  if (on) { fit.hiddenFor = null; $('fit-body').hidden = false; } else fit.hiddenFor = lastOp;
-  $('menu-fit')?.setAttribute('aria-checked', String(on)); showFit();
-}
-/** Where we're looking: { A (moving), B (fixed), point, axis, radius, key } in world space, or null. */
-function fitSource() {
-  const op = lastOp;
-  const onOp = op?.result && op.child.parent && (!fit.pinned || !selected || selected === op.child || selected === op.fixed);
-  if (onOp && fit.hiddenFor !== op) return { A: op.child, B: op.fixed, point: op.result.joint, axis: op.jointAxis || V(0, 0, 1), radius: fitRadius(op), op, key: 'op' };
-  if (!fit.pinned) return null;
-  const sel = selection.length ? selection : selected ? [selected] : [];
-  let A = null, B = null;
-  if (sel.length >= 2) { A = selected || sel[sel.length - 1]; B = sel.find(m => m !== A); }
-  else if (sel.length === 1) { A = sel[0]; B = parentPart(A); }
-  if (!A) return null;
+/** Where to put the plane when it's turned on: through the joint or the selection (or the middle of everything), facing you. */
+function sectionStart() {
   scene.updateMatrixWorld(true);
-  if (!B) {                                        // the base or a loose part: its nearest neighbour, else the nearest part attached to it
-    const ab = worldBox(A), c = ab.getCenter(V()), mine = subtreeParts(A), near = list => { let best = Infinity, n = null;
-      for (const m of list) { if (m === A || !m.visible) continue; const d = worldBox(m).distanceToPoint(c); if (d < best) { best = d; n = m; } } return n; };
-    B = near(liveParts().filter(m => !mine.includes(m)));
-    if (!B) { const kid = near(mine.filter(m => parentPart(m) === A)); if (!kid) return null; B = A; A = kid; }
-  }
-  const key = A.uuid + '|' + B.uuid, j = parentPart(A) === B ? jointOf(A) : null;
-  if (j) return { A, B, point: V().setFromMatrixPosition(j.matrixWorld), axis: V(0, 0, 1).transformDirection(j.matrixWorld), radius: jointRadius(A, B), key };
-  // no joint: where they meet, worked out once and carried along with the moving part
-  if (fit.cache?.key !== key) {
-    const pv = pivotPoint(A, B), pt = pv.point.clone(), ax = pv.axis.clone();
-    if (!(ax.lengthSq() > 1e-12)) ax.set(0, 0, 1); ax.normalize();
-    const inv = A.matrixWorld.clone().invert();
-    fit.cache = { key, p: pt.applyMatrix4(inv), n: ax.transformDirection(inv) };
-  }
-  return { A, B, point: fit.cache.p.clone().applyMatrix4(A.matrixWorld), axis: fit.cache.n.clone().transformDirection(A.matrixWorld), radius: jointRadius(A, B), key };
+  const sel = selection.length ? selection : selected ? [selected] : [];
+  let point, axis = null, R;
+  const A = selected || sel[sel.length - 1];
+  if (A) {
+    const B = sel.length >= 2 ? sel.find(m => m !== A) : parentPart(A), j = B && parentPart(A) === B ? jointOf(A) : null;
+    if (j) { point = V().setFromMatrixPosition(j.matrixWorld); axis = V(0, 0, 1).transformDirection(j.matrixWorld); R = jointRadius(A, B); }
+    else { const b = sceneBox([...new Set(sel)]); point = b.getCenter(V()); R = Math.max(b.getSize(V()).length() * 0.6, 3); }
+  } else { const b = sceneBox(liveParts().filter(isVisibleChain)); if (b.isEmpty()) { point = orbit.target.clone(); R = 20; } else { point = b.getCenter(V()); R = Math.max(b.getSize(V()).length() * 0.6, 3); } }
+  const look = orbit.target.clone().sub(camera.position).normalize();
+  let n;
+  if (axis) { const bs = jointBasis(axis); n = Math.abs(bs.X.dot(look)) >= Math.abs(bs.Y.dot(look)) ? bs.X : bs.Y; }      // the plane runs along the joint
+  else { const ax = [V(1, 0, 0), V(0, 1, 0), V(0, 0, 1)]; n = ax.reduce((a, b) => Math.abs(b.dot(look)) > Math.abs(a.dot(look)) ? b : a).clone(); }
+  if (n.dot(look) < 0) n.negate();                        // the side away from you stays: you look into the cut
+  setSectionPlane(point, n, Math.min(Math.max(R * 2, 4), 400));
+}
+function setSectionPlane(point, n, size = sec.size) {
+  const bs = jointBasis(n); secObj.position.copy(point); secObj.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(bs.X, bs.Y, bs.Z));
+  sec.size = size; sizeSection(); secObj.updateMatrixWorld(true); fit.zoom = 1;
+}
+function sizeSection() { const si = $('sec-size'); if (si && document.activeElement !== si) si.value = +sec.size.toFixed(1); secQuad.scale.set(sec.size, sec.size, 1); secArrow.setLength(sec.size * 0.18, sec.size * 0.05, sec.size * 0.03); }
+function scheduleFit() { if (fit.pending || !sec.on) return; fit.pending = true; requestAnimationFrame(() => { fit.pending = false; drawFit(); }); }
+/** K, View › Section view: on puts the plane through what's selected, facing you, and picks it up to move. */
+function setFitPinned(on) {
+  if (on && !sec.on) sectionStart();
+  sec.on = on; fit.pinned = on;
+  secObj.visible = on; secGfx.visible = sec.show; $('fit-body').hidden = false;
+  $('menu-fit')?.setAttribute('aria-checked', String(on)); $('sec-cut').checked = sec.cut; $('sec-show').checked = sec.show;
+  if (on) { selectBench('section'); if (!['move', 'rotate'].includes(tool)) setTool('move'); }
+  else { if (benchSel?.kind === 'section') { benchSel = null; benchMark.visible = false; syncGizmo(); renderPartPanel(); } cutPlane.visible = false; }
+  updateSection(); showFit();
 }
 function jointRadius(A, B) { const d = Math.min(worldBox(A).getSize(V()).length(), worldBox(B).getSize(V()).length()); return Math.min(Math.max(d * 0.3, 1.5), 60); }
-function showFit() {
-  const el = $('fitcheck'), src = fitSource();
-  $('menu-fit')?.setAttribute('aria-checked', String(fit.pinned));
-  if (!src) {
-    if (fit.pinned) {            // on, but nothing to cut yet
-      el.hidden = false; fit.src = null; $('fit-a').textContent = 'moving'; $('fit-b').textContent = 'fixed';
-      for (let i = 0; i < 3; i++) { const cv = $('cut' + i); cv.getContext('2d').clearRect(0, 0, cv.width, cv.height); $('cut' + i + '-read').textContent = i ? '' : selected ? 'Nothing near it' : 'Select a part'; $('cut' + i + '-read').className = 'read'; }
-      return;
-    }
-    el.hidden = true; cutPlane.visible = false; fit.src = null; return;
-  }
-  if (fit.src?.key !== src.key || fit.src?.op !== src.op || fit.src?.A !== src.A) {
-    fit.zoom = 1; fit.depthFrac = src.op ? defaultDepthFrac(src.op) : 0; $('fit-depth').value = Math.round(fit.depthFrac * 100);
-  }
-  fit.src = src; $('fit-a').textContent = src.A.name; $('fit-b').textContent = src.B.name;
-  el.hidden = false; scheduleFit();
+function showFit() { $('fitcheck').hidden = !sec.on; $('menu-fit')?.setAttribute('aria-checked', String(sec.on)); if (sec.on) scheduleFit(); }
+/** The three cuts: on the plane, and square to it along each of its edges. */
+function sectionCuts() {
+  secObj.updateMatrixWorld(true);
+  const e = secObj.matrixWorld.elements, u = V(e[0], e[1], e[2]).normalize(), v = V(e[4], e[5], e[6]).normalize(), n = V(e[8], e[9], e[10]).normalize(), o = secObj.position.clone();
+  const mk = (name, normal, cu, cv, line) => ({ name, normal, u: cu, v: cv, origin: o, plane: new THREE.Plane().setFromNormalAndCoplanarPoint(normal, o), line });
+  return [mk('Section', n, u, v, null), mk('Across', u, n.clone().negate(), v, 'v'), mk('Along', v, u, n, 'h')];
 }
 function drawFit() {
-  if ($('fitcheck').hidden || $('fit-body').hidden) return;
-  const src = fit.src && fit.src.A.parent && fit.src.B.parent ? fitSource() : null; if (!src) return;
+  if (!sec.on || $('fitcheck').hidden || $('fit-body').hidden) return;
   scene.updateMatrixWorld(true);
-  const R = src.radius * fit.zoom; fit.R = R;
-  const depth = fit.depthFrac * R;
-  $('fit-depth-n').textContent = `${depth >= 0 ? '+' : ''}${depth.toFixed(2)} mm`;
-  fit.cuts = fitCuts(src.point, src.axis, depth);
+  const R = sec.size / 2 * fit.zoom; fit.R = R;
+  fit.cuts = sectionCuts();
+  const ball = new THREE.Sphere(secObj.position, R * 1.5), shown = liveParts().filter(m => isVisibleChain(m) && worldBox(m).intersectsSphere(ball));
+  const sel = new Set(selection.length ? selection : selected ? [selected] : []);
+  let cutN = 0;
   fit.cuts.forEach((c, i) => {
-    const A = sliceMesh(src.A.geometry, src.A.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH);
-    const B = sliceMesh(src.B.geometry, src.B.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH);
-    drawCut($('cut' + i), $('cut' + i + '-read'), A, B, R, c);
+    const items = [];
+    for (const m of shown) { if (!worldBox(m).intersectsPlane(c.plane)) continue; const seg = sliceMesh(m.geometry, m.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH); if (seg.length) items.push({ m, seg, color: '#' + _c.set(baseColor(m)).getHexString(), sel: sel.has(m) }); }
+    if (i === 0) cutN = items.length;
+    drawCut($('cut' + i), $('cut' + i + '-read'), items, R, c);
   });
+  $('fit-a').textContent = cutN ? `${cutN} part${cutN === 1 ? '' : 's'} cut` : 'nothing cut';
 }
 
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 function niceStep(span) { const raw = span / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
-function drawCut(cv, read, A, B, R, cut) {
+function drawCut(cv, read, items, R, cut) {
   const dpr = Math.min(devicePixelRatio || 1, 2), size = Math.max(cv.clientWidth, 60), px = Math.round(size * dpr);
   if (cv.width !== px) { cv.width = cv.height = px; }
   const ctx = cv.getContext('2d'), s = px / (2 * R), X = x => px / 2 + x * s, Y = y => px / 2 - y * s;
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, px, px);
-  // grid with a mm scale
   const step = niceStep(2 * R);
-  ctx.strokeStyle = '#232a30'; ctx.lineWidth = 1;
-  ctx.beginPath();
+  ctx.strokeStyle = '#232a30'; ctx.lineWidth = 1; ctx.beginPath();
   for (let g = Math.ceil(-R / step) * step; g <= R; g += step) { ctx.moveTo(X(g), 0); ctx.lineTo(X(g), px); ctx.moveTo(0, Y(g)); ctx.lineTo(px, Y(g)); }
   ctx.stroke();
+  // on the side cuts: the plane as a line, the side it cuts away shaded
+  if (cut.line) {
+    if (secCutting()) { ctx.fillStyle = 'rgba(0,0,0,.35)'; if (cut.line === 'v') ctx.fillRect(X(0), 0, px - X(0), px); else ctx.fillRect(0, Y(0), px, px - Y(0)); }
+    ctx.strokeStyle = '#d6a24a'; ctx.lineWidth = Math.max(1, dpr); ctx.setLineDash([4 * dpr, 3 * dpr]); ctx.beginPath();
+    if (cut.line === 'v') { ctx.moveTo(X(0), 0); ctx.lineTo(X(0), px); } else { ctx.moveTo(0, Y(0)); ctx.lineTo(px, Y(0)); }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
   const path = seg => { const p2 = new Path2D(); for (const l of chainSegments(seg, R)) { p2.moveTo(X(l.pts[0]), Y(l.pts[1]));
       for (let i = 2; i < l.pts.length; i += 2) p2.lineTo(X(l.pts[i]), Y(l.pts[i+1])); if (l.closed) p2.closePath(); } return p2; };
-  const pA = path(A), pB = path(B);
-  const mv = css('--move') || '#4db4dc', fx2 = css('--fixed') || '#e2804f';
-  ctx.globalAlpha = 0.3; ctx.fillStyle = fx2; ctx.fill(pB, 'evenodd'); ctx.fillStyle = mv; ctx.fill(pA, 'evenodd'); ctx.globalAlpha = 1;
-  // overlap: draw each part into its own channel and find pixels both cover
-  const off = drawCut.off ||= document.createElement('canvas'); off.width = off.height = px;
-  const o = off.getContext('2d', { willReadFrequently: true });
-  o.setTransform(1, 0, 0, 1, 0, 0); o.clearRect(0, 0, px, px); o.globalCompositeOperation = 'lighter';
-  o.fillStyle = '#ff0000'; o.fill(pA, 'evenodd'); o.fillStyle = '#00ff00'; o.fill(pB, 'evenodd');
-  const img = o.getImageData(0, 0, px, px), d = img.data; let over = 0;
-  for (let i = 0; i < d.length; i += 4) { const both = d[i] > 200 && d[i+1] > 200; if (both) { over++; d[i] = 227; d[i+1] = 107; d[i+2] = 107; d[i+3] = 235; } else d[i+3] = 0; }
-  o.globalCompositeOperation = 'source-over'; o.putImageData(img, 0, 0); ctx.drawImage(off, 0, 0);
-  ctx.lineWidth = Math.max(1.2, dpr); ctx.strokeStyle = fx2; ctx.stroke(pB); ctx.strokeStyle = mv; ctx.stroke(pA);
-  // joint marker and axis
-  ctx.strokeStyle = '#d6a24a'; ctx.lineWidth = 1; ctx.setLineDash([3 * dpr, 3 * dpr]);
-  if (cut.name !== 'Across') { ctx.beginPath(); ctx.moveTo(X(0), px); ctx.lineTo(X(0), 0); ctx.stroke(); }
-  ctx.setLineDash([]); ctx.beginPath(); ctx.arc(X(0), Y(cut.name === 'Across' ? 0 : 0), 3 * dpr, 0, Math.PI * 2); ctx.stroke();
-  // scale bar
+  const paths = items.map(it => path(it.seg));
+  ctx.globalAlpha = 0.35; items.forEach((it, i) => { ctx.fillStyle = it.color; ctx.fill(paths[i], 'evenodd'); }); ctx.globalAlpha = 1;
+  // overlap: count how many solids cover each pixel
+  let over = 0;
+  if (items.length >= 2) {
+    const off = drawCut.off ||= document.createElement('canvas'); off.width = off.height = px;
+    const o = off.getContext('2d', { willReadFrequently: true }), cnt = new Uint8Array(px * px);
+    o.setTransform(1, 0, 0, 1, 0, 0); o.fillStyle = '#fff';
+    for (const p2 of paths) { o.clearRect(0, 0, px, px); o.fill(p2, 'evenodd'); const d = o.getImageData(0, 0, px, px).data; for (let k = 0, q = 3; k < cnt.length; k++, q += 4) if (d[q] > 128) cnt[k]++; }
+    const img = o.createImageData(px, px), d = img.data;
+    for (let k = 0; k < cnt.length; k++) if (cnt[k] >= 2) { over++; d[4*k] = 227; d[4*k+1] = 107; d[4*k+2] = 107; d[4*k+3] = 235; }
+    o.clearRect(0, 0, px, px); o.putImageData(img, 0, 0); ctx.drawImage(off, 0, 0);
+  }
+  items.forEach((it, i) => { ctx.lineWidth = (it.sel ? 2 : 1.2) * dpr; ctx.strokeStyle = it.sel ? '#ffffff' : it.color; ctx.stroke(paths[i]); });
+  ctx.strokeStyle = '#d6a24a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(X(0), Y(0), 3 * dpr, 0, Math.PI * 2); ctx.stroke();
   ctx.fillStyle = '#8d969e'; ctx.font = `${10 * dpr}px "IBM Plex Mono", monospace`;
   const bar = step * s; ctx.fillRect(6 * dpr, px - 8 * dpr, bar, 2 * dpr);
   ctx.fillText(`${+step.toPrecision(3)} mm`, 6 * dpr, px - 12 * dpr);
-  // readout
   const area = over / (s * s);
-  if (!A.length || !B.length) { read.textContent = !A.length && !B.length ? 'no parts here' : !A.length ? 'moving part not cut' : 'fixed part not cut'; read.className = 'read'; return; }
+  if (!items.length) { read.textContent = 'nothing here'; read.className = 'read'; return; }
   if (area > Math.max(4 / (s * s), R * R * 1e-5)) { read.textContent = `overlap ${area.toFixed(area < 1 ? 3 : 2)} mm²`; read.className = 'read bad'; return; }
-  const gap = segmentsGap(A, B);
-  if (gap < 0.005) { read.textContent = 'touching'; read.className = 'read ok'; }
-  else { read.textContent = `gap ${gap.toFixed(gap < 1 ? 3 : 2)} mm`; read.className = 'read gap'; }
+  if (items.length === 2) { const gap = segmentsGap(items[0].seg, items[1].seg);
+    if (gap < 0.005) { read.textContent = 'touching'; read.className = 'read ok'; } else { read.textContent = `gap ${gap.toFixed(gap < 1 ? 3 : 2)} mm`; read.className = 'read gap'; } return; }
+  read.textContent = items.length === 1 ? items[0].m.name : `${items.length} parts, no overlap`; read.className = 'read' + (items.length > 1 ? ' ok' : '');
 }
+/** Turn it so you look straight into the cut, keeping its middle. */
+function sectionFaceView() { const look = orbit.target.clone().sub(camera.position).normalize(); setSectionPlane(secObj.position.clone(), look, sec.size); markBench(); syncGizmo(); scheduleFit(); }
+function sectionFlip() { secObj.rotateX(Math.PI); secObj.updateMatrixWorld(true); markBench(); syncGizmo(); scheduleFit(); }
+function sectionAtSelection() { const keep = benchSel?.kind === 'section'; sectionStart(); if (keep) { markBench(); syncGizmo(); } scheduleFit(); }
 function bindFit() {
-  $('fit-head').addEventListener('click', () => { $('fit-body').hidden = !$('fit-body').hidden; cutPlane.visible = false; scheduleFit(); });
-  $('fit-depth').addEventListener('input', () => { fit.depthFrac = +$('fit-depth').value / 100; scheduleFit(); });
+  $('fit-head').addEventListener('click', e => { if (e.target.closest('button, input, label')) return; $('fit-body').hidden = !$('fit-body').hidden; cutPlane.visible = false; scheduleFit(); });
+  $('sec-pick').addEventListener('click', () => { selectBench('section'); if (!['move', 'rotate'].includes(tool)) setTool('move'); });
+  $('sec-flip').addEventListener('click', sectionFlip);
+  $('sec-face').addEventListener('click', sectionFaceView);
+  $('sec-here').addEventListener('click', sectionAtSelection);
+  $('sec-cut').addEventListener('change', () => { sec.cut = $('sec-cut').checked; updateSection(); scheduleFit(); });
+  $('sec-show').addEventListener('change', () => { sec.show = $('sec-show').checked; secGfx.visible = sec.show; });
+  $('sec-size').addEventListener('change', () => { const v = +$('sec-size').value; if (v > 0) { sec.size = Math.min(Math.max(v, 1), 2000); sizeSection(); markBench(); scheduleFit(); } });
   document.querySelectorAll('.cut').forEach(fig => {
     const cv = fig.querySelector('canvas'), i = +fig.dataset.i;
     cv.addEventListener('wheel', e => { e.preventDefault(); fit.zoom = Math.min(Math.max(fit.zoom * (e.deltaY > 0 ? 1.15 : 1 / 1.15), 0.05), 20); scheduleFit(); }, { passive: false });
-    cv.addEventListener('dblclick', () => { fit.zoom = 1; if (fit.src?.op) { fit.depthFrac = defaultDepthFrac(fit.src.op); $('fit-depth').value = Math.round(fit.depthFrac * 100); } scheduleFit(); });
+    cv.addEventListener('dblclick', () => { fit.zoom = 1; scheduleFit(); });
     fig.addEventListener('mouseenter', () => {
-      const c = fit.cuts?.[i]; if (!c) return;
+      const c = fit.cuts?.[i]; if (!c || i === 0) return;
       const R = fit.R; cutPlane.position.copy(c.origin);
       cutPlane.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(c.u, c.v, c.normal));
       cutPlane.scale.set(2 * R, 2 * R, 1); cutPlane.visible = true;
     });
     fig.addEventListener('mouseleave', () => { cutPlane.visible = false; });
   });
+  // hand the keys back to the view after using a control here (so G, R, X and K keep working)
+  $('fitcheck').querySelectorAll('.fit-foot button, .fit-foot input[type=checkbox]').forEach(x => x.addEventListener('click', () => setTimeout(() => x.blur(), 0)));
   new ResizeObserver(() => scheduleFit()).observe($('fitcheck'));
 }
 function flashCentres() {          // briefly show the centres now in use
@@ -2101,6 +2235,12 @@ function rerunLast() {
 // ---------------------------------------------------------------------------
 // Adjust Last Operation panel
 // ---------------------------------------------------------------------------
+/** Keep the snap as it is: the Adjust panel and the pick markers go away. */
+function acceptSnap() {
+  if (!lastOp) return;
+  const name = lastOp.child?.name; lastOp = null; $('adjust').hidden = true; clearFx(); showFit(); renderPartPanel(); updateStep();
+  toast(name ? `${name} placed.` : 'Placed.', 'ok');
+}
 function showAdjust() {
   const op = lastOp, el = $('adjust');
   showFit();
@@ -2132,7 +2272,7 @@ function showAdjust() {
     op.match.results.forEach((r, k) => {
       const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.setAttribute('aria-pressed', k === op.match.chosen ? 'true' : 'false');
       const t = document.createElement('span'); t.textContent = r.lucky ? `Guess ${k + 1}: ${r.lucky.contact.toFixed(1)} mm² flush` : r.seated ? `Fit ${k + 1}: ${r.seated.contact.toFixed(1)} mm² touching` : `Fit ${k + 1}: ${Math.round(r.coverage * 100)}% contact`;
-      const sm = document.createElement('small'); sm.textContent = r.lucky ? (r.lucky.sunk >= 0.05 ? `${r.lucky.sunk.toFixed(1)} mm² overlapping` : 'nothing overlapping') : r.seated ? `${r.label}` : `gap ${r.gap.toFixed(2)} mm · ${r.label}`;
+      const sm = document.createElement('small'); sm.textContent = r.lucky ? (r.lucky.sunk >= 0.05 ? `${r.lucky.sunk.toFixed(1)} mm² overlapping` : 'nothing overlapping') + (lockWords(r.lucky.lock ?? 0) ? ` · ${lockWords(r.lucky.lock)}` : '') : r.seated ? `${r.label}` : `gap ${r.gap.toFixed(2)} mm · ${r.label}`;
       b.append(t, sm); b.addEventListener('click', () => { op.match.chosen = k; rerunLast(); showAdjust(); flashMatch(); });
       box.append(b);
     });
@@ -2210,6 +2350,8 @@ function bindAdjust() {
     });
   });
   $('adjust-head').addEventListener('click', () => { $('adjust-body').hidden = !$('adjust-body').hidden; });
+  $('adj-accept').addEventListener('click', acceptSnap);
+  $('adj-undo').addEventListener('click', () => { undo(); toast('Snap undone.'); });
   $('adj-search').addEventListener('click', searchAllFaces);
 
   // nudges
@@ -2293,20 +2435,23 @@ function select(mesh, mode = 'replace') {
   else if (m && mode === 'add' && !isSel(m)) selection = [...selection, m];
   selected = m && isSel(m) ? m : selection[selection.length - 1] || null;
   paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); renderOptions(); updateButtons();
-  if (fit.pinned) showFit();
+  if (sec.on) scheduleFit();
 }
 function selectMany(list, add = false) {
   selection = add ? [...new Set([...selection, ...list])] : [...new Set(list)];
   selected = selection[selection.length - 1] || null;
   paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); renderOptions(); updateButtons();
-  if (fit.pinned) showFit();
+  if (sec.on) scheduleFit();
 }
 /** Selected parts that aren't inside another selected part's attachments (those move with it anyway). */
 function selectionRoots() { return selection.filter(m => m.parent && !selection.some(o => o !== m && isDescendant(m, o))); }
 let gizmoBase = null;
+/** Some tool is waiting for clicks on parts (cracking, bursting, ooze, placing a growth, picking faces). */
+function placingSpot() { try { return !!(dirPick || oz || modHit || dm || bz || gp); } catch (e) { return false; } }
 function syncGizmo() {
   tc.detach(); tc.showX = tc.showY = tc.showZ = true;
-  slideJ = null; $('pose-roller').hidden = true; connDrag = null;
+  slideJ = null; $('pose-roller').hidden = true; connDrag = null; axesDrag = null; axesFx.visible = false;
+  if (placingSpot()) return;                         // clicking spots on parts: no gizmo in the way (it would take the click)
   if (connSel && ['move', 'rotate'].includes(tool)) {
     const ci = connInfo(connSel); if (!ci) return;
     proxy.position.copy(ci.point); proxy.scale.set(1, 1, 1);
@@ -2317,6 +2462,10 @@ function syncGizmo() {
     tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace(moveFrame === 'world' ? 'world' : 'local'); tc.attach(proxy);
     connDrag = { c: connSel };
     $('move-frame-note').textContent = moveFrame === 'world' ? 'world axes' : 'the connection\'s own axes'; return;
+  }
+  if (benchSel?.kind === 'section' && ['move', 'rotate'].includes(tool)) {             // the section plane moves and turns in its own frame: Z pushes it through
+    if (!sec.on) return; proxy.position.copy(secObj.position); proxy.quaternion.copy(secObj.quaternion); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+    tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace('local'); tc.attach(proxy); return;
   }
   if (benchSel && ['move', 'rotate'].includes(tool)) {
     const o = benchObj(); if (!o) return;
@@ -2349,7 +2498,12 @@ function syncGizmo() {
     if (t !== 'pinned') { tc.showX = tc.showY = false; }          // a hinge turns about its Z only
     tc.attach(j); return;
   }
-  const c = sceneBox(selection.length ? selection : [selected]).getCenter(V());
+  if (axesEdit && selection.length <= 1) {            // Edit axes: the gizmo turns and moves the part's axes and origin, not the part
+    showAxesFx(selected); proxy.position.copy(axesFx.position); proxy.quaternion.copy(partFrameQ(selected)); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+    tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace('local'); tc.attach(proxy); axesDrag = { part: selected };
+    $('move-frame-note').textContent = `${selected.name}'s axes`; return;
+  }
+  const c = (selection.length <= 1 && partPivot(selected)) || sceneBox(selection.length ? selection : [selected]).getCenter(V());
   proxy.position.copy(c); proxy.scale.set(1, 1, 1);
   const fr = gizmoFrame(selected);
   proxy.quaternion.copy(fr.q); proxy.updateMatrixWorld(true);
@@ -2367,7 +2521,7 @@ let slideJ = null;                  // posing a roller by its slide arrow: { j, 
 let connDrag = null;                // dragging a selected connection's point or axes: { c, p, q }
 function gizmoFrame(part) {
   const q = new THREE.Quaternion();
-  if (moveFrame === 'part') { part.updateMatrixWorld(true); part.getWorldQuaternion(q); return { q, local: true, note: `${part.name}'s own axes` }; }
+  if (moveFrame === 'part') { q.copy(partFrameQ(part)); return { q, local: true, note: `${part.name}'s own axes` }; }
   if (moveFrame === 'parent') {
     const j = jointOf(part), par = parentPart(part);
     if (j) { j.getWorldQuaternion(q); return { q, local: true, note: `${par.name}: its joint's axes` }; }
@@ -2409,6 +2563,7 @@ tc.addEventListener('mouseDown', () => {
     gizmoBase = { M0inv: proxy.matrixWorld.clone().invert(), items, bench: { o, W0: o.matrixWorld.clone(), sel: { ...benchSel } } };
     return;
   }
+  if (tc.object === proxy && axesDrag) return;
   if (tc.object === proxy && connDrag) { connDrag.p = proxy.position.clone(); connDrag.q = proxy.quaternion.clone(); return; }
   if (tc.object === proxy && slideJ) { slideJ.v0 = jointValue(slideJ.j); slideJ.p0 = proxy.position.clone(); poseHeld = links.length ? linkedState(slideJ.j) : null; return; }
   if (tc.object === proxy && selected) {
@@ -2417,7 +2572,13 @@ tc.addEventListener('mouseDown', () => {
   }
 });
 tc.addEventListener('objectChange', () => {
-  if (fit.src && !$('fitcheck').hidden) scheduleFit();          // the cross-sections follow the drag
+  if (sec.on) scheduleFit();          // the cross-sections follow the drag
+  if (tc.object === proxy && axesDrag) {
+    const m = axesDrag.part; proxy.updateMatrixWorld(true);
+    if (tc.mode === 'rotate') setPartFrame(m, proxy.quaternion.clone());
+    else { m.updateMatrixWorld(true); m.userData.part.pivot = proxy.position.clone().applyMatrix4(m.matrixWorld.clone().invert()).toArray().map(v => +v.toFixed(6)); }
+    showAxesFx(m); return;
+  }
   if (tc.object === proxy && connDrag?.p) {
     const ci = connInfo(connDrag.c); if (!ci) return;
     if (tc.mode === 'translate') {
@@ -2465,12 +2626,13 @@ tc.addEventListener('mouseUp', () => {
     if (bb.sel.kind === 'box') { kit.at = o.position.toArray(); kit.rot = o.rotation.z; }
     else if (bb.sel.kind === 'book') { kit.bookAt = o.position.toArray(); kit.bookRot = o.rotation.z; }
     else if (bb.sel.kind === 'ref') { const r = refById(bb.sel.k); if (r) { r.pos = o.position.toArray(); r.quat = o.quaternion.toArray(); } }
+    else if (bb.sel.kind === 'section') { /* the plane is its own record */ }
     else if (sprues?.frames[bb.sel.k]) { shiftSprue(bb.sel.k, o.position.clone()); }
   }
   const slid = slideJ?.p0; if (slideJ) slideJ.p0 = null;
   if (connDrag?.p) { const c = connDrag.c; connDrag.p = null; connChanged(c); renderPartPanel(); syncGizmo(); markDirty(); return; }
   if (tc.object?.userData.joint && links.some(l => l.face)) refreshFacing(tc.object);
-  gizmoBase = null; renderPartPanel(); markDirty(); if (sprues) rebuildSprues();
+  gizmoBase = null; renderPartPanel(); markDirty(); if (sprues) rebuildSprues(); refreshGrowers();
   if (bb || slid) syncGizmo();                        // the slide arrow goes back to where the roller stopped
 });
 
@@ -2485,7 +2647,7 @@ function renderOutliner() {
   const row = (p, depth) => {
     const sl = slotOf(p);
     const r = document.createElement('div'); r.className = 'orow dnd-row' + (p.userData.optOff ? ' opt-off' : p.visible ? '' : ' hidden-part'); r.draggable = true; r._key = p;
-    r.title = 'Drag onto another part: on its name to attach, on its right end to make it an option, onto empty space to set it loose';
+    r.title = 'Drag onto another part: on its name to attach, on its right end to make it an alternate for it, onto empty space to set it loose';
     r.setAttribute('role', 'treeitem'); r.setAttribute('aria-selected', isSel(p) ? 'true' : 'false'); if (p === selected) r.classList.add('active');
     r.style.paddingLeft = (12 + depth * 14) + 'px';
     const link = document.createElement('span'); link.className = 'link';
@@ -2559,19 +2721,17 @@ function renderPartPanel() {
     }, !!rerootCheck(p));
     row.lastChild.title = rerootCheck(p) || (swap ? `Make ${p.name} the parent and ${par.name} its child. Nothing moves.` : `Make ${p.name} the base: every link between it and the current base turns round. Nothing moves.`);
   }
-  b('Mirror…', () => openMarr('mirror')); row.lastChild.title = 'Mirror it, or make a mirrored copy, across a plane through any centre (Shift+M)';
-  b('Array…', () => openMarr('linear')); row.lastChild.title = 'Copies along a line or round an axis (Shift+A)';
-  b('Scatter…', () => startScatter()); row.lastChild.title = 'Scatter copies of this over a face of another part, at random';
-  b('Crack…', () => startCrack(p)); row.lastChild.title = 'Crack it and cave it in where you click, as if it was punched';
-  b('Split…', () => startSplit(p)); row.lastChild.title = 'Cut it in two where you click: snapped, torn, melted by a lance, or clean';
-  b('Clean inside', () => startClean(p)); row.lastChild.title = 'Keep the outside skin and remove everything inside it: overlapping pieces, buried parts, sealed hollows, stray inner bits';
+  // (the operations, crack, burst, split and so on, are in the workspace panel above and the menus: not repeated here)
   if (p.userData.part.ooze) { b('Change ooze…', () => startOoze(p)); row.lastChild.title = 'Open it again: carry it on to more spots, or change how it looks'; }
-  else { b('Ooze…', () => startOoze()); row.lastChild.title = 'String organic ooze between spots you click on the parts'; }
+  if (!p.userData.part.grower) { b('Use as growth', () => makeGrower(p)); row.lastChild.title = 'Make this part a growth: move it where you like and the parts round it are pushed out of its way'; }
   b('Drop to grid', () => { pushUndo(); applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); });
   b('Square up', () => openOrient(p, { kind: 'auto' }));
   if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
   b('Delete', () => deleteSelected());
   wsFilterButtons(row); el.append(name, dl, row);
+  axesRows(p, el);
+  shapeRows(p, el);
+  growerRows(p, el);
   modifierRows(p, el);
   connectionRows(p, el);
   magnetRows(p, el);
@@ -2751,6 +2911,7 @@ function renderMultiPanel(el) {
   const row = document.createElement('div'); row.className = 'btnrow';
   const b = (txt, fn, dis, title) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.disabled = !!dis; if (title) x.title = title; x.addEventListener('click', fn); row.append(x); };
   const others = list.filter(m => m !== selected);
+  if (growthSpots(list).length >= 2) { b('Connect with ooze', () => connectWithOoze(list)); row.lastChild.title = 'String ooze between the growths and bursts you picked, nearest to nearest'; }
   b(`Attach to ${selected.name}`, () => {
     pushUndo(); let n = 0;
     for (const m of others) if (!isDescendant(selected, m) && parentPart(m) !== selected) { attach(m, selected, 'plain'); n++; }
@@ -2759,7 +2920,7 @@ function renderMultiPanel(el) {
   b('Detach', () => { pushUndo(); list.filter(m => parentPart(m)).forEach(m => detach(m)); afterHierarchyChange(); }, !list.some(m => parentPart(m)));
   b('Drop to grid', () => { pushUndo(); const dz = -lowestZ(list); roots.forEach(m => applyWorld(m, Tr(V(0, 0, dz)))); afterHierarchyChange(); }, false, 'Lowers them together until the lowest touches the grid');
   b('Square up together', () => openOrient(selected, { kind: 'auto' }));
-  b('Mirror…', () => openMarr('mirror'), false, 'Mirror them, or make mirrored copies (Shift+M)'); b('Array…', () => openMarr('linear'), false, 'Copies along a line or round an axis (Shift+A)'); b('Scatter…', () => startScatter(), false, 'Scatter copies of these, mixed at random, over a face of another part');
+  b('Mirror…', () => openMarr('mirror'), false, 'Mirror them, or make mirrored copies (Ctrl+M)'); b('Array…', () => openMarr('linear'), false, 'Copies along a line or round an axis'); b('Scatter…', () => startScatter(), false, 'Scatter copies of these, mixed at random, over a face of another part');
   const allShown = list.every(m => m.visible);
   b(allShown ? 'Hide' : 'Show', () => { list.forEach(m => { m.visible = !allShown; }); renderOutliner(); renderPartPanel(); markDirty(); });
   b('Delete', () => deleteSelected());
@@ -2788,10 +2949,11 @@ function afterHierarchyChange() {
   if (selected && !selected.parent) selected = selection[selection.length - 1] || null;
   paintSelection();
   renderOutliner(); renderPartPanel(); renderOptions(); rebuildSprues(); rebuildMagnets(); showAdjust(); updateButtons(); updateStats(); syncGizmo();
-  if (fit.pinned) showFit();
+  if (sec.on) scheduleFit();
+  if (typeof refreshGrowers === 'function') refreshGrowers();
 }
 // ---------------------------------------------------------------------------
-// Rearranging by drag and drop: in the parts list and in the auto-assemble review
+// Rearranging by drag and drop: in the parts list and in the link in place review
 // ---------------------------------------------------------------------------
 /**
  * Rows (class dnd-row, with a _key) can be dragged onto each other. Dropping on a row's name attaches the
@@ -2829,16 +2991,16 @@ function attachSmart(part, to) {
     toast(w || (e ? `Attached ${part.name} to ${to.name}${how === 'joint' ? ` with a ${KIND_LABEL[e.kind] || 'joint'} where they touch` : ', fixed'}.` : `Attached ${part.name} to ${to.name}, fixed: they don't touch, so there's no joint.`) + (sl && !w ? ` Its other options came too.` : ''), w ? 'bad' : 'ok');
   }, 30);
 }
-/** Make `part` an alternative for `to` in the same spot: they join one option slot and hang where `to` hangs. */
+/** Make `part` an alternative for `to` in the same spot: they become alternates for one spot and hang where `to` hangs. */
 function makeOptionOf(part, to) {
   pushUndo(); lastOp = null;
   for (const o of options.slots) o.members = o.members.filter(id => id !== part.uuid);
   let sl = slotOf(to);
-  if (!sl) { const cn = commonName([to.name, part.name]); sl = { id: uid(), name: /^Slot \d+$/.test(cn) ? `${to.name} options` : cn, members: [to.uuid], active: to.uuid }; options.slots.push(sl); }
+  if (!sl) { const cn = commonName([to.name, part.name]); sl = { id: uid(), name: /^Spot \d+$/.test(cn) ? `${to.name} alternates` : cn, members: [to.uuid], active: to.uuid }; options.slots.push(sl); }
   sl.members.push(part.uuid);
   if (parentPart(to)) shareSlotJoint(sl, to); else if (parentPart(part)) detach(part);
   applyOptions(); afterHierarchyChange(); select(to);
-  toast(`${part.name} is now an option for ${to.name} in "${sl.name}" (${sl.members.length} options). ${partById(sl.active)?.name} shows; switch in the Options tab or with the eye in the list.`, 'ok');
+  toast(`${part.name} is now an alternate for ${to.name} in "${sl.name}" (${sl.members.length} alternates). ${partById(sl.active)?.name} shows; switch in the Alternates tab or with the eye in the list.`, 'ok');
 }
 function setLoose(part) {
   pushUndo(); lastOp = null;
@@ -2846,7 +3008,7 @@ function setLoose(part) {
   if (sl) { sl.members = sl.members.filter(id => id !== part.uuid); part.userData.optOff = false; part.visible = true; }
   if (parentPart(part)) detach(part);
   applyOptions(); afterHierarchyChange(); select(part);
-  toast(`${part.name} is on its own now${sl ? `, no longer an option in "${sl.name}"` : ''}. Nothing moved.`);
+  toast(`${part.name} is on its own now${sl ? `, no longer an alternate in "${sl.name}"` : ''}. Nothing moved.`);
 }
 function bindTreeDnD() {
   treeDnD($('outliner'), {
@@ -2903,7 +3065,7 @@ function commonName(names) {
   if (!names.length) return 'Option';
   let pre = names[0]; for (const n of names) while (pre && !n.startsWith(pre)) pre = pre.slice(0, -1);
   pre = pre.replace(/[\s_\-.(]+$/, '').trim();
-  return pre.length >= 3 ? pre : `Slot ${options.slots.length + 1}`;
+  return pre.length >= 3 ? pre : `Spot ${options.slots.length + 1}`;
 }
 function makeSlot() {
   const list = selection.length ? [...selection] : selected ? [selected] : [];
@@ -2916,11 +3078,11 @@ function makeSlot() {
   const n = shareSlotJoint(sl);
   applyOptions(); afterHierarchyChange();
   setTimeout(() => { const el = document.querySelector('#opt-slots .opt-slot:last-child input'); if (el) { el.focus(); el.select(); } }, 0);   // name it straight away
-  toast(`Made the "${sl.name}" slot with ${list.length} option${list.length > 1 ? 's' : ''}.` + (n ? ` ${n} now share${n === 1 ? 's' : ''} the same joint.` : !list.some(m => parentPart(m)) ? ' Snap one of them where it goes and the others will hang off the same joint.' : ''), 'ok');
+  toast(`Made "${sl.name}": ${list.length} alternate part${list.length > 1 ? 's' : ''} for one spot.` + (n ? ` ${n} now share${n === 1 ? 's' : ''} the same joint.` : !list.some(m => parentPart(m)) ? ' Snap one of them where it goes and the others will hang off the same joint.' : ''), 'ok');
 }
 function addToSlot(sl) {
   const list = (selection.length ? selection : selected ? [selected] : []).filter(m => !sl.members.includes(m.uuid));
-  if (!list.length) { toast('Select the parts to add to this slot first.', 'bad'); return; }
+  if (!list.length) { toast('Select the parts to add to these alternates first.', 'bad'); return; }
   pushUndo();
   for (const o of options.slots) o.members = o.members.filter(id => !list.some(m => m.uuid === id));
   sl.members.push(...list.map(m => m.uuid));
@@ -2938,18 +3100,18 @@ function renderOptions() {
   tidyOptions();
   const box = $('opt-slots'); box.innerHTML = '';
   const nS = options.slots.length;
-  $('opt-count').textContent = nS ? `${nS} slot${nS > 1 ? 's' : ''}${options.sets.length ? ` · ${options.sets.length} set${options.sets.length > 1 ? 's' : ''}` : ''}` : '';
+  $('opt-count').textContent = nS ? `${nS}${options.sets.length ? ` · ${options.sets.length} build${options.sets.length > 1 ? 's' : ''}` : ''}` : '';
   const selN = selection.length || (selected ? 1 : 0);
   $('opt-new').disabled = !selN;
-  $('opt-new').textContent = selN > 1 ? `Make option slot from ${selN} selected` : 'Make option slot from selection';
+  $('opt-new').textContent = selN > 1 ? `Make the ${selN} selected alternates` : 'Make alternates from selection';
   for (const sl of options.slots) {
     const el = document.createElement('div'); el.className = 'opt-slot';
     const head = document.createElement('div'); head.className = 'opt-slot-head';
-    const nm = document.createElement('input'); nm.value = sl.name; nm.setAttribute('aria-label', 'Slot name');
+    const nm = document.createElement('input'); nm.value = sl.name; nm.setAttribute('aria-label', 'Name of this spot');
     nm.addEventListener('change', () => { sl.name = nm.value.trim() || sl.name; renderOptions(); markDirty(); });
-    const add = document.createElement('button'); add.className = 'mini'; add.type = 'button'; add.textContent = '+ add selected'; add.title = 'Add the selected parts to this slot';
+    const add = document.createElement('button'); add.className = 'mini'; add.type = 'button'; add.textContent = '+ add selected'; add.title = 'Add the selected parts as more alternates here';
     add.addEventListener('click', () => addToSlot(sl));
-    const del = document.createElement('button'); del.className = 'mini'; del.type = 'button'; del.textContent = '✕'; del.title = 'Remove this slot (the parts stay, all shown)';
+    const del = document.createElement('button'); del.className = 'mini'; del.type = 'button'; del.textContent = '✕'; del.title = 'Stop these being alternates (the parts stay, all shown)';
     del.addEventListener('click', () => { pushUndo(); options.slots = options.slots.filter(o => o !== sl); slotMembers(sl).forEach(m => { m.userData.optOff = false; m.visible = true; }); applyOptions(); afterHierarchyChange(); });
     head.append(nm, add, del);
     const chips = document.createElement('div'); chips.className = 'opt-chips'; chips.setAttribute('role', 'radiogroup'); chips.setAttribute('aria-label', sl.name);
@@ -2957,7 +3119,7 @@ function renderOptions() {
       const c = document.createElement('div'); c.className = 'opt-chip'; c.setAttribute('role', 'radio'); c.tabIndex = 0;
       c.setAttribute('aria-pressed', m.uuid === sl.active ? 'true' : 'false'); c.setAttribute('aria-checked', m.uuid === sl.active ? 'true' : 'false');
       const t = document.createElement('span'); t.textContent = m.name; c.title = `Show ${m.name}`;
-      const x = document.createElement('button'); x.className = 'x'; x.type = 'button'; x.textContent = '×'; x.title = `Take ${m.name} out of this slot`;
+      const x = document.createElement('button'); x.className = 'x'; x.type = 'button'; x.textContent = '×'; x.title = `${m.name} stops being an alternate here`;
       x.addEventListener('click', e => { e.stopPropagation(); pushUndo(); sl.members = sl.members.filter(id => id !== m.uuid); m.userData.optOff = false; m.visible = true; applyOptions(); afterHierarchyChange(); });
       c.addEventListener('click', () => chooseOption(sl, m.uuid));
       c.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); chooseOption(sl, m.uuid); } });
@@ -2966,9 +3128,9 @@ function renderOptions() {
     const ms = slotMembers(sl), hosts = new Set(ms.map(m => jointOf(m) || (parentPart(m) ? m.parent : null)));
     const meta = document.createElement('div'); meta.className = 'opt-meta';
     const par = ms.map(parentPart).find(Boolean);
-    meta.textContent = !par ? 'Not attached yet. Snap one option where it goes; the rest follow onto the same joint.'
+    meta.textContent = !par ? 'Not attached yet. Snap one where it goes; the rest follow onto the same joint.'
       : hosts.size === 1 && !hosts.has(null) ? `All ${ms.length} on ${jointOf(ms[0]) ? 'one joint' : 'the same spot'} of ${par.name}.`
-      : `Some options aren't on the shared joint of ${par.name}. Snap them, or remove and re-add them.`;
+      : `Some alternates aren't on the shared joint of ${par.name}. Snap them, or remove and re-add them.`;
     el.append(head, chips, meta); box.append(el);
   }
   $('opt-sets-f').hidden = !nS;
@@ -2980,20 +3142,20 @@ function renderOptions() {
     cb.addEventListener('change', () => { st.export = cb.checked; renderOptions(); markDirty(); });
     const sn = document.createElement('div'); sn.className = 'sn';
     const b = document.createElement('b'); b.textContent = st.name; b.title = 'Double-click to rename';
-    b.addEventListener('dblclick', () => { const v = prompt('Set name', st.name); if (v && v.trim()) { st.name = v.trim(); renderOptions(); markDirty(); } });
+    b.addEventListener('dblclick', () => { const v = prompt('Build name', st.name); if (v && v.trim()) { st.name = v.trim(); renderOptions(); markDirty(); } });
     const sm = document.createElement('small'); sm.textContent = pickLabel(st.pick); sn.append(b, sm);
     const show = document.createElement('button'); show.className = 'btn'; show.type = 'button'; show.textContent = 'Show';
     show.addEventListener('click', () => { applyPick(st.pick); afterHierarchyChange(); toast(`Showing ${st.name}.`); });
-    const del = document.createElement('button'); del.className = 'mini'; del.type = 'button'; del.textContent = '✕'; del.title = 'Delete this set';
+    const del = document.createElement('button'); del.className = 'mini'; del.type = 'button'; del.textContent = '✕'; del.title = 'Delete this build';
     del.addEventListener('click', () => { options.sets = options.sets.filter(o => o !== st); renderOptions(); markDirty(); });
     r.append(cb, sn, show, del); sb.append(r);
   }
   const ticked = options.sets.filter(st => st.export !== false).length;
   $('opt-exp-sets').disabled = !ticked;
-  $('opt-exp-sets').textContent = ticked ? `Export ${ticked} ticked set${ticked > 1 ? 's' : ''}` : 'Export ticked sets';
+  $('opt-exp-sets').textContent = ticked ? `Export ${ticked} ticked build${ticked > 1 ? 's' : ''}` : 'Export ticked builds';
   const combos = options.slots.reduce((a, sl) => a * Math.max(1, sl.members.length), 1);
   $('opt-exp-all').textContent = `Every combination (${combos})`; $('opt-exp-all').disabled = combos > 64;
-  $('opt-exp-all').title = combos > 64 ? 'More than 64 combinations: save the sets you want instead' : 'One STL for every mix of options';
+  $('opt-exp-all').title = combos > 64 ? 'More than 64 combinations: save the builds you want instead' : 'One STL for every mix of alternates';
 }
 /** Export one STL per pick. Puts the current choice back afterwards. */
 async function exportPicks(list) {
@@ -3009,15 +3171,15 @@ async function exportPicks(list) {
     }
   } finally { applyPick(keep); afterHierarchyChange(); }
   if (notes.length) $('exp-note').textContent = notes.slice(0, 3).join(' ');
-  await deliver(files, `${safe(project.name || 'kit')}-sets.zip`);
+  await deliver(files, `${safe(project.name || 'kit')}-builds.zip`);
 }
 function bindOptions() {
   $('opt-new').addEventListener('click', () => { showDockTab('tab-opts'); makeSlot(); });
   $('opt-save-set').addEventListener('click', () => {
     const pick = currentPick(), same = options.sets.find(st => samePick(st.pick, pick));
     if (same) { toast(`That's already saved as "${same.name}".`); return; }
-    options.sets.push({ id: uid(), name: `Set ${options.sets.length + 1}`, pick, export: true });
-    renderOptions(); markDirty(); toast(`Saved "Set ${options.sets.length}": ${pickLabel(pick)}. Double-click its name to rename.`, 'ok');
+    options.sets.push({ id: uid(), name: `Build ${options.sets.length + 1}`, pick, export: true });
+    renderOptions(); markDirty(); toast(`Saved "Build ${options.sets.length}": ${pickLabel(pick)}. Double-click its name to rename.`, 'ok');
   });
   $('opt-exp-sets').addEventListener('click', () => exportPicks(options.sets.filter(st => st.export !== false).map(st => ({ name: st.name, pick: st.pick }))));
   $('opt-exp-all').addEventListener('click', () => {
@@ -3429,6 +3591,24 @@ async function openBox() {
   } finally { if (kit) kit.opening = false; renderPartPanel(); }
 }
 function closeLid() { if (!kit || kit.state !== 'open') return; pushUndo(); kit.state = 'closed'; buildKit(); markDirty(); renderPartPanel(); }
+/** The lid lifts off its spot beside the tray and goes back on, the box now empty. */
+async function lidBackOn() {
+  if (!kit || kit.state !== 'open') return;
+  const lid = kitFx.getObjectByName('kit-box')?.getObjectByName('kit-lid');
+  if (lid) { const from = lid.position.clone(), lift = kit.H + 18;
+    await tween(750, (e, t) => { lid.position.set(from.x * (1 - e), from.y * (1 - e), Math.sin(Math.PI * Math.min(1, t * 1.1)) * lift); }); lid.position.set(0, 0, 0); }
+  kit.state = 'closed'; await buildKit(); markBench(); markDirty(); renderPartPanel();
+}
+/** A kit that's just come in: show the box, open it, set the sprues out, and put the lid back on the empty box. */
+async function unboxNow() {
+  if (kit?.state !== 'sealed') { matHold = 0; fitMat(true); return; }
+  matHold++;
+  try {
+    select(null); frameBox(); await new Promise(r => setTimeout(r, 450));
+    await openBox(); await new Promise(r => setTimeout(r, 250));
+    await lidBackOn();
+  } finally { matHold = 0; fitMat(true); frame(benchBox()); }
+}
 
 let kitGen = 0;
 /** Where the lid sits in the box's own frame: on the tray, or resting beside it once opened. */
@@ -3525,7 +3705,6 @@ async function buildKit() {
   tray.add(slab(tw, td, T, 0, 0, -H / 2 + T / 2, [card, card, card, card, inner, card]));
   for (const [w, d, x, y] of [[tw, T, 0, -td / 2 + T / 2], [tw, T, 0, td / 2 - T / 2], [T, td, -tw / 2 + T / 2, 0], [T, td, tw / 2 - T / 2, 0]]) tray.add(slab(w, d, th, x, y, -H / 2 + th / 2, [card, card, card, card, card, card]));
   lid.position.copy(lidSpot(kit.state === 'open'));
-  if (kit.state === 'sealed') grp.add(shrinkWrap(W, D, H));
   grp.userData.kit = 'box'; grp.traverse(o => { o.userData.kit = 'box'; }); if (!kit.noBox) kitFx.add(grp);
   if (kit.pdf && !kit.noBook) {
     const bd = 74, bw = bd * kit.bookAspect, bt = 2.6, bk = new THREE.Group(); bk.name = 'kit-book'; bk.position.fromArray(kit.bookAt); bk.rotation.z = kit.bookRot ?? 0.12;
@@ -3778,11 +3957,12 @@ function benchObj(sel = benchSel) {
   if (sel.kind === 'box') return kitFx.getObjectByName('kit-box') || null;
   if (sel.kind === 'book') return kitFx.getObjectByName('kit-book') || null;
   if (sel.kind === 'ref') return refFx.children.find(c => c.userData.ref === sel.k) || null;
+  if (sel.kind === 'section') return sec.on ? secObj : null;
   return sprueFx.children.find(c => c.userData.frame === sel.k) || null;
 }
 function markBench() {
   const o = benchObj(); benchMark.visible = !!o;
-  if (o) { o.updateMatrixWorld(true); benchMark.box.setFromObject(o).expandByScalar(0.6); }
+  if (o) { o.updateMatrixWorld(true); benchMark.box.setFromObject(o === secObj ? secQuad : o).expandByScalar(0.6); }
 }
 function selectBench(kind, k = 0) {
   select(null); benchSel = { kind, k }; markBench(); syncGizmo(); renderPartPanel();
@@ -3793,7 +3973,8 @@ function benchHit(ev) {
   const r = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster();
   rc.setFromCamera(new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1), camera);
   const pickRefs = refFx.children.filter(m => m.visible && !refById(m.userData.ref)?.locked);
-  const h = rc.intersectObjects([...kitFx.children, ...sprueFx.children, ...pickRefs], true)[0]; if (!h) return null;
+  const h = rc.intersectObjects([...kitFx.children, ...sprueFx.children, ...pickRefs, ...(sec.on && sec.show ? [secQuad] : [])], true)[0]; if (!h) return null;
+  if (h.object === secQuad) { const part = raycast(ev); return part && part.distance < h.distance - 1e-4 ? null : { kind: 'section' }; }
   const part = raycast(ev); if (part && (part.distance < h.distance || h.object.userData.ref !== undefined)) return null;    // a part in front (or anywhere over a picture) wins
   let o = h.object; while (o && o.userData.kit === undefined && o.userData.frame === undefined && o.userData.ref === undefined) o = o.parent;
   if (!o) return null;
@@ -3818,9 +3999,18 @@ function removeSprue(k) {
   if (!sprues.frames.length) sprues = null;
   select(null); afterHierarchyChange(); toast('Removed that sprue frame. Its pieces stay where they are.');
 }
+function sectionPanel(el) {
+  const head = document.createElement('div'); head.className = 'multi-head'; head.textContent = 'Section plane';
+  const sm = document.createElement('small'); sm.textContent = 'Move (G) slides it (its blue arrow pushes it through the model); Rotate (R) turns it. The arrow on the plane points to the side that stays. X turns the section off.'; head.append(sm);
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, title) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; if (title) x.title = title; x.addEventListener('click', fn); row.append(x); };
+  b('Flip', sectionFlip, 'Keep the other side'); b('Face the view', sectionFaceView, 'Turn it square to where you are looking from'); b('Turn off', () => setFitPinned(false));
+  el.append(head, row);
+}
 function renderBenchPanel(el) {
   const o = benchObj(); if (!o) { benchSel = null; el.innerHTML = '<p class="note">Select a part to see its size and attachments.</p>'; return; }
   if (benchSel.kind === 'ref') return refPanel(el, o);
+  if (benchSel.kind === 'section') return sectionPanel(el);
   const head = document.createElement('div'); head.className = 'multi-head';
   const dl = document.createElement('dl'); dl.className = 'props';
   const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
@@ -4095,7 +4285,7 @@ function updateButtons() {
   $('btn-undo').disabled = !undoStack.length; $('btn-redo').disabled = !redoStack.length;
   const any = liveParts().length > 0;
   $('exp-all').disabled = $('exp-each').disabled = !any; $('exp-sel').disabled = !selected;
-  $('exp-sel').textContent = selection.length > 1 ? `${selection.length} selected + attached` : 'Selected + attached';
+  if (!$('dlg-export').hidden) syncExportPick();
 }
 function updateStats() {
   const ps = liveParts(), tris = ps.reduce((s, p) => s + p.userData.part.tris, 0);
@@ -4693,7 +4883,7 @@ function reliefReplace() {
  * leave one (and its size) is remembered, per popup, for next time it opens; double-click the title bar to put it
  * back where it was. Popups are kept on screen when the window gets smaller.
  */
-const FLOATS = ['ooze', 'relief', 'dmg', 'rlplace', 'dirpick', 'marr', 'orient', 'autorig', 'fitcheck', 'dlg-export', 'dlg-prefs', 'dlg-projects'];
+const FLOATS = ['ooze', 'relief', 'dmg', 'burst', 'rlplace', 'dirpick', 'marr', 'orient', 'autorig', 'fitcheck', 'dlg-export', 'dlg-prefs', 'dlg-projects'];
 function floatFrame(el) {
   const fixed = getComputedStyle(el).position === 'fixed', par = fixed ? null : el.offsetParent;
   return par ? par.getBoundingClientRect() : { left: 0, top: 0, width: innerWidth, height: innerHeight };
@@ -4780,8 +4970,8 @@ function bindFloating() {
  * ones after.
  */
 const modCache = new Map();                                      // part:modifier id → { inG, key, out }
-const MOD_NAMES = { crack: 'Crack & cave in', relief: 'Relief', scatter: 'Scatter', split: 'Split', clean: 'Clean out insides' };
-const CLEAN_DEFAULT = { pieces: 'all', open: 'outside', rays: 64 };
+const MOD_NAMES = { grow: 'Pushed by a growth', burst: 'Burst & growth', crack: 'Crack & cave in', relief: 'Relief', scatter: 'Scatter', split: 'Split', clean: 'Clean out insides' };
+const CLEAN_DEFAULT = { pieces: 'all', open: 'outside', detail: 0.12, rays: 64 };
 /** The outside skin of a mesh and nothing inside it (worked out in the part's own frame). */
 async function cleanGeometry(m, g, mod) {
   const soup = soupOfGeom(g, new THREE.Matrix4());
@@ -4806,6 +4996,8 @@ function cleanSummary(st) {
   const tri = n => `${k(n)} open triangle${n === 1 ? '' : 's'}`;
   if (st.openDropped) bits.push(st.openChecked ? `${tri(st.openDropped)} inside removed` : `${tri(st.openDropped)} removed`);
   if (st.openKept) bits.push(`${tri(st.openKept)} kept on the outside`);
+  if (st.rebuilt) bits.push(`${k(st.openRebuilt)} open triangles: the whole thing shrink-wrapped at ${st.rebuilt} mm`);
+  if (st.mended) bits.push(`${st.mended} broken spot${st.mended === 1 ? '' : 's'} mended`);
   return bits.join(', ');
 }
 function modKids(m, mod) { return (mod.kids || []).map(partById).filter(k => k && k.parent); }
@@ -4845,9 +5037,10 @@ async function boolGeometry(m, g, kids, mode) {
   return geomFromSoup(r.positions);
 }
 function modKey(m, mod) {
-  if (mod.type === 'crack') return JSON.stringify([mod.p, mod.hit]);
+  if (mod.type === 'crack' || mod.type === 'burst') return JSON.stringify([mod.p, mod.hit]);
   if (mod.type === 'split') return JSON.stringify([mod.p, mod.at]);
   if (mod.type === 'clean') return JSON.stringify(mod.p);
+  if (mod.type === 'grow') return growKey(m, mod);
   m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert();
   return mod.mode + '|' + modKids(m, mod).map(k => k.uuid + k.geometry.uuid + inv.clone().multiply(k.matrixWorld).elements.map(x => Math.round(x * 1e5)).join(',')).join('|');
 }
@@ -4857,8 +5050,10 @@ async function evalMod(m, mod, gIn) {
   if (c && c.inG === gIn && c.key === key) return c.out;
   let out = gIn;
   if (mod.type === 'crack') out = (await crackGeometry(m, gIn, mod.hit, mod.p)).geometry;
+  else if (mod.type === 'burst') { const r = await burstGeometry(m, gIn, mod.hit, mod.p); out = r.geometry; mod.stats = r.stats; }
   else if (mod.type === 'split') out = (await splitGeometry(m, gIn, mod)).geometry;
   else if (mod.type === 'clean') out = await cleanGeometry(m, gIn, mod);
+  else if (mod.type === 'grow') out = await growWarpGeometry(m, gIn, mod);
   else if (mod.mode !== 'join') { const kids = modKids(m, mod); if (kids.length) out = await boolGeometry(m, gIn, kids, mod.mode); }
   modCache.set(ck, { inG: gIn, key, out }); return out;
 }
@@ -4893,6 +5088,7 @@ function dropKids(m, mod, free) {
 }
 function removeMod(m, mod) {
   const pt = m.userData.part; pushUndo();
+  if (mod.type === 'grow') { pt.noGrow = [...new Set([...(pt.noGrow || []), mod.grower])]; }      // that growth leaves it alone from now on
   dropKids(m, mod, false); pt.mods = pt.mods.filter(x => x !== mod);
   evalStack(m); toast(`Removed ${mod.name}.`);
 }
@@ -4959,19 +5155,12 @@ function modifierRows(p, el) {
   const pt = p.userData.part, sec = document.createElement('div'); sec.className = 'conn mods';
   const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = 'Modifiers';
   const busy = document.createElement('span'); busy.id = 'mods-busy'; busy.className = 'mods-busy'; busy.textContent = ' working…'; busy.hidden = !pt.stackBusy; h.append(busy);
-  const addSel = document.createElement('select'); addSel.className = 'num osel mods-add'; addSel.setAttribute('aria-label', 'Add a modifier');
-  for (const [v, t] of [['', 'Add modifier…'], ['crack', 'Crack & cave in'], ['split', 'Split / break in two'], ['clean', 'Clean out insides'], ['relief', 'Relief from a picture'], ['scatter', 'Scatter parts over it']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; addSel.append(o); }
-  addSel.addEventListener('change', () => { const v = addSel.value; addSel.value = '';
-    if (v === 'crack') startCrack(p);
-    else if (v === 'split') startSplit(p);
-    else if (v === 'clean') startClean(p);
-    else if (v === 'relief') { toast(`Make the relief, then Place on a part… and click ${p.name}.`); openRelief(); }
-    else if (v === 'scatter') toast(`Select the parts to scatter (Ctrl-click them), then Scatter… and click ${p.name}'s face.`); });
-  h.append(addSel); sec.append(h);
+  sec.append(h);
   if (pt.owner) { const o = partById(pt.owner.part), mo = o?.userData.part.mods?.find(x => x.id === pt.owner.mod);
     if (o && mo) { const n = document.createElement('p'); n.className = 'note'; n.textContent = `Kept by the ${mo.name} modifier on ${o.name}. `;
       const go = document.createElement('button'); go.type = 'button'; go.className = 'mini'; go.textContent = `Select ${o.name}`; go.addEventListener('click', () => select(o)); n.append(go); sec.append(n); } }
   const mods = pt.mods || [];
+  if (!mods.length && !pt.owner) return;                              // nothing to show: no section
   if (!mods.length) { const n = document.createElement('p'); n.className = 'note'; n.textContent = 'None. Cracks, reliefs and scatters you add to this part show here, to turn on and off, change or apply.'; sec.append(n); }
   mods.forEach((mod, i) => {
     const card = document.createElement('div'); card.className = 'mod' + (mod.on ? '' : ' off');
@@ -4988,7 +5177,25 @@ function modifierRows(p, el) {
     const grid = document.createElement('div'); grid.className = 'mod-grid'; card.append(grid);
     const row = (label, ctl, title = '') => { const l = document.createElement('label'); l.textContent = label; if (title) l.title = title; grid.append(l, ctl); };
     const change = fn => () => { pushUndo(); fn(); evalStack(p); };
-    if (mod.type === 'crack') {
+    if (mod.type === 'burst') {
+      const q = mod.p;
+      const num = (label, key, step, min, max, scale = 1, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
+        n.addEventListener('change', change(() => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); q[key] = ['petals', 'pustules', 'pocks', 'horns'].includes(key) ? Math.round(v) : v / scale; })); row(label, n, title); };
+      const chk = (label, key) => { const c = document.createElement('input'); c.type = 'checkbox'; c.checked = q[key] !== false; c.addEventListener('change', change(() => { q[key] = c.checked; })); row(label, c); };
+      if (q.from === 'sphere') {
+        num('Sphere radius mm', 'sr', 0.5, 0.3, 300); num('Depth mm', 'depth', 0.5, -100, 300, 1, 'How far under the surface its middle sits; less than its radius and it breaks through'); chk('Warp the part', 'warp');
+        if (q.warp !== false) { num('Push mm', 'push', 0.25, 0, 100); num('Push reach %', 'preach', 10, 110, 600, 100); num('Lumpy push %', 'pnoise', 5, 0, 100, 100); }
+      } else { num('Radius mm', 'radius', 0.5, 0.3, 200); num('Swell mm', 'swell', 0.1, 0, 50); num('Swell reach %', 'reach', 10, 110, 500, 100); }
+      chk('Torn open', 'tear');
+      if (q.tear !== false) { num('Petals', 'petals', 1, 2, 16); num('Peel °', 'peel', 5, 0, 120); num('Jagged %', 'jag', 5, 0, 100, 100); num('Plate mm', 'plate', 0.1, 0.2, 10); }
+      num('Growth size %', 'grow', 5, 0, 400, 100);
+      if (q.grow > 0) { num('Stands out mm', 'height', 0.5, 0.2, 100); num('Lumpy %', 'lumps', 5, 0, 100, 100); num('Rings %', 'ridges', 5, 0, 100, 100); num('Pustules', 'pustules', 1, 0, 200); num('Pock holes', 'pocks', 1, 0, 100); num('Horns', 'horns', 1, 0, 60); num('Horn length mm', 'hornLen', 0.5, 0.5, 60); num('Curl %', 'curl', 5, 0, 100, 100); }
+      num('Detail mm', 'detail', 0.02, 0.08, 2);
+      const sh = document.createElement('button'); sh.type = 'button'; sh.className = 'btn'; sh.textContent = 'Shuffle'; sh.title = 'New tears, lumps and horns with the same settings';
+      sh.addEventListener('click', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })); row('', sh);
+      if (growthSpots(liveParts()).length >= 2) { const co = document.createElement('button'); co.type = 'button'; co.className = 'btn'; co.textContent = 'Connect with ooze'; co.title = 'String ooze from this burst to the other bursts and growths there are, nearest to nearest';
+        co.addEventListener('click', () => connectWithOoze([p, ...liveParts().filter(o => o !== p)])); row('', co); }
+    } else if (mod.type === 'crack') {
       const q = mod.p;
       const num = (label, key, step, min, max, scale = 1, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
         n.addEventListener('change', change(() => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); q[key] = key === 'rings' || key === 'cracks' ? Math.round(v) : v / scale; })); row(label, n, title); };
@@ -5018,8 +5225,11 @@ function modifierRows(p, el) {
         e.value = String(q[key]); e.addEventListener('change', change(() => { q[key] = key === 'rays' ? +e.value : e.value; })); row(label, e, title); };
       sel('Keep', 'pieces', [['all', 'Every outside piece'], ['largest', 'Biggest piece only']], 'Biggest piece only: just the main body, nothing else (separate bits and open bits go too)');
       if (q.pieces !== 'largest') {
-        sel('Open bits', 'open', [['outside', 'Keep the ones outside'], ['drop', 'Remove them all']], "Triangles that aren't part of a closed solid (open sheets, broken shells): kept where they can be seen from outside, or all removed");
-        if (q.open !== 'drop') sel('Check', 'rays', [['32', 'Quick'], ['64', 'Normal'], ['128', 'Thorough']], 'How hard it looks for a way out from each open triangle: Thorough keeps more of the deep crevices, and takes longer');
+        if (q.open === 'rebuild') q.open = 'outside';                   // (the old name: broken shells are mended exactly now)
+        sel('Open bits', 'open', [['outside', 'Keep the ones outside'], ['drop', 'Remove them all'], ['wrap', 'Shrink-wrap it all (re-mesh)']], "Broken shells (small holes, flaps, pinches) are mended first, exactly, so this is only for what's still open after that: sheets with nothing behind them. Keep the ones outside / remove them all; or, as a last resort, shrink-wrap the whole thing as one watertight solid at the detail below (a new surface all over: it loses fine detail)");
+        if (q.open === 'wrap') { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = 0.02; n.min = 0.04; n.max = 2; n.value = q.detail ?? 0.12;
+          n.addEventListener('change', change(() => { const v = +n.value; if (isFinite(v)) q.detail = Math.min(2, Math.max(0.04, v)); })); row('Detail mm', n, 'The smallest detail the rebuilt surface keeps; cracks and holes narrower than this are sealed. Finer is slower'); }
+        if (q.open === 'outside') sel('Check', 'rays', [['32', 'Quick'], ['64', 'Normal'], ['128', 'Thorough']], 'How hard it looks for a way out from each open triangle: Thorough keeps more of the deep crevices, and takes longer');
       }
       const info = document.createElement('span'); info.className = 'note'; info.textContent = cleanSummary(mod.stats); row('Result', info);
     } else if (mod.type === 'split') {
@@ -5203,13 +5413,13 @@ function startOoze(m = null) {
   if (kept) setOozeParams(kept.params);
   $('ooze').hidden = false; $('oz-title').textContent = kept ? `Change ${m.name}` : 'Ooze & growths';
   $('oz-note').textContent = kept ? 'Click more spots to carry it on; change how it looks below; then Done.' : 'Click spots on the parts to string it between, one after another (two or more). Backspace takes the last one off.';
-  oozeStatus(''); oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2;
+  oozeStatus(''); oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2; syncGizmo();
   if (kept) oozeRedo();
 }
 function endOoze(keep = true) {
   if (!oz) return;
   if (!keep) { restore(oz.before); afterHierarchyChange(); }
-  oz = null; $('ooze').hidden = true; oozeMarks();
+  oz = null; $('ooze').hidden = true; oozeMarks(); syncGizmo();
 }
 function oozeStatus(t) { $('oz-status').textContent = t; $('oz-status').hidden = !t; }
 function oozeClick(hit) {
@@ -5284,6 +5494,7 @@ function bindOoze() {
   document.querySelectorAll('#oz-webstyle button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#oz-webstyle button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncOozeRows(); oozeRedo(); }));
   $('oz-preset').addEventListener('change', () => { const L = OOZE_LOOKS[$('oz-preset').value]; $('oz-preset').value = ''; if (!L) return; setOozeParams(L); oozeMarks(); oozeRedo(); });
   $('oz-undo').addEventListener('click', oozeUndo);
+  $('oz-join').addEventListener('click', oozeJoinGrowths);
   $('oz-shuffle').addEventListener('click', () => { if (!oz) return; oz.seed = (Math.random() * 2 ** 31) | 0; oozeRedo(); });
   $('oz-done').addEventListener('click', () => {
     if (!oz?.m || oz.running || oz.anchors.length < 2) return;
@@ -5306,16 +5517,16 @@ function bindOoze() {
 let dm = null;     // { m, g0 (its mesh before), pL / nL (the hit and its normal, in the part's frame), right, thick, seed, before, running, again }
 function startCrack(m = selected) {
   if (!m || !isPart(m)) { toast('Select the part to crack first, then Crack & cave in.', 'bad'); return; }
-  endCrack(false); endReliefPlace(false);
+  endCrack(false); endReliefPlace(false); if (typeof endBurst === 'function') endBurst(false);
   dm = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: (Math.random() * 2 ** 31) | 0 };
-  $('dmg').hidden = false; $('dm-ctl').hidden = $('dm-done').hidden = true; dmStatus('');
+  $('dmg').hidden = false; $('dm-ctl').hidden = $('dm-done').hidden = true; dmStatus(''); syncGizmo();
   $('dm-note').textContent = `Click where ${m.name} got hit.`;
   syncDmRows();
 }
 function endCrack(keep = true) {
   if (!dm) return;
   if (!keep && dm.pL) { restore(dm.before); afterHierarchyChange(); }
-  dm = null; $('dmg').hidden = true;
+  dm = null; $('dmg').hidden = true; syncGizmo();
 }
 function dmStatus(t) { $('dm-status').textContent = t; $('dm-status').hidden = !t; }
 function syncDmRows() {
@@ -5350,9 +5561,9 @@ function crackClick(hit, ev) {
 function crackRedo() {
   if (!dm?.pL) return;
   const me = dm; if (me.running) { me.again = true; return; }
-  me.running = true; $('dm-done').disabled = true;
+  me.running = true;
   applyCrack().catch(e => { console.warn(e); dmStatus(`Couldn't crack it: ${e.message || e}`); })
-    .finally(() => { me.running = false; if (dm !== me) return; $('dm-done').disabled = false; if (me.again) { me.again = false; crackRedo(); } });
+    .finally(() => { me.running = false; if (dm !== me) return; if (me.again) { me.again = false; crackRedo(); } else if (me.finish) $('dm-done').click(); });
 }
 function crackCardParams(seed) {
   const num = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
@@ -5381,12 +5592,469 @@ function bindCrack() {
   document.querySelectorAll('#dm-mid button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#dm-mid button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); re(); }));
   $('dm-shuffle').addEventListener('click', () => { if (!dm) return; dm.seed = (Math.random() * 2 ** 31) | 0; re(); });
   // Done: it goes on the part as a Crack modifier, to turn off, change or apply later
-  $('dm-done').addEventListener('click', () => { if (!dm?.pL || dm.running) return;
+  $('dm-done').addEventListener('click', () => { if (!dm?.pL) return; if (dm.running) { dm.finish = true; dmStatus('Finishing it off…'); return; }
     const m = dm.m, mods = ensureStack(m, dm.g0, dm.gk0), mod = { id: newModId(), type: 'crack', name: MOD_NAMES.crack, on: true, p: crackCardParams(dm.seed), hit: dmHit(dm) };
     mods.push(mod); modCache.set(m.uuid + ':' + mod.id, { inG: dm.g0, key: modKey(m, mod), out: m.geometry });
     pushUndo(dm.before); endCrack(true); select(m); evalStack(m);
     toast(`${m.name} is cracked and caved in, as a modifier: turn it off, change it or Apply it in Properties › Modifiers.`, 'ok'); });
   $('dm-cancel').addEventListener('click', () => { endCrack(false); toast('Left it as it was.'); });
+}
+
+// ---- burst & growth
+/*
+ * A growth bursting out of a part: click where it comes out, and round that spot the hull is swollen, torn open in a
+ * jagged hole with the plate round it peeled back in petals, and a lumpy, ringed growth with pustules, pock holes
+ * and horns swells out of it. Worked out in the background from the part as it was; Done keeps it as a modifier.
+ */
+let bz = null;     // { m, g0, gk0, pL, nL, right, thick, seed, before, running, again }
+const BZ_IDS = ['bz-sr', 'bz-depth', 'bz-warp', 'bz-push', 'bz-preach', 'bz-pnoise', 'bz-r', 'bz-swell', 'bz-reach', 'bz-tear', 'bz-petals', 'bz-peel', 'bz-jag', 'bz-plate', 'bz-grow', 'bz-h', 'bz-lumps', 'bz-ridges', 'bz-pust', 'bz-pocks', 'bz-horns', 'bz-hlen', 'bz-curl', 'bz-detail'];
+const BZ_LOOKS = {
+  burst: { swell: 1.5, reach: 200, tear: true, petals: 6, peel: 40, jag: 65, grow: 85, h: 1, lumps: 60, ridges: 60, pust: 12, pocks: 5, horns: 6, hlen: 0.8, curl: 60 },
+  boil: { swell: 3, reach: 220, tear: false, petals: 6, peel: 0, jag: 50, grow: 0, h: 0.5, lumps: 40, ridges: 0, pust: 0, pocks: 0, horns: 0, hlen: 0.6, curl: 20 },
+  over: { swell: 2, reach: 260, tear: true, petals: 8, peel: 60, jag: 80, grow: 140, h: 1.4, lumps: 85, ridges: 75, pust: 30, pocks: 9, horns: 12, hlen: 1, curl: 75 },
+  torn: { swell: 0.8, reach: 170, tear: true, petals: 7, peel: 55, jag: 85, grow: 45, h: 0.5, lumps: 50, ridges: 30, pust: 6, pocks: 0, horns: 2, hlen: 0.5, curl: 30 },
+};
+function startBurst(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part it bursts out of first, then Burst & growth.', 'bad'); return; }
+  endCrack(false); endReliefPlace(false); endBurst(false);
+  bz = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: (Math.random() * 2 ** 31) | 0 };
+  $('burst').hidden = false; $('bz-ctl').hidden = $('bz-done').hidden = true; bzStatus(''); syncGizmo();
+  $('bz-note').textContent = `Click where it bursts out of ${m.name}. With Sphere inside, click the surface over where the ball goes.`; syncBzRows();
+}
+function endBurst(keep = true) {
+  if (!bz) return;
+  bzSphereMark(false);
+  if (!keep && bz.pL) { restore(bz.before); afterHierarchyChange(); }
+  bz = null; $('burst').hidden = true; syncGizmo();
+}
+/** The ball, shown see-through where it sits inside the part (and its reach, fainter), while placing from a sphere. */
+let bzBall = null;
+function bzSphereMark(on) {
+  if (!on || !bz?.pL) { if (bzBall) { scene.remove(bzBall); bzBall.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); }); bzBall = null; } return; }
+  const m = bz.m; m.updateMatrixWorld(true);
+  const P = bz.pL.clone().applyMatrix4(m.matrixWorld), N = bz.nL.clone().transformDirection(m.matrixWorld).normalize(), q = burstParams(bz.seed);
+  if (!bzBall) {
+    bzBall = new THREE.Group(); bzBall.renderOrder = 5;
+    const mk = (op, col) => new THREE.Mesh(new THREE.SphereGeometry(1, 40, 24), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: op, depthTest: false, depthWrite: false }));
+    bzBall.add(mk(0.28, 0xd6a24a), mk(0.07, 0xd6a24a)); scene.add(bzBall);
+  }
+  bzBall.position.copy(P).addScaledVector(N, -q.depth);
+  bzBall.children[0].scale.setScalar(q.sr); bzBall.children[1].scale.setScalar(q.warp ? q.sr * q.preach : 0.001);
+}
+function bzStatus(t) { $('bz-status').textContent = t; $('bz-status').hidden = !t; }
+const bzFrom = () => document.querySelector('#bz-from [aria-pressed="true"]')?.dataset.v || 'surface';
+function syncBzRows() {
+  const sph = bzFrom() === 'sphere';
+  document.querySelectorAll('#burst .bz-surf').forEach(e => { e.hidden = sph; });
+  document.querySelectorAll('#burst .bz-sph').forEach(e => { e.hidden = !sph; });
+  if (sph) document.querySelectorAll('#burst .bz-w').forEach(e => { e.hidden = !$('bz-warp').checked; });
+  bzSphereMark(sph);
+  document.querySelectorAll('#burst .bz-torn').forEach(e => { e.hidden = !$('bz-tear').checked; });
+  document.querySelectorAll('#burst .bz-g').forEach(e => { e.hidden = !(+$('bz-grow').value > 0); });
+}
+function burstClick(hit, ev) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  const m = hit.object;
+  if (m !== bz.m) { if (bz.pL) { restore(bz.before); afterHierarchyChange(); } bz = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: bz.seed }; }
+  m.updateMatrixWorld(true);
+  const cur = m.geometry; m.geometry = bz.g0;
+  let h = hit;
+  if (cur !== bz.g0 && ev) { const b = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster(); rc.setFromCamera(new THREE.Vector2(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1), camera); h = rc.intersectObject(m, false)[0] || hit; }
+  // the surface's way out there: averaged over a patch, so a rivet or a panel line doesn't tip it
+  let n = hitNormal(h); if (n.dot(camera.position.clone().sub(h.point)) < 0) n.negate();
+  const avg = surfNormalNear(m, h.point, Math.max(1, +$('bz-r').value * 0.6 || 3), n); if (avg && avg.dot(n) > 0.3) n = avg;
+  const rc = new THREE.Raycaster(); rc.firstHitOnly = true; rc.set(h.point.clone().addScaledVector(n, -1e-3), n.clone().negate()); const back = rc.intersectObject(m, false)[0];
+  m.geometry = cur;
+  const inv = m.matrixWorld.clone().invert();
+  bz.pL = h.point.clone().applyMatrix4(inv); bz.nL = n.clone().transformDirection(inv); bz.thick = back ? back.distance + 1e-3 : 2;
+  bz.right = V(1, 0, 0).applyQuaternion(camera.quaternion);
+  // a first radius that suits the part, if it's never been set
+  if (!bz.sized && !$('bz-r').dataset.touched) { const s = exactBox(m).getSize(V()), r = Math.max(1, Math.min(40, Math.round(Math.min(s.x, s.y, s.z) > 0 ? Math.max(s.x, s.y, s.z) * 0.08 : 6))); $('bz-r').value = r; $('bz-h').value = +(r * +($('bz-h').dataset.k || 1)).toFixed(1); $('bz-hlen').value = +(r * +($('bz-hlen').dataset.k || 0.8)).toFixed(1); bz.sized = true; }
+  $('bz-ctl').hidden = $('bz-done').hidden = false; syncBzRows();
+  if (!bz.sized2 && !$('bz-sr').dataset.touched) { const r = +$('bz-r').value || 6; $('bz-sr').value = +(r * 1.3).toFixed(1); $('bz-depth').value = +(r * 0.6).toFixed(1); $('bz-push').value = +(r * 0.4).toFixed(1); bz.sized2 = true; }
+  syncBzRows();
+  $('bz-note').textContent = bzFrom() === 'sphere' ? `Sphere under ${m.name} (${bz.thick.toFixed(2)} mm thick there). Set its size and depth; click elsewhere to move it; Shuffle for a new one; then Done.`
+    : `Bursting out of ${m.name} (${bz.thick.toFixed(2)} mm thick there). Click elsewhere to move it; Shuffle for a new one; then Done.`;
+  burstRedo();
+}
+function burstRedo() {
+  if (!bz?.pL) return;
+  const me = bz; if (me.running) { me.again = true; return; }
+  me.running = true;
+  applyBurst().catch(e => { console.warn(e); bzStatus(`Couldn't burst it: ${e.message || e}`); })
+    .finally(() => { me.running = false; if (bz !== me) return; if (me.again) { me.again = false; burstRedo(); } else if (me.finish) burstDone(); });
+}
+function burstParams(seed) {
+  const num = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
+  return { radius: Math.max(0.3, num('bz-r', 6)), swell: Math.max(0, num('bz-swell', 1.5)), reach: Math.max(1.1, num('bz-reach', 200) / 100), tear: $('bz-tear').checked,
+    petals: Math.round(num('bz-petals', 6)), peel: Math.max(0, num('bz-peel', 40)), jag: Math.min(1, Math.max(0, num('bz-jag', 65) / 100)), plate: Math.max(0.2, num('bz-plate', 1.5)),
+    grow: Math.max(0, num('bz-grow', 85) / 100), height: Math.max(0.2, num('bz-h', 6)), lumps: Math.min(1, Math.max(0, num('bz-lumps', 60) / 100)), ridges: Math.min(1, Math.max(0, num('bz-ridges', 60) / 100)),
+    pustules: Math.round(num('bz-pust', 12)), pocks: Math.round(num('bz-pocks', 5)), horns: Math.round(num('bz-horns', 6)), hornLen: Math.max(0.5, num('bz-hlen', 5)), curl: Math.min(1, Math.max(0, num('bz-curl', 40) / 100)),
+    detail: Math.max(0.08, num('bz-detail', 0.25)), seed,
+    from: bzFrom(), sr: Math.max(0.3, num('bz-sr', 8)), depth: num('bz-depth', 4), warp: $('bz-warp').checked, push: Math.max(0, num('bz-push', 3)), preach: Math.max(1.1, num('bz-preach', 220) / 100), pnoise: Math.max(0, num('bz-pnoise', 35) / 100) };
+}
+function setBurstParams(q) {
+  const set = (id, v) => { if (v !== undefined) $(id).value = v; };
+  set('bz-r', q.radius); set('bz-swell', q.swell); set('bz-reach', q.reach !== undefined ? Math.round(q.reach * 100) : undefined); if (q.tear !== undefined) $('bz-tear').checked = q.tear;
+  set('bz-petals', q.petals); set('bz-peel', q.peel); set('bz-jag', q.jag !== undefined ? Math.round(q.jag * 100) : undefined); set('bz-plate', q.plate);
+  set('bz-grow', q.grow !== undefined ? Math.round(q.grow * 100) : undefined); set('bz-h', q.height); set('bz-lumps', q.lumps !== undefined ? Math.round(q.lumps * 100) : undefined);
+  set('bz-ridges', q.ridges !== undefined ? Math.round(q.ridges * 100) : undefined); set('bz-pust', q.pustules); set('bz-pocks', q.pocks); set('bz-horns', q.horns); set('bz-hlen', q.hornLen);
+  set('bz-curl', q.curl !== undefined ? Math.round(q.curl * 100) : undefined); set('bz-detail', q.detail);
+  set('bz-sr', q.sr); set('bz-depth', q.depth); if (q.warp !== undefined) $('bz-warp').checked = q.warp; set('bz-push', q.push); set('bz-preach', q.preach !== undefined ? Math.round(q.preach * 100) : undefined); set('bz-pnoise', q.pnoise !== undefined ? Math.round(q.pnoise * 100) : undefined);
+  if (q.from) document.querySelectorAll('#bz-from button').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.v === q.from)));
+  syncBzRows();
+}
+const bzHit = me => ({ pL: me.pL.toArray(), nL: me.nL.toArray(), right: me.right.toArray(), thick: me.thick });
+/** Burst a mesh (the part's g) where hit, worked out in the hit's own frame like a crack. */
+async function burstGeometry(m, g, hit, p) {
+  m.updateMatrixWorld(true);
+  const P = V().fromArray(hit.pL).applyMatrix4(m.matrixWorld), N = V().fromArray(hit.nL).transformDirection(m.matrixWorld).normalize();
+  let X = V().fromArray(hit.right).projectOnPlane(N); if (X.lengthSq() < 1e-6) X = (Math.abs(N.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).cross(N); X.normalize();
+  const Y = N.clone().cross(X).normalize(), F = new THREE.Matrix4().makeBasis(X, Y, N).setPosition(P);
+  // the burst works in mm: a scaled part is taken into the frame at its real size, and back again
+  const soup = soupOfGeom(g, F.clone().invert().multiply(m.matrixWorld));
+  const r = await solidJob({ burst: { ...p, soup, thick: hit.thick } });
+  if (!r.positions.length) throw new Error('that left nothing of it');
+  const back = m.matrixWorld.clone().invert().multiply(F), out = r.positions, v = V();
+  for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(back); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+  return { geometry: geomFromSoup(out), stats: r.stats };
+}
+async function applyBurst() {
+  const me = bz, m = me.m, p = burstParams(me.seed);
+  bzStatus(`Bursting it open… (${Math.round((me.g0.index ? me.g0.index.count : me.g0.attributes.position.count) / 3 / 1000)}k triangles)`);
+  const r = await burstGeometry(m, me.g0, bzHit(me), p);
+  if (bz !== me) return;
+  const g = r.geometry, pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null;
+  refreshPaint(m); afterHierarchyChange();
+  const st = r.stats, bits = [];
+  if (p.tear && st.petals) bits.push(`${st.petals} petal${st.petals === 1 ? '' : 's'} peeled back`);
+  if (p.grow > 0 && (st.horns || st.pustules || st.pocks)) bits.push(`${st.horns} horn${st.horns === 1 ? '' : 's'}, ${st.pustules} pustule${st.pustules === 1 ? '' : 's'}, ${st.pocks} pock hole${st.pocks === 1 ? '' : 's'}`);
+  const sph = p.from === 'sphere', through = !sph || p.depth < p.sr * 0.98;
+  if (sph && !through) bits.length = 0;
+  bzStatus((bits.join(' · ') || (sph ? (through ? 'Broken through' : `Pushed out from inside (the ball's ${(p.depth - p.sr).toFixed(1)} mm short of the surface, so it doesn't break through)`) : 'Swollen')) + ` · ${Math.round(pt.tris / 1000)}k triangles`);
+}
+function bindBurst() {
+  const re = () => burstRedo();
+  BZ_IDS.forEach(id => $(id).addEventListener('change', () => { syncBzRows(); re(); }));
+  $('bz-r').addEventListener('input', () => { $('bz-r').dataset.touched = '1'; });
+  $('bz-sr').addEventListener('input', () => { $('bz-sr').dataset.touched = '1'; });
+  document.querySelectorAll('#bz-from button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#bz-from button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncBzRows(); re(); }));
+  $('bz-look').addEventListener('change', () => { const L = BZ_LOOKS[$('bz-look').value]; $('bz-look').value = ''; if (!L) return;
+    const r = +$('bz-r').value || 6; setBurstParams({ swell: L.swell, reach: L.reach / 100, tear: L.tear, petals: L.petals, peel: L.peel, jag: L.jag / 100, grow: L.grow / 100, height: +(L.h * r).toFixed(1), lumps: L.lumps / 100, ridges: L.ridges / 100, pustules: L.pust, pocks: L.pocks, horns: L.horns, hornLen: +(L.hlen * r).toFixed(1), curl: L.curl / 100 }); re(); });
+  $('bz-shuffle').addEventListener('click', () => { if (!bz) return; bz.seed = (Math.random() * 2 ** 31) | 0; re(); });
+  $('bz-done').addEventListener('click', () => { if (!bz?.pL) return; if (bz.running) { bz.finish = true; bzStatus('Finishing it off…'); return; } burstDone(); });
+  $('bz-cancel').addEventListener('click', () => { endBurst(false); toast('Left it as it was.'); });
+}
+/** Keep it: it goes on the part as a modifier (a change still being worked out finishes first: see burstRedo). */
+function burstDone() {
+  if (!bz?.pL || bz.running) return;
+  { const m = bz.m, mods = ensureStack(m, bz.g0, bz.gk0), mod = { id: newModId(), type: 'burst', name: MOD_NAMES.burst, on: true, p: burstParams(bz.seed), hit: bzHit(bz) };
+    mods.push(mod); modCache.set(m.uuid + ':' + mod.id, { inG: bz.g0, key: modKey(m, mod), out: m.geometry });
+    pushUndo(bz.before); endBurst(true); select(m); evalStack(m);
+    toast(`${m.name} has burst open, as a modifier: turn it off, change it or Apply it in Properties › Modifiers. Burst again for more.`, 'ok'); }
+}
+
+// ---- basic shapes: cube, sphere, pyramid, cylinder
+/*
+ * Plain shapes to build with: a part like any other (snap it, cut magnet holes in it, crack it…), made to the size
+ * you set. Its origin is the middle of its base, so it sits on the mat. Until it has modifiers, its size and sides
+ * can be changed in Properties and it's made again.
+ */
+const SHAPES = {
+  cube: { name: 'Cube', w: 20, d: 20, h: 20 },
+  sphere: { name: 'Sphere', w: 20, d: 20, h: 20, seg: 48 },
+  pyramid: { name: 'Pyramid', w: 20, d: 20, h: 20, sides: 4 },
+  cylinder: { name: 'Cylinder', w: 20, d: 20, h: 20, sides: 48 },
+};
+function shapeGeometry(q) {
+  const { w, d, h } = q; let g;
+  const ring = (n, tall, top) => {     // a prism / pyramid of n sides, flats square to x and y where they can be
+    const r = n < 12 ? 0.5 / Math.cos(Math.PI / n) : 0.5, start = n % 2 === 0 ? Math.PI / n : Math.PI / 2;
+    return new THREE.CylinderGeometry(top * r, r, 1, n, 1, false, start);
+  };
+  if (q.kind === 'cube') g = new THREE.BoxGeometry(1, 1, 1);
+  else if (q.kind === 'sphere') { const n = Math.max(8, Math.round(q.seg || 48)); g = new THREE.SphereGeometry(0.5, n, Math.max(4, Math.round(n / 2))); g.rotateX(Math.PI / 2); }
+  else if (q.kind === 'pyramid') { g = ring(Math.max(3, Math.round(q.sides || 4)), 1, 0); g.rotateX(Math.PI / 2); }
+  else { g = ring(Math.max(3, Math.round(q.sides || 48)), 1, 1); g.rotateX(Math.PI / 2); }
+  g.scale(w, d, h); g.translate(0, 0, h / 2);
+  return g;
+}
+function addShape(kind) {
+  closeDialogs();
+  const q = { kind, ...SHAPES[kind] }; delete q.name;
+  // sized to what's selected (a quarter of it), else the defaults
+  if (selected?.userData.part?.prim) { const o = selected.userData.part.prim; q.w = o.w; q.d = o.d; q.h = o.h; }
+  else if (selected) { const s = exactBox(selected).getSize(V()), k = Math.min(40, Math.max(5, Math.round(Math.max(s.x, s.y, s.z) * 0.25))); q.w = q.d = q.h = k; }
+  pushUndo();
+  const nm = SHAPES[kind].name, name = liveParts().some(x => x.name === nm) ? nextName(nm) : nm;
+  const m = addPart(name, shapeGeometry(q), {});
+  m.userData.part.prim = q;
+  // beside the selected part, on the mat
+  if (selected && selected !== m) { const b = exactBox(selected); m.position.copy(world.worldToLocal(V(b.max.x + 5 + q.w / 2, (b.min.y + b.max.y) / 2, 0))); }
+  afterHierarchyChange(); select(m); setTool('move');
+  toast(`Added a ${nm.toLowerCase()}: move it into place, and set its size in Properties.`, 'ok');
+}
+function remakeShape(m) {
+  const pt = m.userData.part, q = pt.prim; if (!q || pt.mods?.length) return;
+  const g0 = shapeGeometry(q); g0.deleteAttribute('normal'); g0.deleteAttribute('uv');
+  const g = weldGeometry(g0); g.computeBoundingBox(); g.computeBoundsTree();
+  m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m);
+}
+function shapeRows(p, el) {
+  const pt = p.userData.part, q = pt.prim; if (!q) return;
+  const box = document.createElement('div'); box.className = 'mods'; el.append(box);
+  const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = SHAPES[q.kind]?.name || 'Shape'; box.append(h);
+  if (pt.mods?.length) { const n = document.createElement('p'); n.className = 'note'; n.textContent = 'It has modifiers now, so its size is fixed: remove them to change it.'; box.append(n); return; }
+  const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
+  const num = (label, key, step, min, max, title = '') => {
+    const l = document.createElement('label'); l.textContent = label; if (title) l.title = title;
+    const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = q[key];
+    n.addEventListener('change', () => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); if (['sides', 'seg'].includes(key)) v = Math.round(v); pushUndo(); q[key] = v; remakeShape(p); afterHierarchyChange(); });
+    grid.append(l, n);
+  };
+  num(q.kind === 'cube' ? 'Width mm' : 'Across mm', 'w', 0.5, 0.2, 500); num('Depth mm', 'd', 0.5, 0.2, 500); num('Height mm', 'h', 0.5, 0.2, 500);
+  if (q.kind === 'pyramid') num('Sides', 'sides', 1, 3, 96, '3 for a triangular pyramid, 4 square, more and it becomes a cone');
+  if (q.kind === 'cylinder') num('Sides', 'sides', 1, 3, 128, '6 for a hex prism, 8 an octagon; more is rounder');
+  if (q.kind === 'sphere') num('Smoothness', 'seg', 4, 8, 128, 'Segments round it: more is smoother');
+}
+
+// ---- growths that push the parts round them out of the way
+/*
+ * A growth is a part (a lumpy ball made for you, or any part you choose: a sculpted growth you imported, say) that
+ * you place and move like any other, fixed to the part you put it on. Every part round it is pushed out of its way,
+ * as if it had swollen up between them: each gets a "Pushed by" modifier, kept up to date whenever anything moves.
+ * Its room is a sphere for a ball, or the ellipsoid that fits a shape; the push is fullest at its skin and dies
+ * away by its reach.
+ */
+const GROW_DEFAULT = { kind: 'ball', mode: 'away', r: 8, reach: 2.6, sink: 0.12, strength: 0.5, noise: 0.3, fit: 0.8, lumps: 0.6, ridges: 0.6, pustules: 16, pocks: 6, horns: 0, hornPct: 0.6, curl: 0.6, detail: 0.25 };   // no horns unless asked; their length goes with the ball's size
+let gp = null;                                    // placing a new growth: the next click says where
+function startGrowth() {
+  endCrack(false); endBurst(false); endReliefPlace(false); endGrowPlace();
+  setTimeout(syncGizmo); gp = { size: selected ? Math.max(2, Math.round(Math.max(...exactBox(selected).getSize(V()).toArray()) * 0.12)) : 8 };
+  toast('Click where the growth goes (on any part: it goes with that part). Then move it and size it like any part.');
+}
+function endGrowPlace() { if (!gp) return; gp = null; syncGizmo(); }
+async function growClick(hit) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  const on = hit.object, at = hit.point.clone(), q = { ...GROW_DEFAULT, r: gp.size, seed: (Math.random() * 2 ** 31) | 0, draft: true };
+  endGrowPlace(); pushUndo();
+  // an outline first: quick to move and size; it's made and pushes the parts only when you say Grow it
+  const m = addPart(liveParts().some(x => /^Growth( \d+)?$/.test(x.name)) ? nextName('Growth') : 'Growth', draftGeom(q.r), { color: '#9b4a5a' });
+  m.position.copy(world.worldToLocal(at)); m.userData.part.grower = q; styleDraft(m, true);
+  m.updateMatrixWorld(true); on.attach(m);                            // it goes where that part goes
+  afterHierarchyChange(); select(m); setTool('move');
+  toast(`An outline of where the growth goes, on ${on.name}: drag it into place, size it ([ and ] or in Properties), then Grow it.`, 'ok');
+}
+async function growBallGeometry(q) {
+  const r = await solidJob({ growball: { r: q.r, lumps: q.lumps, ridges: q.ridges, pustules: q.pustules, pocks: q.pocks, horns: q.horns ?? 0, hornPct: q.hornPct ?? (q.hornLen ? q.hornLen / q.r : 0.6), curl: q.curl, detail: q.detail, seed: q.seed } });
+  return geomFromSoup(r.positions);
+}
+/** Turn a part into a growth (its own mesh stays: its room is the ellipsoid that fits it). Starts as an outline too. */
+function makeGrower(m) {
+  pushUndo(); m.userData.part.grower = { ...GROW_DEFAULT, kind: 'shape', seed: (Math.random() * 2 ** 31) | 0, draft: true }; styleDraft(m, true);
+  afterHierarchyChange(); toast(`${m.name} is a growth, as an outline for now: put it in place, then Grow it to push the parts round it aside.`, 'ok');
+}
+/** The outline's mesh: a plain ball, cheap to remake as it's sized. */
+function draftGeom(r) { const g = new THREE.IcosahedronGeometry(r * 0.85, 3); g.deleteAttribute('normal'); g.deleteAttribute('uv'); return g; }
+/**
+ * A growth as an outline: see-through, with its room drawn as a wire ball (an ellipsoid for a shape) and its
+ * reach as a fainter one, so you can see what it will push and how far. Off: back to solid, the outlines gone.
+ */
+function styleDraft(m, on) {
+  const mat = m.material, q = m.userData.part.grower;
+  for (const c of [...m.children]) if (c.userData.growOutline) { m.remove(c); c.geometry.dispose(); c.material.dispose(); }
+  mat.transparent = on; mat.opacity = on ? 0.3 : 1; mat.depthWrite = !on; mat.needsUpdate = true;
+  if (!on || !q) return;
+  m.updateMatrixWorld(true);
+  const room = growRoom(m), local = m.matrixWorld.clone().invert().multiply(room);          // the unit ball, in the part's own frame
+  const wire = (rr, op) => { const l = new THREE.LineSegments(new THREE.WireframeGeometry(new THREE.SphereGeometry(rr, 24, 14)), new THREE.LineBasicMaterial({ color: 0xd6a24a, transparent: true, opacity: op, depthTest: false }));
+    l.applyMatrix4(local); l.userData.growOutline = true; l.renderOrder = 6; l.raycast = () => {}; m.add(l); };
+  wire(1, 0.9); wire(q.reach || 2.6, 0.18);
+}
+/** Make it for real: the growth made, and the parts round it pushed aside. */
+async function growIt(m) {
+  const q = m.userData.part.grower; if (!q?.draft) return;
+  pushUndo(); toast(q.kind === 'ball' ? 'Growing it and pushing the parts aside…' : 'Pushing the parts aside…');
+  if (q.kind === 'ball') { const g = await growBallGeometry(q), pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m); }
+  q.draft = false; styleDraft(m, false); afterHierarchyChange();
+}
+/** Back to an outline, to move and size it quickly again (the parts go back as they were until it's grown again). */
+function toDraft(m) {
+  const q = m.userData.part.grower; if (!q || q.draft) return;
+  pushUndo(); q.draft = true;
+  if (q.kind === 'ball') { const g = weldGeometry(draftGeom(q.r)), pt = m.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; }
+  styleDraft(m, true); afterHierarchyChange();
+}
+/** Size an outline (or a grown ball, made again) by a factor. */
+async function resizeGrowth(m, k) {
+  const q = m.userData.part.grower; if (!q || q.kind !== 'ball') return;
+  pushUndo(); q.r = Math.max(0.5, Math.min(200, +(q.r * k).toFixed(2)));
+  if (q.draft) { const g = weldGeometry(draftGeom(q.r)), pt = m.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.tris = g.index.count / 3; styleDraft(m, true); }
+  else { const g = await growBallGeometry(q), pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m); }
+  afterHierarchyChange();
+}
+function stopGrower(m) {
+  pushUndo(); delete m.userData.part.grower;
+  for (const o of liveParts()) { const pt = o.userData.part; if (pt.mods?.some(x => x.type === 'grow' && x.grower === m.uuid)) { pt.mods = pt.mods.filter(x => !(x.type === 'grow' && x.grower === m.uuid)); evalStack(o); } }
+  afterHierarchyChange();
+}
+/** A growth's room: the unit ball of this frame (its own frame, moved to the room's middle and scaled to it). */
+function growRoom(gr) {
+  const q = gr.userData.part.grower; gr.updateMatrixWorld(true);
+  if (q.kind === 'ball') { const r = q.r * 0.85; return gr.matrixWorld.clone().multiply(new THREE.Matrix4().makeScale(r, r, r)); }
+  const bb = gr.geometry.boundingBox || (gr.geometry.computeBoundingBox(), gr.geometry.boundingBox), c = bb.getCenter(V()), h = bb.getSize(V()).multiplyScalar(0.5 * (q.fit ?? 0.8));
+  return gr.matrixWorld.clone().multiply(new THREE.Matrix4().makeTranslation(c.x, c.y, c.z)).multiply(new THREE.Matrix4().makeScale(Math.max(h.x, 0.05), Math.max(h.y, 0.05), Math.max(h.z, 0.05)));
+}
+function growToQ(m, gr) { m.updateMatrixWorld(true); return growRoom(gr).invert().multiply(m.matrixWorld); }
+function growKey(m, mod) {
+  const gr = partById(mod.grower); if (!gr || !gr.userData.part.grower || gr.userData.part.grower.draft || !isVisibleChain(gr)) return 'none';
+  const q = gr.userData.part.grower;
+  return JSON.stringify([q.kind, q.mode, q.r, q.reach, q.sink, q.strength, q.noise, q.fit, q.seed]) + growToQ(m, gr).elements.map(x => Math.round(x * 1e4)).join(',');
+}
+async function growWarpGeometry(m, g, mod) {
+  const gr = partById(mod.grower); if (!gr || !gr.userData.part.grower || gr.userData.part.grower.draft || !isVisibleChain(gr)) return g;
+  const q = gr.userData.part.grower, toQ = growToQ(m, gr), fromQ = toQ.clone().invert();
+  const S = V().setFromMatrixScale(growRoom(gr)), unit = Math.min(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) || 1;
+  const r = await solidJob({ warp: { soup: soupOfGeom(g, new THREE.Matrix4()), toQ: toQ.elements, fromQ: fromQ.elements, reach: q.reach, sink: q.sink, strength: q.strength, noise: q.noise, mode: q.mode || 'away', L: Math.max(0.12, unit / 22) / unit, seed: q.seed } });
+  mod.moved = r.moved;
+  return r.moved ? geomFromSoup(r.positions) : g;
+}
+/** Bring every part's "Pushed by" modifiers up to date: add them where a growth now reaches, take them off where none does. */
+let growTimer = 0;
+function refreshGrowers() { clearTimeout(growTimer); growTimer = setTimeout(refreshGrowersNow, 120); }
+function refreshGrowersNow() {
+  const all = liveParts(), growers = all.filter(o => o.userData.part.grower && !o.userData.part.grower.draft && isVisibleChain(o));
+  const reachOf = gr => { const M4 = growRoom(gr), c = V().setFromMatrixPosition(M4), S = V().setFromMatrixScale(M4); return { c, r: Math.max(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) * gr.userData.part.grower.reach }; };
+  const zones = growers.map(gr => ({ gr, ...reachOf(gr) }));
+  for (const m of all) {
+    const pt = m.userData.part; if (pt.grower || !isVisibleChain(m)) continue;
+    const box = exactBox(m), want = zones.filter(z => !(pt.noGrow || []).includes(z.gr.uuid) && box.distanceToPoint(z.c) < z.r).map(z => z.gr.uuid);
+    const have = (pt.mods || []).filter(x => x.type === 'grow');
+    let changed = false;
+    for (const x of have) if (!want.includes(x.grower)) { pt.mods = pt.mods.filter(y => y !== x); changed = true; }
+    for (const id of want) if (!have.some(x => x.grower === id)) { ensureStack(m).push({ id: newModId(), type: 'grow', grower: id, name: `Pushed by ${partById(id)?.name || 'a growth'}`, on: true }); changed = true; }
+    // worked out again only if something it depends on changed (else nothing happens, so this never loops)
+    const sig = (pt.mods || []).filter(x => x.type === 'grow' && x.on).map(x => growKey(m, x)).join('|');
+    if (changed || sig !== pt.growSig) { pt.growSig = sig; if (pt.mods) evalStack(m); }
+  }
+}
+function growerRows(p, el) {
+  const q = p.userData.part.grower; if (!q) return;
+  const box = document.createElement('div'); box.className = 'mods grower'; el.append(box);
+  const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = 'Growth'; box.append(h);
+  const pushed = liveParts().filter(o => o.userData.part.mods?.some(x => x.type === 'grow' && x.grower === p.uuid && x.on));
+  const note = document.createElement('p'); note.className = 'note';
+  if (q.draft) {
+    const reach = liveParts().filter(o => o !== p && !o.userData.part.grower && isVisibleChain(o)), room = growRoom(p), c = V().setFromMatrixPosition(room), S = V().setFromMatrixScale(room), rr = Math.max(S.x, S.y, S.z) * (q.reach || 2.6);
+    const will = reach.filter(o => exactBox(o).distanceToPoint(c) < rr).map(o => o.name);
+    note.textContent = `Outline: drag it into place (Move, G) and size it${q.kind === 'ball' ? ' ([ and ], or Size)' : ''}; the faint ball is how far it will bend things. ${will.length ? `It will push ${will.join(', ')}.` : 'It isn\'t near anything yet.'} Then Grow it.`;
+  } else note.textContent = (pushed.length ? `Pushing ${pushed.map(o => o.name).join(', ')} out of its way.` : 'Not touching anything: move it into or against a part.') + ' Back to outline to move it about quickly.';
+  box.append(note);
+  const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
+  const row = (label, ctl, title = '') => { const l = document.createElement('label'); l.textContent = label; if (title) l.title = title; grid.append(l, ctl); };
+  const regrow = async () => { if (q.kind !== 'ball') return; if (q.draft) { const g = weldGeometry(draftGeom(q.r)), pt = p.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); p.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.tris = g.index.count / 3; styleDraft(p, true); return; } const g = await growBallGeometry(q); const pt = p.userData.part; p.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(p); };
+  const num = (label, key, step, min, max, scale = 1, title = '', shape = false) => {
+    const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
+    n.addEventListener('change', async () => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); pushUndo(); q[key] = ['pustules', 'pocks', 'horns'].includes(key) ? Math.round(v) : v / scale; if (shape) await regrow(); if (q.draft) styleDraft(p, true); afterHierarchyChange(); });
+    row(label, n, title);
+  };
+  if (q.kind === 'ball') num('Size mm', 'r', 0.5, 0.5, 200, 1, 'Its radius', true);
+  else num('Room %', 'fit', 5, 20, 150, 100, "How much of the shape's box pushes the parts away (it's an ellipsoid fitting the shape)");
+  { const sel = document.createElement('select'); sel.className = 'num osel'; for (const [v, t] of [['away', 'Shoved aside'], ['around', 'Bulging round it']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.append(o); }
+    sel.value = q.mode || 'away'; sel.addEventListener('change', () => { pushUndo(); q.mode = sel.value; afterHierarchyChange(); });
+    row('Parts are', sel, 'Shoved aside: each part round it is pushed away from it and bends out of the way, so it takes their place (at a corner, the corner opens up). Bulging round it: they swell out over it'); }
+  num('Reach %', 'reach', 10, 110, 600, 100, 'How far round it the push spreads, as a share of its size: further, and the parts bend more gently');
+  num('Push %', 'strength', 5, 0, 150, 100, 'How far the parts round it are shoved out, as a share of its size: they clear out of its way and bend out round it');
+  if (!q.draft) {
+  num('Sink in %', 'sink', 2, 0, 50, 100, 'How far into its skin the parts may stay, so they bed into it rather than just touching');
+  num('Lumpy push %', 'noise', 5, 0, 100, 100, 'An uneven push, so the plates look forced out of shape rather than blown up');
+  }
+  if (q.kind === 'ball' && !q.draft) {
+    num('Lumpy %', 'lumps', 5, 0, 100, 100, '', true); num('Rings %', 'ridges', 5, 0, 100, 100, '', true); num('Pustules', 'pustules', 1, 0, 200, 1, '', true); num('Pock holes', 'pocks', 1, 0, 100, 1, '', true);
+    num('Horns', 'horns', 1, 0, 60, 1, 'None to start with: how many horns grow out of it', true);
+    if ((q.horns ?? 0) > 0) { q.hornPct ??= q.hornLen ? q.hornLen / q.r : 0.6; num('Horn length %', 'hornPct', 5, 5, 300, 100, "As a share of the growth's size, so they stay in proportion as you size it", true); num('Curl %', 'curl', 5, 0, 100, 100, '', true); }
+    num('Detail mm', 'detail', 0.02, 0.08, 2, 1, '', true);
+  }
+  const btns = document.createElement('div'); btns.className = 'btnrow'; box.append(btns);
+  const bt = (t, title, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = t; b.title = title; b.addEventListener('click', fn); btns.append(b); };
+  if (growthSpots(liveParts()).length >= 2) bt('Connect with ooze', 'String ooze from this growth to the others and the bursts there are, nearest to nearest', () => connectWithOoze([p, ...liveParts().filter(o => o !== p)]));   // starting from this one
+  if (q.draft) { bt('Grow it', 'Make the growth and push the parts round it aside (the slow part)', () => growIt(p)); btns.lastChild.classList.add('primary'); }
+  else bt('Back to outline', 'Quick to move and size again; the parts go back as they were until you Grow it again', () => toDraft(p));
+  if (q.kind === 'ball' && !q.draft) bt('Shuffle', 'New lumps, rings and horns', async () => { pushUndo(); q.seed = (Math.random() * 2 ** 31) | 0; await regrow(); afterHierarchyChange(); });
+  bt('Not a growth', 'It stops pushing the parts round it (they go back to how they were)', () => stopGrower(p));
+}
+
+// ---- ooze between growths and bursts
+/*
+ * Growths (placed or grown) and bursts can be joined up with ooze: each one becomes a spot on the ooze, on its
+ * surface facing the next one along, strung nearest to nearest. It's the same ooze as clicking spots by hand, so
+ * its looks, Shuffle and Done all work as usual, and the spots move with the parts they're on.
+ */
+/** The growths and bursts among these parts (and the bursts on them): { m, c (world middle), r (its size), anchorTo(dir) }. */
+function growthSpots(ms) {
+  const out = [];
+  for (const m of ms) {
+    if (!m?.parent || !isVisibleChain(m)) continue;
+    const pt = m.userData.part;
+    if (pt.grower) {
+      const room = growRoom(m), c = V().setFromMatrixPosition(room), S = V().setFromMatrixScale(room), r = Math.max(S.x, S.y, S.z);
+      // which way it's out in the open (not buried in the parts round it): the ooze leaves from that side
+      const others = liveParts().filter(o => o !== m && !o.userData.part.grower && isVisibleChain(o)), open = V(), rc0 = new THREE.Raycaster();
+      for (let i = 0; i < 26; i++) { const z = 1 - 2 * (i + 0.5) / 26, a = i * 2.399963, sr = Math.sqrt(1 - z * z), d = V(sr * Math.cos(a), sr * Math.sin(a), z);
+        rc0.set(c, d); rc0.far = r * 1.6; if (!rc0.intersectObjects(others, false).length) open.add(d); }
+      if (open.lengthSq() > 1e-6) open.normalize();
+      out.push({ m, c, r, anchorTo: dir0 => {                     // where a line from the middle that way leaves it
+        const dir = dir0.clone().add(open.clone().multiplyScalar(1.4)).normalize();
+        m.updateMatrixWorld(true); const rc = new THREE.Raycaster(c.clone().addScaledVector(dir, r * 4), dir.clone().negate(), 0, r * 8);
+        const h = rc.intersectObject(m, false)[0], P = h ? h.point : c.clone().addScaledVector(dir, r), N = h ? hitNormal(h) : dir.clone();
+        if (N.dot(dir) < 0) N.negate();
+        const inv = m.matrixWorld.clone().invert(); return { part: m.uuid, pL: P.clone().applyMatrix4(inv).toArray(), nL: N.clone().transformDirection(inv).toArray() }; } });
+    }
+    for (const mod of pt.mods || []) {
+      if (mod.type !== 'burst' || !mod.on) continue;
+      m.updateMatrixWorld(true);
+      const q = mod.p, P = V().fromArray(mod.hit.pL).applyMatrix4(m.matrixWorld), N = V().fromArray(mod.hit.nL).transformDirection(m.matrixWorld).normalize();
+      const sph = q.from === 'sphere', r = sph ? q.sr : q.radius, up = sph ? Math.max(0, (q.sr - q.depth) * 0.5) : (q.grow > 0 ? q.height * 0.45 : 0);
+      const c = P.clone().addScaledVector(N, up);
+      out.push({ m, c, r, anchorTo: dir => {                      // in the middle of the growth, leaning towards the next one
+        const at = c.clone().addScaledVector(dir.clone().projectOnPlane(N), r * 0.35), inv = m.matrixWorld.clone().invert(), n = N.clone().add(dir.clone().multiplyScalar(0.5)).normalize();
+        return { part: m.uuid, pL: at.applyMatrix4(inv).toArray(), nL: n.transformDirection(inv).toArray() }; } });
+    }
+  }
+  return out;
+}
+/** The spots strung nearest to nearest, starting from the first (or from the end of what's there). */
+function chainSpots(spots, from = null) {
+  const left = [...spots], order = []; let at = from || (left.length ? left[0].c : null);
+  while (left.length) { let bi = 0, bd = Infinity; left.forEach((s, i) => { const d = s.c.distanceTo(at); if (d < bd) { bd = d; bi = i; } }); const s = left.splice(bi, 1)[0]; order.push(s); at = s.c; }
+  return order;
+}
+/** Anchors for a chain: each on its spot's surface, facing along the chain. */
+function chainAnchors(order, prevC = null) {
+  return order.map((s, i) => {
+    const next = order[i + 1]?.c, prev = i ? order[i - 1].c : prevC;
+    const dir = (next && prev ? next.clone().sub(s.c).normalize().add(prev.clone().sub(s.c).normalize()) : (next || prev || s.c.clone().add(V(0, 0, 1))).clone().sub(s.c));
+    if (dir.lengthSq() < 1e-9) dir.copy(next ? next.clone().sub(s.c) : V(0, 0, 1)); dir.normalize();
+    return s.anchorTo(dir);
+  });
+}
+/** Ooze joining these growths and bursts (two or more). */
+function connectWithOoze(ms) {
+  const spots = growthSpots(ms);
+  if (spots.length < 2) { toast('Pick two or more growths or parts with bursts on them (Ctrl-click), then Connect with ooze.', 'bad'); return; }
+  startOoze(); oz.anchors = chainAnchors(chainSpots(spots));
+  if (+$('oz-sag').value > 10) $('oz-sag').value = 10;               // strands between growths across a plate hang less, or they'd sag into it
+  oozeMarks(); $('oz-done').disabled = false; oozeRedo();
+  $('oz-note').textContent = `Ooze strung between ${spots.length} growths and bursts. Click more spots to carry it on; change how it looks below; then Done.`;
+}
+/** In the ooze card: string it on through every growth and burst there is, after the spots already clicked. */
+function oozeJoinGrowths() {
+  if (!oz) return;
+  const have = new Set(oz.anchors.map(a => a.part)), spots = growthSpots(liveParts()).filter(s => !(s.m.userData.part.grower && have.has(s.m.uuid)));
+  if (!spots.length) { toast('There are no growths or bursts to join up (or they all are already).'); return; }
+  const w = oozeWorld(), last = w.length ? V().fromArray(w[w.length - 1].p) : null;
+  oz.anchors.push(...chainAnchors(chainSpots(spots, last), last));
+  oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2; if (oz.anchors.length >= 2) oozeRedo();
 }
 
 // ---- scattering parts over a face
@@ -5799,21 +6467,22 @@ async function importFiles(files) {
   await loadBatch(list.map(f => ({ file: f, path: f.name, name: f.name.replace(/\.stl$/i, ''), size: f.size })), null, project.name || 'Kit');
 }
 /** Load files with the loading popup for anything more than a couple; onto sprues with no box yet, they arrive sealed in a plain one. */
-async function loadBatch(entries, src, name) {
-  const mode = entries.length > 1 ? await askLoadMode(entries.length, src ? name : '', entries) : 'auto';
+const LOAD_MODE_WORDS = { kit: 'as a model kit, on sprues', spread: 'spread out', asis: 'where the files put them', auto: 'automatically' };
+async function loadBatch(entries, src, name, chosen = null) {
+  const mode = entries.length > 1 ? chosen || await askLoadMode(entries.length, src ? name : '', entries) : 'auto';
   if (!mode) { toast('Nothing loaded.'); return; }
   const kitMode = mode === 'kit', big = entries.length > 2 || kitMode;
   if (big) loading.show(kitMode ? `Packing ${name}` : `Loading ${entries.length} files`);
+  if (kitMode) matHold++;
   try {
     const hadSprues = !!sprues;
     await loadGroup(entries, src, big ? { mode, progress: (f, t) => loading.set(f * 0.85, t) } : { mode });
     if (kitMode && sprues && (!kit || (kit.state !== 'open' && !hadSprues))) {
       loading.set(0.9, kit ? 'Packing the box…' : 'Printing the box…'); await nextFrame();
       if (kit) { kit.state = 'sealed'; kit.noBox = false; await buildKit(); }      // into the box: it comes back out if it was put away else await makeKit(name, [], liveParts().length, { always: true, state: 'sealed' });
-      fitMat(true); select(null); frameBox(); markDirty();
-      toast(`${name} is sealed in its box. Double-click the box to open it.`, 'ok');
+      fitMat(true); markDirty(); loading.hide(); await unboxNow(); loading.depth++;
     }
-  } finally { if (big) loading.hide(); }
+  } finally { if (big) loading.hide(); if (matHold) { matHold = 0; fitMat(true); } }
 }
 function frameBox() { const o = kitFx.getObjectByName('kit-box'); if (!o) return; o.updateMatrixWorld(true); const b = new THREE.Box3().setFromObject(o); b.expandByScalar(b.getSize(V()).length() * 0.45); frame(b); }
 const nextFrame = () => new Promise(r => { let done = false; const go = () => { if (!done) { done = true; r(); } };
@@ -5821,7 +6490,7 @@ const nextFrame = () => new Promise(r => { let done = false; const go = () => { 
 
 /**
  * Load STL entries. A single file goes beside what's on the bench. Several files keep their own
- * coordinates if they look exported in their assembled places (then Auto-assemble opens);
+ * coordinates if they look exported in their assembled places (then Link in place opens);
  * if they're all piled at the origin they're laid out side by side instead.
  */
 async function loadGroup(entries, src, opts = {}) {
@@ -5942,33 +6611,84 @@ async function openFolder(list, name) {
     return { file: x.file, path: rel, dir: rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '', name: dup ? rel.replace(/\.stl$/i, '') : base[k],
              size: x.file.size, selected: true, state: null, partId: null, thumb: null };
   });
-  $('tab-files').hidden = false; $('folder-name').textContent = name; $('folder-filter').value = '';
-  renderFolder();
+  // how to set them out comes first, before the file list: a big folder then loads what you tick that way
   const total = folder.entries.reduce((a, e) => a + e.size, 0);
-  if (folder.entries.length <= 40 && total <= 200 * 1048576) {
-    const mode = folder.entries.length > 1 ? await askLoadMode(folder.entries.length, name, folder.entries) : 'auto';
-    if (!mode) {                                   // cancelled: the files are listed, nothing is loaded
-      folder.entries.forEach(e => { e.selected = false; }); renderFolder(); showDockTab('tab-files');
-      $('folder-note').textContent = 'Nothing loaded yet. Tick the files you want, then Load selected.'; toast(`Opened ${name}. Nothing loaded.`); return;
-    }
-    $('folder-note').textContent = 'Loaded every file. Untick any you don\'t want before loading more.';
-    const onSprues = mode === 'kit';
+  const mode = folder.entries.length > 1 ? await askLoadMode(folder.entries.length, name, folder.entries) : 'auto';
+  folder.mode = mode || null;
+  // then which parts: every one ticked unless the folder is big, when you tick what you want
+  const small = folder.entries.length <= 40 && total <= 200 * 1048576;
+  const go = mode && (folder.entries.length < 2 || await pickParts(name, folder.entries, mode, small));
+  $('tab-files').hidden = false; $('folder-name').textContent = name; $('folder-filter').value = '';
+  if (!go) {                                       // cancelled: the files are listed, nothing is loaded
+    folder.entries.forEach(e => { e.selected = false; }); renderFolder(); showDockTab('tab-files');
+    $('folder-note').textContent = 'Nothing loaded yet. Tick the files you want, then Load selected.'; toast(`Opened ${name}. Nothing loaded.`); return;
+  }
+  renderFolder();
+  if (folder.entries.some(e => e.selected)) {
+    $('folder-note').textContent = folder.entries.every(e => e.selected) ? 'Loaded every file.' : 'Loaded the ones you picked. Tick more and Load selected to add them.';
+    const onSprues = mode === 'kit'; if (onSprues) matHold++;
     loading.show(onSprues ? `Packing ${name}` : `Opening ${name}`);
     try {
       await loadGroup(folder.entries.filter(e => e.selected), folder, { mode, progress: (f, t) => loading.set(f * 0.8, t) });
       const seal = onSprues && !!sprues && !kit;
       loading.set(0.85, seal ? 'Printing the box…' : 'Setting out the bench…'); await nextFrame();
       await makeKit(name, list, liveParts().length, seal ? { always: true, state: 'sealed' } : {}); fitMat(true);
-      if (seal) { loading.set(0.96, 'Shrink-wrapping…'); await nextFrame(); select(null); frameBox(); toast(`${name} is sealed in its box${kit.pdf ? ' with the instructions' : ''}. Double-click the box to open it.`, 'ok'); }
+      if (seal) { loading.set(1, 'Opening the box…'); loading.hide(); await unboxNow(); loading.depth++; }
+      else if (onSprues) { matHold = 0; fitMat(true); }
       else if (kit) { frame(benchBox()); toast(`Opened the ${name} kit${kit.image ? ' box' : ''}${kit.pdf ? ' with its instructions. Click the booklet to read them' : ''}.`, 'ok'); }
       loading.set(1, 'Ready');
-    } finally { loading.hide(); }
+    } finally { loading.hide(); if (matHold) { matHold = 0; fitMat(true); } }
   } else {
     await makeKit(name, list, 0);
-    folder.entries.forEach(e => { e.selected = false; }); renderFolder(); showDockTab('tab-files');     // you pick what to load, so the list comes to the front
-    $('folder-note').textContent = `${folder.entries.length} files, ${fmtSize(total)} in all. Tick the ones you want, then Load selected.`;
+    renderFolder(); showDockTab('tab-files');
+    $('folder-note').textContent = `${folder.entries.length} files, ${fmtSize(total)} in all. Tick the ones you want, then Load selected. They'll be set out ${LOAD_MODE_WORDS[mode] || 'as you chose'}.`;
     toast(`Opened ${name}. Pick the files to load.`);
   }
+  // later loads from the list are new picks: start them unticked
+  folder.entries.forEach(e => { if (e.state === 'loaded') e.selected = false; }); renderFolder();
+}
+/**
+ * After the layout: a screen of the folder's parts, each with a picture, to tick the ones to load.
+ * Sets each entry's `selected`; resolves true to load them, false if cancelled.
+ */
+function pickParts(name, entries, mode, all = true) {
+  entries.forEach(e => { e.selected = all; });
+  $('pp-sub').textContent = `${entries.length} files in ${name} · ${{ kit: 'Model kit', spread: 'Spread out', asis: 'Where the files put them', auto: 'Set out for you' }[mode] || ''}`;
+  $('pp-note').textContent = all ? '' : 'A big folder: tick just the parts you want.';
+  $('pp-filter').value = '';
+  const box = $('pickparts'), grid = $('pp-grid');
+  const count = () => { const n = entries.filter(e => e.selected).length, sz = entries.filter(e => e.selected).reduce((a, e) => a + e.size, 0);
+    $('pp-count').textContent = `${n} of ${entries.length} ticked` + (n ? ` · ${fmtSize(sz)}` : ''); $('pp-load').textContent = n ? `Load ${n} part${n > 1 ? 's' : ''}` : 'Load'; $('pp-load').disabled = !n; };
+  const draw = () => {
+    const q = $('pp-filter').value.trim().toLowerCase(); grid.innerHTML = ''; let lastDir = null, shown = 0;
+    for (const e of entries) {
+      if (q && !e.path.toLowerCase().includes(q)) continue; shown++;
+      if (e.dir !== lastDir) { lastDir = e.dir; if (e.dir) { const g = document.createElement('div'); g.className = 'pp-dir'; g.textContent = e.dir + '/'; grid.append(g); } }
+      const it = document.createElement('label'); it.className = 'pp-item' + (e.selected ? ' on' : ''); it.setAttribute('role', 'listitem'); it.title = e.path;
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = e.selected; cb.setAttribute('aria-label', `Load ${e.name}`);
+      cb.addEventListener('change', () => { e.selected = cb.checked; it.classList.toggle('on', cb.checked); count(); });
+      const big = e.size > 30 * 1048576, th = document.createElement(big ? 'div' : 'img'); th.className = 'thumb' + (big ? ' big' : ''); th.alt = '';
+      if (big) th.textContent = 'large file'; else if (e.thumb) th.src = e.thumb; else queueThumb(e, th);
+      const fn = document.createElement('span'); fn.className = 'fn'; fn.textContent = e.name;
+      const fs = document.createElement('span'); fs.className = 'fs'; fs.textContent = fmtSize(e.size);
+      it.append(cb, th, fn, fs); grid.append(it);
+    }
+    if (!shown) grid.innerHTML = '<div class="empty">No parts match.</div>';
+    count();
+  };
+  const shownEntries = () => { const q = $('pp-filter').value.trim().toLowerCase(); return entries.filter(e => !q || e.path.toLowerCase().includes(q)); };
+  return new Promise(res => {
+    const on = [];
+    const bind = (el, ev, fn) => { el.addEventListener(ev, fn); on.push(() => el.removeEventListener(ev, fn)); };
+    const done = v => { box.hidden = true; on.forEach(f => f()); grid.innerHTML = ''; res(v); };
+    bind($('pp-filter'), 'input', draw);
+    bind($('pp-all'), 'click', () => { shownEntries().forEach(e => { e.selected = true; }); draw(); });
+    bind($('pp-none'), 'click', () => { shownEntries().forEach(e => { e.selected = false; }); draw(); });
+    bind($('pp-load'), 'click', () => done(true));
+    bind($('pp-cancel'), 'click', () => done(false));
+    bind(box, 'keydown', e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); done(false); } else if (e.key === 'Enter' && !e.target.matches('button') && !$('pp-load').disabled) { e.preventDefault(); done(true); } });
+    box.hidden = false; draw(); $('pp-load').focus();
+  });
 }
 function renderFolder() {
   const box = $('folder-list'), q = $('folder-filter').value.trim().toLowerCase();
@@ -6050,7 +6770,7 @@ async function renderThumb(file) {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-assemble: contacts -> joints and parent links
+// Link in place: contacts -> joints and parent links
 // ---------------------------------------------------------------------------
 const ar = { meshes: [], pairs: [], plan: null, root: null, busy: false };
 const rigPreview = new THREE.Group(); scene.add(rigPreview);
@@ -6058,7 +6778,7 @@ const KIND_LABEL = { ball: 'ball joint', socket: 'peg / socket', flat: 'flat con
 
 async function runAutorig(meshes, opts = {}) {
   if (ar.busy) return;
-  if (meshes.length < 2) { toast('Auto-assemble needs at least two loose parts on the bench.'); return; }
+  if (meshes.length < 2) { toast('Link in place needs at least two loose parts on the bench.'); return; }
   if (looksStacked(meshes)) {
     toast("These parts are piled on top of each other, each centred on the origin, so their positions don't say how they fit. Lay them out and snap them by hand.", 'bad');
     return;
@@ -6091,7 +6811,7 @@ function openAutorig(opts = {}) {
     : `${opts.auto ? 'These files are already in their assembled places, so they kept their positions. ' : ''}Each part hangs off the neighbour it touches most. Change what anything hangs off, or make parts options of each other (heads, weapons that swap in the same spot): use the menus, or drag a part by its ⋮⋮ onto another part's name to attach it, or onto its right end to make it an option. Then build the rig.`;
   rowsFromPlan(); renderAutorigList();
   showRigPreview();
-  if (opts.auto && pairs.length) toast(`Found ${pairs.length} contact${pairs.length === 1 ? '' : 's'} between ${meshes.length} parts. Review them in Auto-assemble.`, 'ok');
+  if (opts.auto && pairs.length) toast(`Found ${pairs.length} contact${pairs.length === 1 ? '' : 's'} between ${meshes.length} parts. Review them in Link in place.`, 'ok');
 }
 /* The review is a tree the user can rearrange before anything is built: per part, what it connects to (and how),
    or which part it's an option of. ar.rows[k] = { parent: index | -1, how: 'joint' | 'plain', optionOf: index | -1, edge } */
@@ -6147,7 +6867,7 @@ function renderAutorigList() {
     const who = document.createElement('div'); who.className = 'who';
     const grip = document.createElement('span'); grip.className = 'grip'; grip.textContent = '⋮⋮'; grip.title = 'Drag onto another part: on its name to attach, on its right end to make it an option';
     const nm = document.createElement('b'); nm.textContent = m.name;
-    who.append(grip, ...(asOption ? [Object.assign(document.createElement('span'), { className: 'opt-mark', textContent: '⇄', title: `An option for ${names[r.optionOf]}` })] : depth ? [Object.assign(document.createElement('span'), { className: 'arrow', textContent: e && r.how === 'joint' ? '◆' : '└' })] : []), nm);
+    who.append(grip, ...(asOption ? [Object.assign(document.createElement('span'), { className: 'opt-mark', textContent: '⇄', title: `An alternate for ${names[r.optionOf]}` })] : depth ? [Object.assign(document.createElement('span'), { className: 'arrow', textContent: e && r.how === 'joint' ? '◆' : '└' })] : []), nm);
     row.append(who);
     if (!asOption && r.parent >= 0) {           // how it attaches
       const seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${m.name} attaches`);
@@ -6160,10 +6880,10 @@ function renderAutorigList() {
     }
     const meta = document.createElement('div'); meta.className = 'meta';
     if (asOption) {
-      meta.append('option of', pick(`What ${m.name} is an option of`, r.optionOf, [[-1, '— not an option'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => arSet(k, v, v < 0 ? 'loose' : 'option'), 'Options swap for each other in the same spot'));
+      meta.append('alternate for', pick(`What ${m.name} is an alternate for`, r.optionOf, [[-1, '— not an alternate'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => arSet(k, v, v < 0 ? 'loose' : 'option'), 'Options swap for each other in the same spot'));
     } else {
       meta.append(depth ? 'on' : 'base', pick(`What ${m.name} attaches to`, r.parent, [[-1, depth ? '— nothing (leave loose)' : '— nothing'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'attach') && r.parent !== j])], v => arSet(k, v, v < 0 ? 'loose' : 'attach'), 'The part it hangs off'));
-      meta.append(pick(`Make ${m.name} an option of another part`, -1, [[-1, '⇄ option of…'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => { if (v >= 0) arSet(k, v, 'option'); }, 'Make it an alternative for another part in the same spot (a head, a weapon…)'));
+      meta.append(pick(`Make ${m.name} an alternate for another part`, -1, [[-1, '⇄ alternate for…'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => { if (v >= 0) arSet(k, v, 'option'); }, 'Make it an alternative for another part in the same spot (a head, a weapon…)'));
       if (r.parent >= 0) { const kd = document.createElement('span'); kd.className = 'kind ' + (e ? e.kind : 'none');
         kd.textContent = e ? (KIND_LABEL[e.kind] || e.kind) + (e.kind === 'ball' && e.pair.radius ? ` ⌀${(e.pair.radius * 2).toFixed(2)}` : ` ≈${e.pair.area.toFixed(e.pair.area < 10 ? 1 : 0)} mm²`) : 'not touching'; meta.append(kd); }
     }
@@ -6243,7 +6963,7 @@ function buildRig() {
     const main = meshes[t], alts = ks.map(k => meshes[k]);
     for (const sl of options.slots) sl.members = sl.members.filter(id => !alts.some(m => m.uuid === id));
     let sl = slotOf(main);
-    if (!sl) { const cn = commonName([main.name, ...alts.map(m => m.name)]); sl = { id: uid(), name: /^Slot \d+$/.test(cn) ? `${main.name} options` : cn, members: [main.uuid], active: main.uuid }; options.slots.push(sl); }
+    if (!sl) { const cn = commonName([main.name, ...alts.map(m => m.name)]); sl = { id: uid(), name: /^Spot \d+$/.test(cn) ? `${main.name} alternates` : cn, members: [main.uuid], active: main.uuid }; options.slots.push(sl); }
     sl.members.push(...alts.map(m => m.uuid)); nOpt += alts.length;
     shareSlotJoint(sl, main);
   }
@@ -6257,7 +6977,7 @@ function buildRig() {
   const base = meshes[rows.findIndex(r => r.parent < 0 && r.optionOf < 0)] || meshes[0];
   closeAutorig(); afterHierarchyChange(); select(base);
   if (warns.length) toast(warns[0], 'bad');
-  else toast(`Built the rig from ${base.name}: ${joints} joint${joints === 1 ? '' : 's'}${fixed ? `, ${fixed} fixed` : ''}${nOpt ? `, ${groups.size} option slot${groups.size > 1 ? 's' : ''}` : ''}${nLinks ? `, ${nLinks} extra pin${nLinks > 1 ? 's' : ''}` : ''}. Press P to pose.`, 'ok');
+  else toast(`Built the rig from ${base.name}: ${joints} joint${joints === 1 ? '' : 's'}${fixed ? `, ${fixed} fixed` : ''}${nOpt ? `, ${groups.size} set${groups.size === 1 ? '' : 's'} of alternates${groups.size > 1 ? 's' : ''}` : ''}${nLinks ? `, ${nLinks} extra pin${nLinks > 1 ? 's' : ''}` : ''}. Press P to pose.`, 'ok');
 }
 function bindAutorig() {
   $('ar-root').addEventListener('change', () => {
@@ -6290,7 +7010,7 @@ function bindAutorig() {
   $('folder-none').addEventListener('click', () => { folder.entries.forEach(e => { e.selected = false; }); renderFolder(); });
   $('folder-load').addEventListener('click', () => {
     const list = folder.entries.filter(e => e.selected && e.state !== 'loaded');
-    if (list.length) loadBatch(list, folder, folder.name);
+    if (list.length) loadBatch(list, folder, folder.name, folder.mode);
   });
 }
 function loadSample() {
@@ -6323,7 +7043,7 @@ function saveViaLink(blob, name) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); toast(`Saved ${name}`, 'ok');
 }
-function exportMeshes() { scene.updateMatrixWorld(true); return liveParts().filter(p => isVisibleChain(p)); }
+function exportMeshes() { scene.updateMatrixWorld(true); return liveParts().filter(p => isVisibleChain(p) && !p.userData.part.grower?.draft); }   // a growth still an outline isn't there yet
 const fillOpts = () => ({ maxGap: Math.max(+$('exp-gap').value || 0.5, 0.01), overlap: Math.max(+$('exp-overlap').value || 0, 0) });
 /** A stand-in mesh holding a part's filled corners in world space (same triangles; mirrored parts keep their winding). */
 function filledMesh(m, positions) {
@@ -6355,11 +7075,22 @@ async function mergeSTLs(bufs, title = 'Merging into one solid', holes = []) {
   loading.show(title); loading.set(0.15, 'Removing the surfaces inside the model…'); await nextFrame();
   try {
     const out = await mergeJobs(bufs.map((b, i) => ({ soups: [soupFromSTL(b)], subtract: holes[i] || [] })), { fillHollows: true, loose: $('exp-loose').value });
-    const s = out.reduce((a, r) => ({ inS: a.inS + r.inputShells, outS: a.outS + r.shells, h: a.h + r.hollows, hv: a.hv + r.hollowVolume, hl: a.hl + r.hollowsLeft, hlv: a.hlv + r.hollowLeftVolume, rep: a.rep + r.repaired, un: a.un + r.unmerged }), { inS: 0, outS: 0, h: 0, hv: 0, hl: 0, hlv: 0, rep: 0, un: 0 });
+    const s = out.reduce((a, r) => ({ inS: a.inS + r.inputShells, outS: a.outS + r.shells, h: a.h + r.hollows, hv: a.hv + r.hollowVolume, hl: a.hl + r.hollowsLeft, hlv: a.hlv + r.hollowLeftVolume, rep: a.rep + r.repaired, un: a.un + r.unmerged, mend: a.mend + (r.mended || 0) }), { inS: 0, outS: 0, h: 0, hv: 0, hl: 0, hlv: 0, rep: 0, un: 0, mend: 0 });
     const mm3 = v => v < 1 ? v.toFixed(2) : v.toFixed(0);
+    // a file with open or broken bits left in it can't be watertight as it is: rebuilt as one solid (if that's on)
+    let rebuilt = 0, rdetail = 0;
+    if ($('exp-rebuild').checked) for (let i = 0; i < out.length; i++) {          // (broken shells were already mended exactly in the merge: this is for what's still open)
+      const r = out[i]; if (!r.strays?.length || r.strays.length / 9 < 20) continue;
+      loading.set(0.5 + 0.4 * i / out.length, 'Shrink-wrapping what is still open…'); await nextFrame();
+      try { const q = await solidJob({ remesh: { soup: r.positions, detail: Math.max(0.04, +$('exp-rebuild-detail').value || 0.12) } }); out[i] = { ...r, positions: q.positions, unmerged: 0, rebuiltAt: q.stats.detail }; rebuilt++; rdetail = q.stats.detail; }
+      catch (e) { console.warn(e); }
+    }
     const files = out.map(r => stlFromSoup(r.positions));
     let note = s.inS > s.outS ? `Merged ${s.inS} shell${s.inS === 1 ? '' : 's'} into ${s.outS} solid${s.outS === 1 ? '' : 's'}, with no surfaces left inside.` : 'No surfaces left inside.';
     if (s.h) note += ` Filled ${s.h} sealed hollow${s.h === 1 ? '' : 's'} (${mm3(s.hv)} mm³).`;
+    if (rebuilt) note += ` ${rebuilt === 1 && out.length === 1 ? 'It' : rebuilt + ' file' + (rebuilt === 1 ? '' : 's')} had open or broken surfaces, so ${rebuilt === 1 ? 'it was' : 'they were'} shrink-wrapped as one watertight solid at ${rdetail} mm detail (a new surface).`;
+    else if (s.un && !$('exp-rebuild').checked) note += ' Some of it is open sheets with nothing behind them (not a closed solid even mended), so the file won\'t be watertight: Shrink-wrap would fix that, at the cost of re-meshing it.';
+    if (s.mend) note += ` Mended ${s.mend} broken spot${s.mend === 1 ? '' : 's'} (small holes, flaps, pinches) exactly, leaving the rest of the surface as it was.`;
     if (s.hl) note += ` ${s.hl} sealed hollow${s.hl === 1 ? ' is' : 's are'} left inside (${mm3(s.hlv)} mm³): tick "Fill hollow pockets" to fill ${s.hl === 1 ? 'it' : 'them'}.`;
     const bits = out.flatMap(r => r.loose), nb = bits.length, gapMax = Math.max(0, ...bits.map(b => b.gap)), joined = out.reduce((a, r) => a + r.bridged, 0), droppedN = out.reduce((a, r) => a + r.dropped, 0);
     const bitWord = n => `${n} loose bit${n === 1 ? '' : 's'}`;
@@ -6367,8 +7098,10 @@ async function mergeSTLs(bufs, title = 'Merging into one solid', holes = []) {
       : $('exp-loose').value === 'drop' ? ` Left out ${bitWord(droppedN)} that didn't touch the rest.`
       : ` ${bitWord(nb)} ${nb === 1 ? "doesn't" : "don't"} touch the rest (up to ${gapMax.toFixed(2)} mm away) and will print as separate pieces.`;
     const cutN = out.reduce((a, r) => a + r.cut, 0); if (cutN) note += ` Cut ${cutN} magnet hole${cutN === 1 ? '' : 's'}.`;
-    if (s.rep) note += ` Closed small holes in ${s.rep} piece${s.rep === 1 ? '' : 's'} first.`;
-    if (s.un) note += ` ${s.un} piece${s.un === 1 ? ' has' : 's have'} holes too big to close and went in as they were.`;
+    if (s.rep && !s.mend) note += ` Closed small holes in ${s.rep} piece${s.rep === 1 ? '' : 's'} first.`;
+    if (s.un && !rebuilt) note += ` ${s.un} piece${s.un === 1 ? ' has' : 's have'} holes too big to close and went in as they were.`;
+    if (rebuilt && rebuilt === out.filter(r => r.rebuiltAt).length && out.every(r => r.rebuiltAt))       // all rebuilt: the merge's own tally no longer applies
+      note = `${rebuilt === 1 ? 'It' : 'Every file'} had open sheets that couldn't be mended, so ${rebuilt === 1 ? 'it was' : 'they were'} shrink-wrapped as one watertight solid at ${rdetail} mm detail (a new surface).` + (cutN ? ` Cut ${cutN} magnet hole${cutN === 1 ? '' : 's'}.` : '');
     return { files, note: note + ' ' };
   } catch (e) {
     console.warn(e); toast(`Couldn't merge into one solid (${e.message || e}). Exported the parts as they are.`, 'bad');
@@ -6398,15 +7131,153 @@ async function oneSTLRaw(ms) {
 }
 $('exp-all').addEventListener('click', async () => {
   const ms = exportMeshes(); if (!ms.length) return;
+  const glue = $('exp-glue').checked ? glueOns(ms) : null;
+  if (glue?.list.length) { await exportWithGlue(ms, glue, 'model'); return; }
   const { data, note } = await oneSTL(ms); if (note) $('exp-note').textContent = note;
   deliver([{ name: 'model.stl', data }], 'model-stl.zip');
 });
+/** The selected parts to export: with what hangs off them if that's ticked. */
+function exportSelection() {
+  scene.updateMatrixWorld(true);
+  const sel = selection.length ? selection : selected ? [selected] : [];
+  const list = $('exp-attached').checked ? (selection.length ? selectionRoots() : [selected]).flatMap(subtreeParts) : sel;
+  const ok = new Set(exportMeshes());
+  return [...new Set(list)].filter(m => isVisibleChain(m) && ok.has(m));
+}
+const expPick = { what: 'all', as: 'one' };
+function syncExportPick() {
+  const hasSel = !!(selected || selection.length);
+  if (!hasSel && expPick.what === 'sel') expPick.what = 'all';
+  document.querySelectorAll('#exp-what button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === expPick.what)); if (b.dataset.v === 'sel') b.disabled = !hasSel; });
+  document.querySelectorAll('#exp-as button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === expPick.as)));
+  $('exp-attached-l').hidden = expPick.what !== 'sel';
+  const ms = expPick.what === 'sel' ? exportSelection() : exportMeshes(), n = ms.length;
+  $('exp-sum').textContent = !n ? 'Nothing to export.' : expPick.as === 'one'
+    ? `${n} part${n === 1 ? '' : 's'} into one STL${$('exp-merge').checked && n > 1 ? ', joined into one solid' : ''}.`
+    : `${n} STL${n === 1 ? '' : 's'}, one per part, each saved where it sits now so they line up again when opened together.`;
+  $('exp-go').disabled = !n; $('exp-go').textContent = !n ? 'Export' : expPick.as === 'one' ? 'Export 1 STL' : `Export ${n} STLs`;
+}
+document.querySelectorAll('#exp-what button').forEach(b => b.addEventListener('click', () => { expPick.what = b.dataset.v; syncExportPick(); }));
+document.querySelectorAll('#exp-as button').forEach(b => b.addEventListener('click', () => { expPick.as = b.dataset.v; syncExportPick(); }));
+['exp-attached', 'exp-merge'].forEach(id => $(id).addEventListener('change', syncExportPick));
+$('exp-go').addEventListener('click', () => {
+  if (expPick.what === 'all') { if (expPick.as === 'one') $('exp-all').click(); else exportSeparate(exportMeshes(), 'parts'); }
+  else if (expPick.as === 'one') $('exp-sel').click();
+  else exportSeparate(exportSelection(), selection.length > 1 ? 'selection' : safe(selected?.name || 'selection'));
+});
 $('exp-sel').addEventListener('click', async () => {
   if (!selected) return; scene.updateMatrixWorld(true);
-  const roots = selection.length ? selectionRoots() : [selected], ms = [...new Set(roots.flatMap(subtreeParts))].filter(isVisibleChain);
+  const ms = exportSelection(), roots = selection.length ? selectionRoots() : [selected];
   const name = roots.length > 1 ? 'selection' : safe(selected.name);
+  const glue = $('exp-glue').checked ? glueOns(ms) : null;
+  if (glue?.list.length) { await exportWithGlue(ms, glue, name); return; }
   const { data, note } = await oneSTL(ms); if (note) $('exp-note').textContent = note;
   deliver([{ name: name + '.stl', data }], name + '-stl.zip');
+});
+
+// ---------------------------------------------------------------------------
+// Glue-on pieces: ooze, reliefs and scatters exported as pieces of their own, to print and glue onto a model you
+// already have (or have printed). The model goes out without them; each piece goes out with the model cut out of
+// it (grown by a glue gap if set), so its back sits flush on the surface it was made on.
+// ---------------------------------------------------------------------------
+const glueKinds = () => ({ ooze: $('exp-glue-ooze').checked, relief: $('exp-glue-relief').checked, scatter: $('exp-glue-scatter').checked });
+/**
+ * The glue-ons among (or riding on) these parts: { list: [{ mesh, hosts, name, kind }], skipMesh: Set (left out of
+ * the model), hostMods: Map(host → Set of modifier ids to leave out of its stack) }.
+ */
+function glueOns(ms) {
+  const kinds = glueKinds(), inSet = new Set(ms), list = [], skipMesh = new Set(), hostMods = new Map();
+  for (const m of ms) {
+    const pt = m.userData.part;
+    if (pt.ooze && kinds.ooze) {
+      const hosts = [...new Set(pt.ooze.anchors.map(a => partById(a.part)).filter(h => h && h !== m && inSet.has(h)))];
+      list.push({ mesh: m, hosts, name: m.name, kind: 'ooze' }); skipMesh.add(m);
+    }
+    for (const mod of pt.mods || []) {
+      if (!mod.on || (mod.type !== 'relief' && mod.type !== 'scatter') || mod.mode === 'cut' || !kinds[mod.type]) continue;
+      const kids = modKids(m, mod); if (!kids.length) continue;
+      if (mod.mode === 'merge') { if (!hostMods.has(m)) hostMods.set(m, new Set()); hostMods.get(m).add(mod.id); }
+      kids.forEach((k, i) => { list.push({ mesh: k, hosts: [m], name: kids.length > 1 ? `${m.name} - ${mod.name || MOD_NAMES[mod.type]} ${i + 1}` : `${m.name} - ${mod.name || MOD_NAMES[mod.type]}`, kind: mod.type }); skipMesh.add(k); });
+    }
+  }
+  // scatters merged on per piece: one file each is a lot; the pieces of one scatter stay separate files all the same (each is glued on its own)
+  return { list, skipMesh, hostMods };
+}
+/** A host's mesh without the glue-ons merged into it: its stack run again leaving those modifiers out. */
+async function hostWithout(m, skipIds) {
+  const pt = m.userData.part; let g = pt.base.geometry;
+  for (const mod of pt.mods) { if (!mod.on || skipIds.has(mod.id)) continue; g = await evalMod(m, mod, g); }
+  return g;
+}
+/** Swap the hosts' meshes for their glue-free ones while fn runs (the scene shows them only for that moment). */
+async function withHostsBare(glue, fn) {
+  const swapped = [];
+  try {
+    for (const [m, ids] of glue.hostMods) { const g = await hostWithout(m, ids); swapped.push([m, m.geometry]); m.geometry = g; }
+    scene.updateMatrixWorld(true);
+    return await fn();
+  } finally { for (const [m, g] of swapped) m.geometry = g; }
+}
+/** The glue-on pieces as STL files (the hosts must be bare while this runs). */
+async function glueFiles(glue, names = new Set()) {
+  const fit = $('exp-glue-fit').checked, gap = Math.max(0, +$('exp-glue-gap').value || 0), files = [], notes = [];
+  loading.show('Making the glue-on pieces');
+  try {
+    for (const [k, it] of glue.list.entries()) {
+      loading.set(k / glue.list.length, it.name); await nextFrame();
+      it.mesh.updateMatrixWorld(true);
+      const soup = soupOfGeom(it.mesh.geometry, it.mesh.matrixWorld);
+      let cut = [];
+      if (fit) for (const h of it.hosts) { h.updateMatrixWorld(true); cut.push(gap > 0 ? grownSoup(h, gap) : soupOfGeom(h.geometry, h.matrixWorld)); }
+      let positions = soup;
+      try {
+        const [r] = await mergeJobs([{ soups: [soup], subtract: cut }], { fillHollows: true, loose: 'keep' });
+        if (r?.positions?.length) positions = r.positions; else notes.push(`${it.name} sits wholly inside the model, so it was left as it is`);
+      } catch (e) { console.warn(e); notes.push(`${it.name} couldn't be shaped to the model (its mesh may not be closed), so it's as it is`); }
+      let n = safe(it.name), j = 2; while (names.has(n)) n = `${safe(it.name)}_${j++}`; names.add(n);
+      files.push({ name: n + '.stl', data: stlFromSoup(positions) });
+    }
+  } finally { loading.hide(); }
+  return { files, note: `${files.length} glue-on piece${files.length === 1 ? '' : 's'}` + (fit ? `, each shaped to the model${gap ? ` with a ${gap} mm glue gap` : ''}` : '') + '.' + (notes.length ? ' ' + notes.join('; ') + '.' : '') };
+}
+/** A part's world mesh pushed out along its corner normals by d (a slightly bigger copy, for the glue gap). */
+function grownSoup(m, d) {
+  const g = m.geometry, pos = g.attributes.position, ix = g.index, nrm = new Float32Array(pos.count * 3), a = V(), b = V(), c = V(), n = V();
+  m.updateMatrixWorld(true); const W = m.matrixWorld, flip = W.determinant() < 0 ? -1 : 1, wp = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) { a.fromBufferAttribute(pos, i).applyMatrix4(W); wp.set([a.x, a.y, a.z], 3 * i); }
+  for (let t = 0; t < ix.count; t += 3) {
+    const i0 = ix.getX(t), i1 = ix.getX(t + 1), i2 = ix.getX(t + 2);
+    a.fromArray(wp, 3 * i0); b.fromArray(wp, 3 * i1); c.fromArray(wp, 3 * i2); n.subVectors(b, a).cross(c.sub(a)).multiplyScalar(flip);
+    for (const i of [i0, i1, i2]) { nrm[3 * i] += n.x; nrm[3 * i + 1] += n.y; nrm[3 * i + 2] += n.z; }
+  }
+  for (let i = 0; i < pos.count; i++) { n.fromArray(nrm, 3 * i).normalize(); wp[3 * i] += n.x * d; wp[3 * i + 1] += n.y * d; wp[3 * i + 2] += n.z * d; }
+  const out = new Float32Array(ix.count * 3);
+  for (let t = 0; t < ix.count; t += 3) { const o = [ix.getX(t), flip < 0 ? ix.getX(t + 2) : ix.getX(t + 1), flip < 0 ? ix.getX(t + 1) : ix.getX(t + 2)]; for (let e = 0; e < 3; e++) out.set(wp.subarray(3 * o[e], 3 * o[e] + 3), 3 * (t + e)); }
+  return out;
+}
+/** Whole model or selection with glue-ons: the model without them, and each piece on its own. */
+async function exportWithGlue(ms, glue, name) {
+  const model = ms.filter(m => !glue.skipMesh.has(m));
+  await withHostsBare(glue, async () => {
+    const files = [], notes = [];
+    if (model.length) { const { data, note } = await oneSTL(model); files.push({ name: name + '.stl', data }); if (note) notes.push(note); }
+    const g = await glueFiles(glue, new Set([name])); files.push(...g.files); notes.push(g.note);
+    $('exp-note').textContent = notes.join(' ');
+    deliver(files, name + '-with-glue-ons.zip');
+  });
+}
+function syncGlueNote() {
+  const ms = exportMeshes(), g = glueOns(ms), by = k => g.list.filter(x => x.kind === k).length;
+  const parts = [['ooze', 'ooze'], ['relief', 'relief'], ['scatter', 'scattered piece']].map(([k, w]) => { const n = by(k); return n ? `${n} ${w}${n === 1 ? '' : 's'}` : ''; }).filter(Boolean);
+  $('exp-glue-only').disabled = !g.list.length;
+  $('exp-glue-only').textContent = g.list.length ? `Glue-on pieces only (${g.list.length})` : 'Glue-on pieces only';
+  $('exp-glue-only').title = parts.length ? 'Just these, one STL each: ' + parts.join(', ') : 'Nothing to export as glue-ons: add ooze, a relief or a scatter (and tick its kind above)';
+}
+$('exp-glue').addEventListener('change', () => { $('exp-glue-f').hidden = !$('exp-glue').checked; syncGlueNote(); markDirty(); });
+['exp-glue-ooze', 'exp-glue-relief', 'exp-glue-scatter', 'exp-glue-fit', 'exp-glue-gap'].forEach(id => $(id).addEventListener('change', () => { syncGlueNote(); markDirty(); }));
+$('exp-glue-only').addEventListener('click', async () => {
+  const ms = exportMeshes(), glue = glueOns(ms); if (!glue.list.length) { toast('No ooze, reliefs or scatters to export as glue-ons.'); return; }
+  await withHostsBare(glue, async () => { const g = await glueFiles(glue); $('exp-note').textContent = g.note; deliver(g.files, 'glue-ons-stl.zip'); });
 });
 
 // ---------------------------------------------------------------------------
@@ -6841,14 +7712,29 @@ $('exp-sprue').addEventListener('click', () => exportSprues());
 $('exp-sprue-clear').addEventListener('click', () => { pushUndo(); sprues = null; afterHierarchyChange(); toast('Removed the sprue frames.'); });
 $('exp-preview').addEventListener('click', () => { if ($('exp-preview').getAttribute('aria-pressed') === 'true') clearSeamPreview(); else showSeamPreview(); });
 ['exp-gap', 'exp-overlap'].forEach(id => $(id).addEventListener('change', () => { if (seamFx.children.length) showSeamPreview(); markDirty(); }));
-$('exp-each').addEventListener('click', async () => {
-  const ms = exportMeshes(); if (!ms.length) return;
+$('exp-each').addEventListener('click', () => exportSeparate(exportMeshes(), 'parts'));
+/** One STL per part, each where it sits now (so they line up again opened together). */
+async function exportSeparate(all, zipName = 'parts') {
+  if (!all.length) return;
+  const glue = $('exp-glue').checked ? glueOns(all) : null;
+  if (glue?.list.length) {
+    await withHostsBare(glue, async () => {
+      const ms = all.filter(m => !glue.skipMesh.has(m)), used = new Set(), cut = await cutMagnetHoles(ms, ms);
+      const files = ms.map((m, i) => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([cut.meshes[i]]) }; });
+      const mg = await mergeSTLs(files.map(f => f.data), 'Merging each part into one solid', cut.byPart || []); files.forEach((f, i) => { f.data = mg.files[i]; });
+      const g = await glueFiles(glue, used);
+      $('exp-note').textContent = mg.note + (cut.note || '') + g.note;
+      deliver([...files, ...g.files], zipName + '-stl.zip');
+    });
+    return;
+  }
+  const ms = all;
   const used = new Set(), cut = await cutMagnetHoles(ms, ms); if (cut.note) $('exp-note').textContent = cut.note;
   const files = ms.map((m, i) => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([cut.meshes[i]]) }; });
   const mg = await mergeSTLs(files.map(f => f.data), 'Merging each part into one solid', cut.byPart || []); files.forEach((f, i) => { f.data = mg.files[i]; });
   if (mg.note || cut.note) $('exp-note').textContent = mg.note + (cut.note || '');
-  deliver(files, 'parts-stl.zip');
-});
+  deliver(files, zipName + '-stl.zip');
+}
 
 // ---------------------------------------------------------------------------
 // Input
@@ -6863,6 +7749,8 @@ renderer.domElement.addEventListener('pointerup', e => {
   if (oz) { oozeClick(raycast(e)); return; }                           // stringing ooze between spots
   if (modHit) { modHitClick(raycast(e), e); return; }                // a crack modifier's new hit
   if (dm) { crackClick(raycast(e), e); return; }                      // cracking: where it got hit
+  if (bz) { burstClick(raycast(e), e); return; }                      // bursting: where it comes out
+  if (gp) { growClick(raycast(e)); return; }                          // placing a growth
   if (rp) { reliefPlaceClick(raycast(e), e.shiftKey); return; }                   // placing a relief, or sliding it along the face
   if (!SNAP_STEPS[tool] && tool !== 'ORIENT' && tool !== 'pose' && !(e.ctrlKey || e.metaKey || e.shiftKey)) {
     const bh = benchHit(e);
@@ -7177,21 +8065,52 @@ window.addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if ((e.ctrlKey || e.metaKey) && k === 'y') { e.preventDefault(); redo(); return; }
-  if ((e.ctrlKey || e.metaKey) && k === 'a') { e.preventDefault(); selectMany(liveParts().filter(isVisibleChain)); toast(`Selected all ${selection.length} parts.`); return; }
-  // number pad views, like Blender: 1 front, 3 right, 7 top; with Ctrl the opposite side
+  const ctrl = e.ctrlKey || e.metaKey;
+  if (ctrl && k === 'a' && !e.shiftKey) { e.preventDefault(); selectAll(); return; }
+  if (ctrl && k === 'i') { e.preventDefault(); invertSelection(); return; }
+  if (ctrl && k === 'm' && !e.shiftKey) { e.preventDefault(); openMarr('mirror'); return; }
+  if (ctrl && k === 'p' && !e.shiftKey) { e.preventDefault(); parentToActive(); return; }
+  if (ctrl && e.code === 'Space') { e.preventDefault(); toggleMaxView(); return; }
+  // number pad views, as in Blender: 1 front, 3 right, 7 top (Ctrl: the opposite side), 9 the other side of where you are,
+  // 2 4 6 8 turn the view in steps, 5 perspective / orthographic, . frame the selection, / local view, + and - zoom
   if (e.code === 'Numpad5') { e.preventDefault(); setOrtho(!camera.isOrthographicCamera); toast(camera.isOrthographicCamera ? 'Orthographic view: no perspective, so things line up with references.' : 'Perspective view.'); return; }
   const pad = { Numpad1: V(0, -1, 0), Numpad3: V(1, 0, 0), Numpad7: V(0, 0, 1) }[e.code];
-  if (pad) { e.preventDefault(); navCube.goTo(e.ctrlKey || e.metaKey ? pad.negate() : pad); return; }
-  if (e.ctrlKey || e.metaKey || e.altKey) return;
-  const map = { '1': 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', b: 'BALL', h: 'PLANE', m: 'MID', t: 'THREE', j: 'MATCH', c: 'paint', n: 'MAGNET', l: 'LUCKY' };
+  if (pad) { e.preventDefault(); navCube.goTo(ctrl ? pad.negate() : pad); return; }
+  if (e.code === 'Numpad9') { e.preventDefault(); navCube.goTo(orbit.target.clone().sub(camera.position).normalize()); return; }
+  if (['Numpad2', 'Numpad4', 'Numpad6', 'Numpad8'].includes(e.code)) { e.preventDefault(); stepView(e.code); return; }
+  if (e.code === 'NumpadAdd' || e.code === 'NumpadSubtract') { e.preventDefault(); zoomView(e.code === 'NumpadAdd' ? 1 / 1.2 : 1.2); return; }
+  if (e.code === 'NumpadDecimal') { e.preventDefault(); frameSelected(); return; }
+  if (e.code === 'NumpadDivide') { e.preventDefault(); toggleLocalView(); return; }
+  if (e.altKey && !ctrl) {
+    if (e.code === 'KeyA') { e.preventDefault(); select(null); return; }       // by key, not letter: Alt changes the letter on a Mac
+    if (e.code === 'KeyH') { e.preventDefault(); revealAll(); return; }
+    if (e.code === 'KeyP') { e.preventDefault(); clearParent(); return; }
+    return;
+  }
+  if (ctrl) return;
+  if (e.key === 'F2') { e.preventDefault(); renameSelected(); return; }
+  // tools: Blender's letters where the bench has the same tool, numbers for the snap tools (as they're numbered on the left)
+  const map = { w: 'select', q: 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', c: 'paint', m: 'MAGNET', '1': 'BALL', '2': 'PLANE', '3': 'MID', '4': 'THREE', '5': 'MATCH', '6': 'LUCKY' };
+  if (e.key === '?' || e.key === 'F1') { e.preventDefault(); openKeys(); return; }
+  if (e.shiftKey && k === 'a') { e.preventDefault(); openDialog('dlg-shapes'); return; }
+  if (e.shiftKey && k === 'd') { e.preventDefault(); duplicateSelected(); return; }
+  if (e.shiftKey && k === 'h') { e.preventDefault(); hideOthers(); return; }
+  if (e.shiftKey && k === 'c') { e.preventDefault(); frame(sceneBox(liveParts().filter(isVisibleChain))); return; }
+  if (!e.shiftKey && k === 'h') { hideSelected(); return; }
+  if (!e.shiftKey && k === 'a') { selectAll(); return; }
+  if (!e.shiftKey && k === 'i') { $('btn-import').click(); return; }
+  if (!e.shiftKey && k === 'n') { toggleSide(); return; }
+  if (!e.shiftKey && k === 't') { toggleTools(); return; }
+  if ((e.key === '[' || e.key === ']') && tool === 'paint') { const v = Math.max(0.1, Math.min(30, +$('paint-size').value * (e.key === ']' ? 1.15 : 1 / 1.15))); $('paint-size').value = v.toFixed(2); $('paint-size').dispatchEvent(new Event('change')); return; }
   if (k === 'e' && tool === 'paint') { const c = $('paint-erase'); c.checked = !c.checked; toast(c.checked ? 'Erasing back to bare plastic.' : 'Painting.'); return; }
-  if (k === 'k' && !e.shiftKey) { setFitPinned(!(fit.pinned || !$('fitcheck').hidden)); toast(fit.pinned ? 'Fit check on: cross-sections through the selected part where it meets its neighbour. K hides it.' : 'Fit check hidden. K brings it back.'); return; }
-  if (e.shiftKey && k === 'm') { openMarr('mirror'); return; }
-  if (e.shiftKey && k === 'a') { openMarr('linear'); return; }
+  if (k === 'k' && !e.shiftKey) { setFitPinned(!sec.on); toast(sec.on ? 'Section view: move and turn the plane to cut where you want. K turns it off.' : 'Section view off.'); return; }
   if (k === 'escape' && dirPick) { cancelDirPick(); return; }
   if (oz && k === 'escape') { endOoze(false); toast('No ooze.'); return; }
   if (oz && k === 'backspace') { e.preventDefault(); oozeUndo(); return; }
   if (k === 'escape' && dm) { endCrack(false); toast('Left it as it was.'); return; }
+  if (k === 'escape' && bz) { endBurst(false); toast('Left it as it was.'); return; }
+  if (k === 'escape' && gp) { endGrowPlace(); toast('No growth.'); return; }
+  if ((e.key === '[' || e.key === ']') && selected?.userData.part.grower?.kind === 'ball' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); resizeGrowth(selected, e.key === ']' ? 1.1 : 1 / 1.1); return; }
   if (k === 'escape' && rp) { endReliefPlace(false); toast('Left the relief where it was.'); return; }
   if (k === 'escape' && !$('marr').hidden) { if (marr.picking) { marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false'); } else closeMarr(); return; }
   if (k === 'enter' && !$('marr').hidden && !e.target.closest?.('#marr')) { applyMarr(); return; }
@@ -7200,20 +8119,85 @@ window.addEventListener('keydown', e => {
   if (k === 'escape' && benchSel) { select(null); syncGizmo(); renderPartPanel(); return; }
   if (k === 'escape' && magPending) { magPending = null; rebuildMagnets(); updateStep(); toast('Cancelled that magnet.'); return; }
   if (k === 'escape') { if (!$('orient').hidden) { closeOrient(); return; } if (picks.length) cancelPick(); else if (tool === 'select' && selection.length) select(null); else setTool('select'); return; }
+  if (k === 'enter' && !$('adjust').hidden && lastOp && !picks.length) { e.preventDefault(); acceptSnap(); return; }
   if (k === 'enter' && tool === 'MATCH' && picks.length) { e.preventDefault(); applyMatch(); return; }
   if (k === 'enter' && tool === 'LUCKY' && !luckyFirst && selection.length === 2) { e.preventDefault(); feelLucky(selection[0], selection[1]); return; }
   if (k === 'escape' && luckyFirst) { luckyFirst = null; updateStep(); toast('Cancelled.'); return; }
   if (k === 'backspace' && picks.length) { e.preventDefault(); picks.pop(); rebuildPickFx(); updateStep(); return; }
   if ((k === 'delete' || k === 'x') && benchSel) {
+    if (benchSel.kind === 'section') { setFitPinned(false); return; }
     if (benchSel.kind === 'ref') removeRef(benchSel.k);
     else if (benchSel.kind === 'sprue') removeSprue(benchSel.k);
     else putAway(benchSel.kind === 'book' ? 'book' : 'box');
     return;
   }
   if (k === 'delete' || k === 'x') { deleteSelected(); return; }
-  if (k === 'f' || k === '.') { frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox()); return; }
+  if (k === 'f' || k === '.') { frameSelected(); return; }
   if (k === 'home') { frame(benchBox()); return; }
 });
+function frameSelected() { frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox(liveParts().filter(isVisibleChain))); }
+function selectAll() { selectMany(liveParts().filter(isVisibleChain)); toast(`Selected all ${selection.length} parts.`); }
+function invertSelection() { const had = new Set(selection.length ? selection : selected ? [selected] : []); const list = liveParts().filter(m => isVisibleChain(m) && !had.has(m)); if (list.length) selectMany(list); else select(null); }
+/** Turn the view a step round the target, like Blender's number pad 2 4 6 8. */
+function stepView(code) {
+  const a = THREE.MathUtils.degToRad(15), off = camera.position.clone().sub(orbit.target);
+  if (code === 'Numpad4' || code === 'Numpad6') off.applyAxisAngle(V(0, 0, 1), code === 'Numpad4' ? -a : a);
+  else { const right = V().crossVectors(off, camera.up).normalize(), t = off.clone().applyAxisAngle(right, code === 'Numpad8' ? a : -a); if (Math.abs(t.clone().normalize().z) < 0.995) off.copy(t); }
+  camera.position.copy(orbit.target).add(off); camera.lookAt(orbit.target); orbit.update(); markViewMoved();
+}
+function zoomView(f) {
+  if (camera.isOrthographicCamera) { camera.zoom /= f; camera.updateProjectionMatrix(); }
+  else camera.position.copy(orbit.target).add(camera.position.clone().sub(orbit.target).multiplyScalar(f));
+  orbit.update(); markViewMoved();
+}
+/** H, Shift+H, Alt+H: hide what's selected, hide everything else, show it all again (alternates that are switched off stay off). */
+function partsShown(list, on) { list.forEach(m => { m.visible = on; }); renderOutliner(); renderPartPanel(); markDirty(); if (sprues) rebuildSprues(); }
+function hideSelected() {
+  const list = selection.length ? [...selection] : selected ? [selected] : []; if (!list.length) return;
+  select(null); partsShown(list, false); toast(`Hid ${list.length === 1 ? list[0].name : list.length + ' parts'}. Alt+H shows everything again.`);
+}
+function hideOthers() {
+  const keep = new Set((selection.length ? selectionRoots() : selected ? [selected] : []).flatMap(r => [...subtreeParts(r), ...ancestorsOf(r)])); if (!keep.size) return;
+  const list = liveParts().filter(m => m.visible && !keep.has(m) && !m.userData.optOff); partsShown(list, false); toast(`Hid ${list.length} other part${list.length === 1 ? '' : 's'}. Alt+H shows everything again.`);
+}
+function ancestorsOf(m) { const out = []; for (let p = parentPart(m); p; p = parentPart(p)) out.push(p); return out; }
+function revealAll() {
+  localView = null; const list = liveParts().filter(m => !m.visible && !m.userData.optOff); if (!list.length) return;
+  partsShown(list, true); selectMany(list); toast(`Showing ${list.length} hidden part${list.length === 1 ? '' : 's'}.`);
+}
+/** Number pad /: just the selection, framed; again to go back. */
+let localView = null;
+function toggleLocalView() {
+  if (localView) { const { hid, cam, target } = localView; localView = null; partsShown(hid.filter(m => m.parent), true); camera.position.copy(cam); orbit.target.copy(target); orbit.update(); markViewMoved(); toast('Back to everything.'); return; }
+  const keep = new Set((selection.length ? selectionRoots() : selected ? [selected] : []).flatMap(r => [...subtreeParts(r), ...ancestorsOf(r)])); if (!keep.size) { toast('Select a part first.'); return; }
+  const hid = liveParts().filter(m => m.visible && !keep.has(m)); localView = { hid, cam: camera.position.clone(), target: orbit.target.clone() };
+  partsShown(hid, false); frameSelected(); toast('Local view: just the selection. Numpad / again to go back.');
+}
+/** Shift+D: copies of the selection (and what hangs off it), in the same place, attached where the originals are, ready to move. */
+function duplicateSelected() {
+  const roots = selection.length ? selectionRoots() : selected ? [selected] : []; if (!roots.length) return;
+  pushUndo(); lastOp = null; scene.updateMatrixWorld(true); const made = [], I = new THREE.Matrix4();
+  for (const r of roots) { const info = linkInfo(r), c = cloneTree(r, nextName); world.add(c); setWorld(c, r.matrixWorld.clone()); if (info.par) attachLike(c, r, I, info); made.push(c); }
+  afterHierarchyChange(); selectMany(made); setTool('move');
+  toast(`Duplicated ${made.length === 1 ? `as ${made[0].name}` : made.length + ' parts'}: drag the arrows to move ${made.length === 1 ? 'it' : 'them'}.`, 'ok');
+}
+/** Ctrl+P: the others follow the active part, fixed. Alt+P: let go of what they hang off, staying where they are. */
+function parentToActive() {
+  const others = selection.filter(m => m !== selected); if (!selected || !others.length) { toast('Select the parts, then the one they attach to last.'); return; }
+  pushUndo(); let n = 0; for (const m of others) if (!isDescendant(selected, m) && parentPart(m) !== selected) { attach(m, selected, 'plain'); n++; }
+  afterHierarchyChange(); toast(n ? `Attached ${n} part${n > 1 ? 's' : ''} to ${selected.name}.` : 'Nothing to attach.', n ? 'ok' : '');
+}
+function clearParent() {
+  const list = (selection.length ? selection : selected ? [selected] : []).filter(m => parentPart(m)); if (!list.length) return;
+  pushUndo(); list.forEach(m => detach(m)); afterHierarchyChange(); toast(`Detached ${list.length === 1 ? list[0].name : list.length + ' parts'}.`);
+}
+function renameSelected() {
+  if (!selected) return; showDockTab('tab-props'); const n = $('part-name'); if (n) { n.focus(); n.select(); }
+}
+/** N and T, as in Blender: the side panel and the toolbar. Ctrl+Space: the view on its own. */
+function toggleSide() { document.querySelector('.app').classList.toggle('no-side'); }
+function toggleTools() { document.querySelector('.app').classList.toggle('no-tools'); }
+function toggleMaxView() { const a = document.querySelector('.app'), on = !(a.classList.contains('no-side') && a.classList.contains('no-tools')); a.classList.toggle('no-side', on); a.classList.toggle('no-tools', on); }
 function rebuildPickFx() {
   clearFx();
   picks.forEach((q, i) => { const side = (q.side ? q.side === 'move' : i < PER_SIDE[tool]) ? '#4db4dc' : '#e2804f'; if (q.region) showRegion(q.mesh, q.region, side); showMarker(q.point, '#ffe066', tool === 'THREE' ? .8 : 1.2); });
@@ -7222,7 +8206,7 @@ function rebuildPickFx() {
 // ---------------------------------------------------------------------------
 // Projects: autosave to this browser (IndexedDB) and project files (.zip)
 // ---------------------------------------------------------------------------
-const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-mirror', 'set-mirror-axis', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-loose', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain'];
+const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-mirror', 'set-mirror-axis', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-loose', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain', 'exp-glue', 'exp-glue-ooze', 'exp-glue-relief', 'exp-glue-scatter', 'exp-glue-fit', 'exp-glue-gap', 'exp-rebuild', 'exp-rebuild-detail'];
 const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
 let idb = null;
 const idbReady = new Promise(res => {
@@ -7251,7 +8235,7 @@ function serializeProject() {
     parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
       geom: storedKey(m), tris: m.userData.part.tris, parent: parentId(m), ...tr(m),
       mods: m.userData.part.mods?.length ? JSON.parse(JSON.stringify(m.userData.part.mods, (k, v) => k === 'err' ? undefined : v)) : undefined,
-      owner: m.userData.part.owner || undefined, ooze: m.userData.part.ooze || undefined, relief: m.userData.part.relief ? encodeRelief(m.userData.part.relief) || undefined : undefined })),
+      owner: m.userData.part.owner || undefined, ooze: m.userData.part.ooze || undefined, grower: m.userData.part.grower || undefined, prim: m.userData.part.prim || undefined, axes: m.userData.part.axes || undefined, pivot: m.userData.part.pivot || undefined, noGrow: m.userData.part.noGrow || undefined, relief: m.userData.part.relief ? encodeRelief(m.userData.part.relief) || undefined : undefined })),
     joints: joints.filter(j => j.parent).map(j => { const jd = j.userData.joint; return { id: j.uuid, parent: parentId(j), size: jd.size, rest: jd.rest.toArray(),
       type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, axisName: jd.axisName || '', pointOff: jd.pointOff || null, partOff: jd.partOff || null, ...tr(j) }; }),
     links: JSON.parse(JSON.stringify(links)),
@@ -7283,7 +8267,7 @@ function buildProject(data, geoms, paints = new Map()) {
   [...parts, ...joints].forEach(o => o.parent && o.parent.remove(o));
   parts.length = 0; joints.length = 0; undoStack.length = 0; redoStack.length = 0; lastOp = null;
   for (const [id, v] of Object.entries(data.settings || {})) { const el = $(id); if (!el) continue; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; }
-  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked; $('exp-pockets-f').hidden = !$('exp-pockets').checked; $('exp-merge-f').hidden = $('exp-merge-note').hidden = !$('exp-merge').checked;
+  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked; $('exp-pockets-f').hidden = !$('exp-pockets').checked; $('exp-glue-f').hidden = !$('exp-glue').checked; $('exp-merge-f').hidden = $('exp-merge-note').hidden = !$('exp-merge').checked;
   const byId = new Map(), missing = [], shared = new Map();
   for (const p of data.parts) {
     const rec = geoms.get(p.geom); if (!rec) { missing.push(p.name); continue; }
@@ -7294,6 +8278,9 @@ function buildProject(data, geoms, paints = new Map()) {
     if (p.mods?.length) { pt.base = { geometry: g, geomKey: p.geom }; pt.mods = JSON.parse(JSON.stringify(p.mods)); }
     if (p.owner) pt.owner = p.owner;
     if (p.ooze) pt.ooze = p.ooze;
+    if (p.prim) pt.prim = p.prim;
+    if (p.axes) pt.axes = p.axes; if (p.pivot) pt.pivot = p.pivot;
+    if (p.grower) { pt.grower = p.grower; styleDraft(m, !!p.grower.draft); } if (p.noGrow) pt.noGrow = p.noGrow;
     if (p.relief) pt.relief = decodeRelief(p.relief);
     if (pb && pb.byteLength === g.attributes.position.count * 4) { pt.paint = new Uint8Array(pb.slice(0)); pt.paintVer = pt.paintSaved = 1; }
     refreshPaint(m);
@@ -7464,6 +8451,7 @@ async function openProjectFile(file) {
 // ---------------------------------------------------------------------------
 function openDialog(id) {
   const d = $(id); document.querySelectorAll('.dlg').forEach(x => { if (x !== d) x.hidden = true; });
+  if (id === 'dlg-export') { try { syncGlueNote(); } catch (e) {} if (d.hidden) { expPick.what = selected || selection.length ? 'sel' : 'all'; } syncExportPick(); }
   d.hidden = false; (d.querySelector('.content button, .content input, .content select') || d.querySelector('.dlg-x')).focus({ preventScroll: true });
 }
 function closeDialogs() { let any = false; document.querySelectorAll('.dlg').forEach(d => { if (!d.hidden) { d.hidden = true; any = true; } }); return any; }
@@ -7517,6 +8505,7 @@ function bindChrome() {
   on('menu-selnone', () => { select(null); syncGizmo(); renderPartPanel(); });
   on('menu-delete', () => {
     if (!benchSel) { deleteSelected(); return; }
+    if (benchSel.kind === 'section') { setFitPinned(false); return; }
     if (benchSel.kind === 'sprue') removeSprue(benchSel.k);
     else putAway(benchSel.kind === 'book' ? 'book' : 'box');
   });
@@ -7529,10 +8518,12 @@ function bindChrome() {
   on('menu-front', () => navCube.goTo(V(0, -1, 0))); on('menu-right', () => navCube.goTo(V(1, 0, 0))); on('menu-top', () => navCube.goTo(V(0, 0, 1)));
   on('menu-frame', () => frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox()));
   on('menu-ortho', () => setOrtho(!camera.isOrthographicCamera));
-  on('menu-fit', () => setFitPinned(!(fit.pinned || !$('fitcheck').hidden)));
+  on('menu-fit', () => setFitPinned(!sec.on));
   $('fit-close').addEventListener('click', e => { e.stopPropagation(); setFitPinned(false); });
   on('menu-scatter', () => startScatter());
   on('menu-crack', () => startCrack());
+  on('menu-burst', () => startBurst());
+  on('menu-grow', () => startGrowth());
   on('menu-split', () => startSplit());
   on('menu-clean', () => startClean());
   on('menu-ooze', () => startOoze());
@@ -7561,33 +8552,43 @@ function bindChrome() {
   window.addEventListener('keydown', e => {
     if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
     const k = e.key.toLowerCase();
-    if (k === 'o' && !e.shiftKey) { e.preventDefault(); $('btn-import').click(); }
+    if (k === 'o' && !e.shiftKey) { e.preventDefault(); $('proj-open-file').click(); }
+    else if (k === 'o' && e.shiftKey) { e.preventDefault(); $('proj-list-btn').click(); }
+    else if (k === 's') { e.preventDefault(); $('proj-save-file').click(); }
     else if (k === 'e') { e.preventDefault(); if (liveParts().length) openDialog('dlg-export'); }
     else if (k === ',') { e.preventDefault(); openDialog('dlg-prefs'); }
   });
   bindWorkspaces();
   syncOptbar();
 }
+/** Every keyboard shortcut, in one place. */
+function openKeys() { openDialog('dlg-keys'); }
 function bindWorkspaces() {
   const order = Object.keys(WS_NAMES);
+  ['menu-unbox', 'menu-unsprue', 'menu-clearpaint', 'menu-nomagnets', 'exp-sprue'].forEach(id => document.querySelectorAll(`.wsop[data-click="${id}"]`).forEach(b => b.classList.add('ctx')));
+  document.querySelectorAll('#dlg-shapes [data-shape]').forEach(b => b.addEventListener('click', () => addShape(b.dataset.shape)));
+  $('menu-shapes').addEventListener('click', () => { closeMenus(); openDialog('dlg-shapes'); });
+  $('keys-open').addEventListener('click', openKeys); $('menu-keys').addEventListener('click', () => { closeMenus(); openKeys(); });
   document.querySelectorAll('.wstab').forEach(t => {
     t.addEventListener('click', () => setWorkspace(t.dataset.ws));
     t.addEventListener('keydown', e => { if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return; e.preventDefault();
       const i = order.indexOf(workspace), n = order[(i + (e.key === 'ArrowRight' ? 1 : -1) + order.length) % order.length]; setWorkspace(n); $('ws-' + n).focus(); });
   });
   const custom = {
+    'ws-shapes': () => openDialog('dlg-shapes'),
     'ws-paint': () => setTool('paint'), 'ws-magnet': () => setTool('MAGNET'),
     'ws-drop': () => { const list = selection.length ? selection : selected ? [selected] : []; if (!list.length) return; pushUndo(); for (const p of list) applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); toast(`Dropped ${list.length === 1 ? list[0].name : list.length + ' parts'} onto the mat.`); },
     'ws-square': () => { if (selected) openOrient(selected, { kind: 'auto' }); },
     'ws-sets': () => showDockTab('tab-opts'),
+    'ws-glue': () => { openDialog('dlg-export'); if (!$('exp-glue').checked) { $('exp-glue').checked = true; $('exp-glue').dispatchEvent(new Event('change')); } $('exp-glue-f').scrollIntoView({ block: 'nearest' }); },
   };
   document.querySelectorAll('.wsop[data-click]').forEach(b => b.addEventListener('click', () => { const id = b.dataset.click; if (custom[id]) custom[id](); else $(id)?.click(); syncWsOps(); }));
   // the buttons follow the menu items they stand for
   const mo = new MutationObserver(() => syncWsOps());
   for (const id of new Set([...document.querySelectorAll('.wsop[data-click]')].map(b => b.dataset.click))) { const t = $(id); if (t) mo.observe(t, { attributes: true, attributeFilter: ['disabled', 'aria-checked', 'aria-pressed'] }); }
   mo.observe($('exp-sprue-f'), { attributes: true, attributeFilter: ['hidden'] });
-  // F1–F5 switch workspace
-  window.addEventListener('keydown', e => { const m = /^F([1-5])$/.exec(e.key); if (!m || e.ctrlKey || e.metaKey || e.altKey) return; e.preventDefault(); setWorkspace(order[+m[1] - 1]); });
+  // Ctrl+PageUp / PageDown step through the workspaces, as in Blender
+  window.addEventListener('keydown', e => { if (!(e.ctrlKey || e.metaKey) || e.altKey || (e.key !== 'PageUp' && e.key !== 'PageDown')) return; if (e.target.matches?.('input, select, textarea')) return; e.preventDefault(); const i = order.indexOf(workspace); setWorkspace(order[(i + (e.key === 'PageDown' ? 1 : order.length - 1)) % order.length]); });
   let saved = null; try { saved = localStorage.getItem('kitbash-ws'); } catch (e) {}
   setWorkspace(saved || 'assemble', { quiet: true });
 }
@@ -7615,8 +8616,9 @@ function resize() {
 }
 new ResizeObserver(resize).observe(view);
 bindAdjust();
-bindFit(); bindDirPick(); bindCrack(); bindRelief(); bindOoze(); bindFloating();
+bindFit(); bindDirPick(); bindCrack(); bindBurst(); bindRelief(); bindOoze(); bindFloating();
 document.querySelectorAll('#move-frame button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === moveFrame)); b.addEventListener('click', () => setMoveFrame(b.dataset.v)); });
+document.querySelectorAll('#affect button').forEach(b => { b.setAttribute('aria-pressed', String((b.dataset.v === 'axes') === axesEdit)); b.addEventListener('click', () => setAxesEdit(b.dataset.v === 'axes')); });
 document.querySelectorAll('#pose-mode button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)); b.addEventListener('click', () => setPoseMode(b.dataset.v)); });
 bindProject();
 bindAutorig(); bindTreeDnD(); bindMarr();
@@ -7645,6 +8647,6 @@ $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   
   const pick = all.find(p => p.id === last) || all[0];
   if (pick && await openSaved(pick.id)) toast(`Welcome back. Reopened ${pick.name} from this browser.`, 'ok');
 })();
-renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
+renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); if (sec.on || sec.helpers.size) updateSection(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
 // automated tests only (a query string never reaches the page inside claude.ai)
-if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf, get rp() { return rp; }, get oz() { return oz; } }; }
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf, get rp() { return rp; }, get oz() { return oz; }, glueOns, ensureStack, evalStack, newModId, partById, afterHierarchyChange, undo, get MAT() { return MAT; } }; }

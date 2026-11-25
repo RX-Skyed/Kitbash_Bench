@@ -112,6 +112,54 @@ function capHoles(vert, open) {
 }
 
 /**
+ * Mend a broken shell without touching what isn't broken: slivers of no area go; an edge with three or more
+ * triangles keeps one each way round (the extra flaps go, leaving holes that are then closed); pinches are split
+ * apart by a hair; and every hole is closed, however its edges run (round a corner shared by two holes, say),
+ * with a fan from its middle. Then pinches are split again (a cap can make one). → { vert, tri, fixes } or null.
+ */
+export function mendShell(vert0, tri0) {
+  let vert = vert0, fixes = 0;
+  const T = [];
+  for (let i = 0; i < tri0.length; i += 3) { const a = tri0[i], b = tri0[i + 1], c = tri0[i + 2]; if (a !== b && b !== c && a !== c) T.push(a, b, c); else fixes++; }
+  // flaps: on an edge with more than two triangles, keep the first each way round, drop the rest
+  { const he = new Map(), K = (a, b) => a * 4194304 + b;
+    for (let t = 0; t < T.length / 3; t++) for (let e = 0; e < 3; e++) { const a = T[3 * t + e], b = T[3 * t + (e + 1) % 3], k = K(a, b); const l = he.get(k); if (l) l.push(t); else he.set(k, [t]); }
+    const drop = new Set();
+    for (const [k, fw] of he) { const a = Math.floor(k / 4194304), b = k - a * 4194304; if (a > b) continue; const bw = he.get(K(b, a)) || []; if (fw.length + bw.length <= 2) continue;
+      if (fw.length === bw.length) continue;                          // even: sheets touching, split below
+      const extra = fw.length > bw.length ? fw.slice(bw.length || 1) : bw.slice(fw.length || 1); for (const t of extra) drop.add(t); }
+    if (drop.size) { fixes += drop.size; let o = 0; for (let t = 0; t < T.length / 3; t++) if (!drop.has(t)) { T[o++] = T[3 * t]; T[o++] = T[3 * t + 1]; T[o++] = T[3 * t + 2]; } T.length = o; } }
+  // twins (the same triangle both ways round): a fold of no thickness, both go
+  { const seen = new Map(), drop = new Set();
+    for (let t = 0; t < T.length / 3; t++) { const k = [T[3 * t], T[3 * t + 1], T[3 * t + 2]].sort((x, y) => x - y).join(','), e = seen.get(k); if (e !== undefined) { drop.add(e); drop.add(t); } else seen.set(k, t); }
+    if (drop.size) { fixes += drop.size; let o = 0; for (let t = 0; t < T.length / 3; t++) if (!drop.has(t)) { T[o++] = T[3 * t]; T[o++] = T[3 * t + 1]; T[o++] = T[3 * t + 2]; } T.length = o; } }
+  let u = unpinch(vert, T); vert = u.V; fixes += u.split;
+  // holes: the open edges walked into loops (each edge once; a corner shared by two holes is fine) and fanned shut
+  const nv0 = vert.length / 3, cnt = new Map(), K2 = (a, b) => a < b ? a * 4194304 + b : b * 4194304 + a;
+  for (let t = 0; t < T.length / 3; t++) for (let e = 0; e < 3; e++) { const a = T[3 * t + e], b = T[3 * t + (e + 1) % 3], k = K2(a, b), o = cnt.get(k); if (o) o.n++; else cnt.set(k, { n: 1, a, b }); }
+  const next = new Map(); let over = 0;
+  for (const o of cnt.values()) { if (o.n === 1) { const l = next.get(o.b); if (l) l.push(o.a); else next.set(o.b, [o.a]); } else if (o.n > 2) over++; }   // the cap runs the other way round
+  if (over) return null;
+  const newV = [];
+  for (const [start] of next) {
+    while (next.get(start)?.length) {
+      const loop = [start]; let v = next.get(start).pop(), guard = 0;
+      while (v !== start && guard++ < 1e6) { loop.push(v); const l = next.get(v); if (!l || !l.length) return null; v = l.pop(); }
+      if (v !== start) return null;
+      if (loop.length < 3) continue;
+      fixes++;
+      if (loop.length === 3) { T.push(loop[0], loop[1], loop[2]); continue; }
+      let cx = 0, cy = 0, cz = 0; for (const i of loop) { cx += vert[3 * i]; cy += vert[3 * i + 1]; cz += vert[3 * i + 2]; }
+      const c = nv0 + newV.length / 3; newV.push(cx / loop.length, cy / loop.length, cz / loop.length);
+      for (let i = 0; i < loop.length; i++) T.push(loop[i], loop[(i + 1) % loop.length], c);
+    }
+  }
+  if (newV.length) { const v2 = new Float32Array(vert.length + newV.length); v2.set(vert); v2.set(newV, vert.length); vert = v2; }
+  u = unpinch(vert, T); vert = u.V;
+  return { vert, tri: Uint32Array.from(T), fixes };
+}
+
+/**
  * Merge triangle soups into one closed solid.
  * M: the initialised Manifold module. soups: Float32Array of xyz per corner (world space, mm), one or many.
  * opts.fillHollows: also fill hollows sealed inside the result. opts.subtract: closed solids to cut away (magnet holes).
@@ -122,6 +170,7 @@ function capHoles(vert, open) {
  */
 export function mergeSolid(M, soups, opts = {}) {
   const { Manifold, Mesh } = M;
+  let unpinched = 0, mended = 0;
   const pos = concat(Array.isArray(soups) ? soups : [soups]);
   const { vert, tri } = weld(pos, opts.tol ?? 1e-4), nv = vert.length / 3;
   const solids = [], turned = []; let loose = [];
@@ -144,6 +193,14 @@ export function mergeSolid(M, soups, opts = {}) {
     if (inward) for (let i = 0; i < t.length; i += 3) { const s = t[i + 1]; t[i + 1] = t[i + 2]; t[i + 2] = s; }   // inside out: turn it round
     let m = null;
     try { m = toManifold(inflate(vv, t, fuse), t); } catch (e) { m = null; }
+    if (!m && opts.mend !== false) {                   // a broken skin: mend it where it's broken, leave the rest exactly as it is
+      const r = mendShell(vv, t);
+      if (r) {
+        if (signedVolume(r.vert, r.tri, [...Array(r.tri.length / 3).keys()]) < 0) for (let i = 0; i < r.tri.length; i += 3) { const s = r.tri[i + 1]; r.tri[i + 1] = r.tri[i + 2]; r.tri[i + 2] = s; }
+        try { m = toManifold(inflate(r.vert, r.tri, fuse), r.tri); } catch (e) { m = null; }
+        if (m) { repaired++; mended += r.fixes; }
+      }
+    }
     if (!m) {                                          // holes? cap them and try again
       const { open, over } = openEdges(t, all, vv.length / 3);
       const cap = !over && open.length ? capHoles(vv, open) : null;
@@ -246,8 +303,11 @@ export function mergeSolid(M, soups, opts = {}) {
       const drop = new Set(); for (const l of seen.values()) if (l.length === 2 && turn(l[0]) !== turn(l[1])) { drop.add(l[0]); drop.add(l[1]); }
       if (drop.size) { let o = 0; for (let i = 0; i < tris.length; i += 3) if (!drop.has(i)) { tris[o++] = tris[i]; tris[o++] = tris[i + 1]; tris[o++] = tris[i + 2]; } tris.length = o; }
     }
+    // pinches (two sheets that only touch at a corner or along an edge) split apart by a hair, so every edge of the
+    // file has exactly two triangles: slicers and repair tools count a shared edge as non-manifold
+    const up = unpinch(V, tris); unpinched += up.split;
     positions = new Float32Array(tris.length * 3); let o = 0;
-    for (const v of tris) { const i = 3 * v; positions[o++] = V[i]; positions[o++] = V[i + 1]; positions[o++] = V[i + 2]; }
+    for (const v of tris) { const i = 3 * v; positions[o++] = up.V[i]; positions[o++] = up.V[i + 1]; positions[o++] = up.V[i + 2]; }
     // opts.manifold: hand back the solid itself (the kept shells straight from Manifold, before any snapping), so a
     // caller that goes on cutting it never has to rebuild it from triangles that may pinch
     if (opts.manifold) {
@@ -272,10 +332,108 @@ export function mergeSolid(M, soups, opts = {}) {
     strays = p2.slice(positions.length); positions = p2;
   }
   const looseOut = looseBits.map(b => ({ volume: b.sv, gap: b.gap, at: b.at }));
-  return { positions, solid, strays, cut, loose: looseOut, bridged, dropped, shells: shellsOut, inputShells, repaired, unmerged, specks, hollows, hollowVolume, hollowsLeft, hollowLeftVolume, volume };
+  return { positions, solid, strays, unpinched, mended, cut, loose: looseOut, bridged, dropped, shells: shellsOut, inputShells, repaired, unmerged, specks, hollows, hollowVolume, hollowsLeft, hollowLeftVolume, volume };
 }
 
 // each vertex → the first vertex within tol of it (grid hashed); vertices with nothing near map to themselves
+/**
+ * Pinches out: corners where the triangles round a corner make more than one fan (sheets that only touch there),
+ * and edges with more than two triangles. The triangles are paired across each edge (one each way round), the
+ * fans round each corner found from those pairs, and each fan past the first gets a corner of its own, moved a hair
+ * (a few microns, or a tenth of its shortest edge) into its own fan so it no longer sits on the other. tris is
+ * changed in place; the corners come back with the new ones added. → { V, split }
+ */
+export function unpinch(V0, tris) {
+  const nT = tris.length / 3; let nV = V0.length / 3;
+  // half-edges a→b → triangles
+  const he = new Map(), K = (a, b) => a * 4194304 + b;
+  for (let t = 0; t < nT; t++) for (let e = 0; e < 3; e++) { const a = tris[3 * t + e], b = tris[3 * t + (e + 1) % 3], k = K(a, b); const l = he.get(k); if (l === undefined) he.set(k, t); else if (Array.isArray(l)) l.push(t); else he.set(k, [l, t]); }
+  // corners (3 per triangle), joined across paired edges
+  const par = new Int32Array(nT * 3); for (let i = 0; i < par.length; i++) par[i] = i;
+  const find = x => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+  const join = (x, y) => { x = find(x); y = find(y); if (x !== y) par[y] = x; };
+  const slot = (t, v) => tris[3 * t] === v ? 3 * t : tris[3 * t + 1] === v ? 3 * t + 1 : 3 * t + 2;
+  let bad = 0;
+  for (const [k, l] of he) {
+    const a = Math.floor(k / 4194304), b = k - a * 4194304; if (a > b) continue;           // each edge once, from its a<b side
+    const fw = Array.isArray(l) ? l : [l], bwRaw = he.get(K(b, a)), bw = bwRaw === undefined ? [] : Array.isArray(bwRaw) ? bwRaw : [bwRaw];
+    if (fw.length + bw.length > 2) bad++;
+    const n = Math.min(fw.length, bw.length);
+    if (n >= 2 && fw.length === bw.length) {
+      // several sheets on one edge: pair each triangle with its neighbour round the edge on its inside (the side
+      // away from its normal), so the sheets come apart the way they touch
+      const ax = V0[3 * b] - V0[3 * a], ay = V0[3 * b + 1] - V0[3 * a + 1], az = V0[3 * b + 2] - V0[3 * a + 2], al = Math.hypot(ax, ay, az) || 1;
+      const ux = ax / al, uy = ay / al, uz = az / al;
+      let rx = 1, ry = 0, rz = 0; if (Math.abs(ux) > 0.9) { rx = 0; ry = 1; }
+      let px = uy * rz - uz * ry, py = uz * rx - ux * rz, pz = ux * ry - uy * rx; const pl = Math.hypot(px, py, pz); px /= pl; py /= pl; pz /= pl;
+      const qx = uy * pz - uz * py, qy = uz * px - ux * pz, qz = ux * py - uy * px;
+      const wing = (t, fwd) => { const s0 = 3 * t, c = tris[s0] !== a && tris[s0] !== b ? tris[s0] : tris[s0 + 1] !== a && tris[s0 + 1] !== b ? tris[s0 + 1] : tris[s0 + 2];
+        const wx = V0[3 * c] - V0[3 * a], wy = V0[3 * c + 1] - V0[3 * a + 1], wz = V0[3 * c + 2] - V0[3 * a + 2], ang = Math.atan2(wx * qx + wy * qy + wz * qz, wx * px + wy * py + wz * pz);
+        // a triangle a→b→c has its normal along (b−a)×(c−a): its inside is the way round from c that goes against that
+        const inward = fwd ? -1 : 1; return { t, ang, fwd, inward }; };
+      const all = [...fw.map(t => wing(t, true)), ...bw.map(t => wing(t, false))].sort((x, y) => x.ang - y.ang), L = all.length, used = new Set();
+      for (let i = 0; i < L; i++) {
+        const f = all[i]; if (!f.fwd || used.has(f.t)) continue;
+        // turning by +angle from the wing goes round the edge; for a→b with normal (b−a)×(c−a), +angle turns towards the normal
+        const g = all[(i + (f.inward < 0 ? L - 1 : 1)) % L];
+        if (!g.fwd && !used.has(g.t)) { used.add(f.t); used.add(g.t); join(slot(f.t, a), slot(g.t, a)); join(slot(f.t, b), slot(g.t, b)); }
+      }
+    } else for (let i = 0; i < n; i++) { const f = fw[i], g = bw[i]; join(slot(f, a), slot(g, a)); join(slot(f, b), slot(g, b)); }
+  }
+  // the a>b edges with no a<b partner (open edges seen only from one side) need nothing: they join nothing
+  // fans round each corner
+  const fanOf = new Map(); let split = 0; const extra = [];
+  const first = new Int32Array(nV).fill(-1);
+  for (let c = 0; c < nT * 3; c++) {
+    const v = tris[c], r = find(c);
+    if (first[v] < 0) { first[v] = r; continue; }
+    if (first[v] === r) continue;
+    let m = fanOf.get(v); if (!m) fanOf.set(v, m = new Map());
+    let nv = m.get(r); if (nv === undefined) { nv = nV + extra.length / 3; extra.push(V0[3 * v], V0[3 * v + 1], V0[3 * v + 2]); m.set(r, nv); split++; }
+    tris[c] = nv;
+  }
+  // an edge that still has four triangles (the sheets touch along it but join up again further round, so no
+  // corner can be split): one pair gets a corner of its own in the middle of that edge, a hair to its side
+  { const cnt = new Map(); for (let t = 0; t < tris.length / 3; t++) for (let e = 0; e < 3; e++) { const a = tris[3 * t + e], b = tris[3 * t + (e + 1) % 3], k = a < b ? K(a, b) : K(b, a); const l = cnt.get(k); if (l) l.push([t, a, b]); else cnt.set(k, [[t, a, b]]); }
+    for (const l of cnt.values()) {
+      if (l.length !== 4) continue;
+      const fw = l.filter(x => x[1] < x[2]), bw = l.filter(x => x[1] > x[2]); if (fw.length !== 2 || bw.length !== 2) continue;
+      const pair = [fw[1], bw[1]], [_, a, b] = fw[1];
+      const third = t => { for (let e = 0; e < 3; e++) { const v = tris[3 * t + e]; if (v !== a && v !== b) return v; } return a; };
+      const src = (v, k) => v < nV ? V0[3 * v + k] : extra[3 * (v - nV) + k];
+      const mid = [0, 1, 2].map(k => (src(a, k) + src(b, k)) / 2), side = [0, 1, 2].map(k => (src(third(pair[0][0]), k) + src(third(pair[1][0]), k)) / 2 - mid[k]);
+      const sl = Math.hypot(...side) || 1, step = Math.min(0.004, 0.05 * Math.hypot(...[0, 1, 2].map(k => src(a, k) - src(b, k)))) / sl;
+      const m = nV + extra.length / 3; extra.push(mid[0] + side[0] * step, mid[1] + side[1] * step, mid[2] + side[2] * step); split++;
+      for (const [t] of pair) {
+        const v = [tris[3 * t], tris[3 * t + 1], tris[3 * t + 2]];
+        let e = 0; for (; e < 3; e++) { const p0 = v[e], p1 = v[(e + 1) % 3]; if ((p0 === a && p1 === b) || (p0 === b && p1 === a)) break; }
+        const p0 = v[e], p1 = v[(e + 1) % 3], c = v[(e + 2) % 3];
+        tris[3 * t] = p0; tris[3 * t + 1] = m; tris[3 * t + 2] = c; tris.push(m, p1, c);
+      }
+    }
+  }
+  if (!split) return { V: V0, split: 0 };
+  const V = new Float32Array(V0.length + extra.length); V.set(V0); V.set(extra, V0.length);
+  // move each new corner (and the corner it was split from) a hair into its own fan
+  const sum = new Float64Array(V.length), cnt = new Uint32Array(V.length / 3), minE = new Float64Array(V.length / 3).fill(Infinity);
+  const isSplit = new Uint8Array(V.length / 3); for (const [v, m] of fanOf) { isSplit[v] = 1; for (const nv of m.values()) isSplit[nv] = 1; }
+  for (let t = 0; t < tris.length / 3; t++) for (let e = 0; e < 3; e++) {
+    const v = tris[3 * t + e]; if (!isSplit[v]) continue;
+    for (const w of [tris[3 * t + (e + 1) % 3], tris[3 * t + (e + 2) % 3]]) {
+      sum[3 * v] += V[3 * w]; sum[3 * v + 1] += V[3 * w + 1]; sum[3 * v + 2] += V[3 * w + 2]; cnt[v]++;
+      const d = Math.hypot(V[3 * w] - V[3 * v], V[3 * w + 1] - V[3 * v + 1], V[3 * w + 2] - V[3 * v + 2]); if (d < minE[v]) minE[v] = d;
+    }
+  }
+  for (let v = 0; v < V.length / 3; v++) {
+    if (!isSplit[v] || !cnt[v]) continue;
+    const cx = sum[3 * v] / cnt[v] - V[3 * v], cy = sum[3 * v + 1] / cnt[v] - V[3 * v + 1], cz = sum[3 * v + 2] / cnt[v] - V[3 * v + 2], l = Math.hypot(cx, cy, cz);
+    if (l < 1e-12) continue;
+    const step = Math.min(0.004, 0.1 * minE[v]) / l;
+    V[3 * v] += cx * step; V[3 * v + 1] += cy * step; V[3 * v + 2] += cz * step;
+  }
+  return { V, split, bad };
+}
+
 function snapClose(V, tol) {
   const n = V.length / 3, rep = new Int32Array(n), grid = new Map(), k = (x, y, z) => x + ',' + y + ',' + z, t2 = tol * tol;
   for (let i = 0; i < n; i++) {

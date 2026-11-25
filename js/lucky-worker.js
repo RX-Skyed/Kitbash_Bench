@@ -17,6 +17,8 @@ self.onmessage = e => {
       self.postMessage({ type: 'found', mine: r.mine, best: r.best, poses: r.poses });
     } else if (m.type === 'refine') {
       self.postMessage({ type: 'refined', out: L.refineAll(ctx, m.starts) });
+    } else if (m.type === 'seat') {            // wedged poses (a peg a little off its socket): a grid of small turns and shifts, settled
+      self.postMessage({ type: 'seated', out: m.wedged.map(o => L.gridSeat(ctx, o)) });
     } else if (m.type === 'rank') {
       self.postMessage({ type: 'ranked', fits: L.rankFits(ctx, m.refined, m.max) });
     } else if (m.type === 'contact') {

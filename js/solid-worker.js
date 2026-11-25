@@ -7,15 +7,22 @@ import { buildCrack } from './crack.js';
 import { buildSplit } from './split.js';
 import { buildOoze } from './ooze.js';
 import { buildClean } from './clean.js';
+import { buildBurst } from './burst.js';
+import { buildGrowBall, buildWarp } from './grow.js';
+import { buildRemesh } from './remesh.js';
 const ready = (async () => {
   const M = await Module({ locateFile: f => new URL('./vendor/' + f, import.meta.url).href }); M.setup(); return M;
 })();
 self.onmessage = async e => {
-  const { id, jobs, opts, relief, crack, split, ooze, clean } = e.data;
+  const { id, jobs, opts, relief, crack, split, ooze, clean, burst, growball, warp, remesh } = e.data;
   try {
     const M = await ready;
     if (relief) { const r = buildRelief(M, relief); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
     if (crack) { const r = buildCrack(M, crack); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
+    if (remesh) { const r = buildRemesh(M, remesh); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
+    if (growball) { const r = buildGrowBall(M, growball); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
+    if (warp) { const r = buildWarp(warp); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
+    if (burst) { const r = buildBurst(M, burst); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
     if (clean) { const r = buildClean(M, clean); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
     if (ooze) { const r = buildOoze(M, ooze); self.postMessage({ id, out: r }, [r.positions.buffer]); return; }
     if (split) { const r = buildSplit(M, split); self.postMessage({ id, out: r }, [r.positions.buffer, r.sides.buffer]); return; }

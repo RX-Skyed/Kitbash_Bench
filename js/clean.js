@@ -4,6 +4,7 @@
 // stray triangles, broken shells) can't be unioned, so each of their triangles is tested by sight: rays cast from it
 // in many directions; if any gets out of the model, it's on the outside and stays, if none does it's inside and goes.
 import { mergeSolid } from './solid.js';
+import { buildRemesh } from './remesh.js';
 
 /** A uniform grid over triangles, for "does this ray hit anything" queries. */
 function makeGrid(P) {
@@ -115,14 +116,15 @@ function seenFromOutside(P, first, rays) {
 }
 
 /**
- * p: { soup, pieces ('all' | 'largest': only the biggest closed piece, nothing else), open ('outside': open bits
- * kept where they're on the outside | 'drop': all open bits go), rays (how many directions each open triangle tries) }
+ * p: { soup, pieces ('all' | 'largest': only the biggest closed piece, nothing else), open ('wrap': open bits and
+ * all shrink-wrapped as one watertight solid at `detail` mm (a new surface) | 'outside': open bits kept where they're on the outside (holes
+ * where hidden bits joined on) | 'drop': all open bits go), rays (how many directions each open triangle tries) }
  * → { positions, stats }
  */
 export function buildClean(M, p) {
   const before = p.soup.length / 9;
   const clean = mergeSolid(M, [p.soup], { fillHollows: true, loose: 'keep', manifold: true });
-  const stats = { before, hollows: clean.hollows, inputShells: clean.inputShells, pieces: 0, piecesDropped: 0, openKept: 0, openDropped: 0, after: 0 };
+  const stats = { before, mended: clean.mended || 0, hollows: clean.hollows, inputShells: clean.inputShells, pieces: 0, piecesDropped: 0, openKept: 0, openDropped: 0, after: 0 };
   let solidPos = clean.positions.subarray(0, clean.positions.length - clean.strays.length);
   try {
     if (clean.solid && p.pieces === 'largest') {
@@ -136,8 +138,24 @@ export function buildClean(M, p) {
       stats.pieces = best ? 1 : 0; parts.forEach(x => x.delete());
     } else if (clean.solid) stats.pieces = clean.shells;
   } finally { if (clean.solid) clean.solid.delete(); }
-  // the open bits: kept only where they can be seen from outside
+  // (broken shells were mended in the merge already, exactly; what's left open here couldn't be.) The open bits:
+  // kept only where they can be seen from outside, or dropped, or, as a last resort, everything shrink-wrapped as
+  // one watertight solid (a new surface at the detail asked: it changes the whole outside)
   const S = clean.strays, ns = S.length / 9;
+  if (ns && p.open === 'wrap') {
+    const all = new Float32Array(solidPos.length + S.length); all.set(solidPos); all.set(S, solidPos.length);
+    const r = buildRemesh(M, { soup: all, detail: p.detail || 0.12 });
+    let positions = r.positions;
+    if (p.pieces === 'largest' && r.stats.pieces > 1) {                 // just the biggest piece of the rebuilt solid
+      const m0 = new M.Manifold(new M.Mesh({ numProp: 3, vertProperties: positions, triVerts: Uint32Array.from({ length: positions.length / 3 }, (_, i) => i) }));
+      try { const b = m0.decompose(); let best = null, bv = -1; for (const x of b) { const v = x.volume(); if (v > bv) { bv = v; best = x; } }
+        const g = best.getMesh(), T = g.triVerts, V = g.vertProperties, np = g.numProp; positions = new Float32Array(T.length * 3);
+        for (let i = 0; i < T.length; i++) { positions[3 * i] = V[T[i] * np]; positions[3 * i + 1] = V[T[i] * np + 1]; positions[3 * i + 2] = V[T[i] * np + 2]; }
+        stats.piecesDropped += b.length - 1; b.forEach(x => x.delete()); } catch (e) {} finally { m0.delete(); }
+    }
+    Object.assign(stats, { rebuilt: r.stats.detail, openRebuilt: ns, after: positions.length / 9, pieces: p.pieces === 'largest' ? 1 : r.stats.pieces });
+    return { positions, stats };
+  }
   let openOut = new Float32Array(0);
   if (ns && p.open !== 'drop' && p.pieces !== 'largest') {
     const all = new Float32Array(solidPos.length + S.length); all.set(solidPos); all.set(S, solidPos.length);
