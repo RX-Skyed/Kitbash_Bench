@@ -1,0 +1,8674 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { mergeVertices, mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { computeBoundsTree, acceleratedRaycast, INTERSECTED, NOT_INTERSECTED } from 'three-mesh-bvh';
+import { soupFromSTL, stlFromSoup } from './solid.js';
+import { inkField, blurField, otsu, traceOutline } from './relief.js';
+import {
+  V,
+  buildTopo,
+  growRegion,
+  solve4,
+  fitSphereOnce,
+  fitSphere,
+  boundaryLoops,
+  triNormal,
+  triCenter,
+  worldNormal,
+  pickBall,
+  planeBasis,
+  regionPlane,
+  rasterHoles,
+  pickFlat,
+  discAround,
+  resolveCentre,
+  weldGeometry,
+  pickPoint,
+  gapMidframe,
+  frame3,
+  Tr,
+  rotBetween,
+  computeSnap,
+  writeSTL,
+  sliceMesh,
+  chainSegments,
+  segmentsGap,
+  jointBasis,
+  slideToContact,
+  fitCuts,
+  eigenSym,
+  eigenSym3,
+  rigidFit,
+  creaseRegion,
+  pickSurface,
+  segmentRegions,
+  fract,
+  regionSamples,
+  insideFraction,
+  closestOnSegs,
+  solveLinear,
+  matchRegions,
+  partBox,
+  boxVol,
+  looksStacked,
+  contactContext,
+  contactBetween,
+  detectContacts,
+  NAME_ROOT,
+  NAME_FIXED,
+  planRig,
+  AXES,
+  nearestAxis,
+  orientQuat,
+  rotAbout,
+  dominantDirections,
+  squareUpQuat,
+  faceLongAxis,
+  vertexNormalsWorld,
+  cornerNeighbours,
+  edgeLengthWorld,
+  growBand,
+  fillSeams,
+  fillSeamsAll,
+  gapsLeft,
+  sampleKit,
+  heightField,
+  seatSolve,
+  angDiff,
+  areaSamples,
+  patchMesh,
+  multiFit,
+  parseQuantity,
+  parseMirror,
+  shortLabel,
+  tagWidth,
+  packSprues,
+  sprueGeometry,
+  goldenPack,
+} from './math.js';
+import * as Lucky from './lucky.js';
+const BVH = { INTERSECTED, NOT_INTERSECTED };
+
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
+
+
+// ---------------------------------------------------------------------------
+// Scene
+// ---------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const view = $('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true }); renderer.localClippingEnabled = true;
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+view.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#121518');
+// two cameras: perspective (the default) and orthographic (no perspective, for lining up against references);
+// `camera` is whichever is in use, and everything that looks through it follows the switch
+const perspCam = new THREE.PerspectiveCamera(40, 1, 0.1, 5000);
+const ORTHO_H = 50;                  // the orthographic camera's half-height at zoom 1 (its zoom does the rest)
+const orthoCam = new THREE.OrthographicCamera(-ORTHO_H, ORTHO_H, ORTHO_H, -ORTHO_H, 0.1, 5000);
+let camera = perspCam;
+perspCam.up.set(0, 0, 1); orthoCam.up.set(0, 0, 1);
+camera.position.set(90, -110, 80);
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true; orbit.dampingFactor = 0.15;
+orbit.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.ROTATE, RIGHT: THREE.MOUSE.PAN };
+orbit.enableRotate = false; orbit.enableZoom = false;         // turning and zooming are done by the viewport code below; OrbitControls keeps panning
+scene.add(new THREE.HemisphereLight('#dfe6ee', '#2a2622', 1.6));
+const sun = new THREE.DirectionalLight('#fff4e4', 1.8); sun.position.set(60, -80, 120); camera.add(sun); scene.add(perspCam, orthoCam);
+const fill = new THREE.DirectionalLight('#9fb7d6', 0.6); fill.position.set(-80, 60, 30); scene.add(fill);
+const grid = new THREE.GridHelper(300, 30, '#4a535c', '#262c32'); grid.rotateX(Math.PI / 2); scene.add(grid);
+const fine = new THREE.GridHelper(100, 100, '#1f2429', '#1c2126'); fine.rotateX(Math.PI / 2); fine.position.z = -0.01; scene.add(fine);
+const axes = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints([V(-150,0,0.02), V(150,0,0.02), V(0,-150,0.02), V(0,150,0.02)]),
+  new THREE.LineBasicMaterial({ vertexColors: true }));
+axes.geometry.setAttribute('color', new THREE.Float32BufferAttribute([.75,.3,.3, .75,.3,.3, .4,.65,.3, .4,.65,.3], 3));
+scene.add(axes);
+// the bench surface: a self-healing cutting mat (1 cm squares, ruler edges, angle guides), or the plain grid
+const MAT = { w: 18 * 25.4, h: 12 * 25.4, label: '12 × 18 in', cx: 0, cy: 0 };
+const MAT_STYLES = {
+  green: { base: '#1f5a48', line: 'rgba(214,236,224,.5)', faint: 'rgba(214,236,224,.13)', accent: '#e9d27a', text: '#e6f2ea', edge: '#173f33' },
+  black: { base: '#17191b', line: 'rgba(235,235,235,.42)', faint: 'rgba(235,235,235,.1)', accent: '#e8c35a', text: '#f0f0f0', edge: '#0d0e0f' },
+  blue:  { base: '#1c3d63', line: 'rgba(220,232,246,.48)', faint: 'rgba(220,232,246,.12)', accent: '#f0c860', text: '#eaf1fa', edge: '#132b46' },
+};
+/** Ruler margin around the grid: smaller on small mats. */
+const matMargin = (w, h) => Math.min(20, Math.max(7, Math.min(w, h) * 0.07));
+function matTexture(st) {
+  const ppm = Math.min(8, 4096 / Math.max(MAT.w, MAT.h)), W = Math.round(MAT.w * ppm), H = Math.round(MAT.h * ppm), c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d'), X = mm => (mm + MAT.w / 2) * ppm, Y = mm => (MAT.h / 2 - mm) * ppm;   // mat mm (origin at centre) to pixels
+  g.fillStyle = st.base; g.fillRect(0, 0, W, H);
+  // the measuring grid starts at its bottom-left corner (0, 0): a whole number of centimetres each way
+  const m = matMargin(MAT.w, MAT.h), k = m / 20, gw = Math.floor((MAT.w - 2 * m) / 10) * 10, gh = Math.floor((MAT.h - 2 * m) / 10) * 10;
+  const x0 = -gw / 2, x1 = gw / 2, y0 = -gh / 2, y1 = gh / 2;
+  const line = (ax, ay, bx, by, col, wpx) => { g.strokeStyle = col; g.lineWidth = wpx; g.beginPath(); g.moveTo(X(ax), Y(ay)); g.lineTo(X(bx), Y(by)); g.stroke(); };
+  const strong = st.line.replace(/[\d.]+\)$/, '.95)'), cm = st.line.replace(/[\d.]+\)$/, '.62)'), px = ppm / 4;
+  // a line right across the mat every centimetre; the 0 lines heaviest
+  for (let u = 0; u <= gw; u += 10) line(x0 + u, y0, x0 + u, y1, u === 0 ? strong : cm, (u === 0 ? 3.4 : 1.5) * px);
+  for (let v = 0; v <= gh; v += 10) line(x0, y0 + v, x1, y0 + v, v === 0 ? strong : cm, (v === 0 ? 3.4 : 1.5) * px);
+  // angle guides from the bottom corners
+  if (gw >= 40 && gh >= 30) {
+    g.setLineDash([10 * px, 8 * px]);
+    const fs = Math.min(7, gh * 0.07, gw * 0.07), d = Math.min(75, Math.min(gw, gh) * 0.45);
+    for (const [ang, lab] of [[30, '30°'], [45, '45°'], [60, '60°']]) {
+      const t = Math.tan(ang * Math.PI / 180), L = Math.min(x1 - x0, (y1 - y0) / t);
+      line(x0, y0, x0 + L, y0 + L * t, strong, 1.6 * px); line(x1, y0, x1 - L, y0 + L * t, strong, 1.6 * px);
+      g.fillStyle = st.text; g.font = `600 ${fs * ppm}px "Barlow Condensed", system-ui, sans-serif`;
+      const a = ang * Math.PI / 180;                     // the label sits on its own line, turned to follow it
+      g.save(); g.translate(X(x0 + d * Math.cos(a)), Y(y0 + d * Math.sin(a))); g.rotate(-a); g.textAlign = 'center'; g.textBaseline = 'bottom'; g.fillText(lab, 0, -6 * px); g.restore();
+    }
+    g.setLineDash([]);
+  }
+  // ruler edges: a tick every millimetre (longer every 5 mm and centimetre), numbered in centimetres from 0
+  g.fillStyle = st.text; g.textAlign = 'center'; g.textBaseline = 'middle'; g.font = `600 ${Math.max(1.4, 3.6 * k) * ppm}px "Barlow Semi Condensed", system-ui, sans-serif`;
+  const tick = u => (u % 10 ? (u % 5 ? 1.5 : 2.6) : 4) * Math.max(0.55, k), off = 7.5 * k + 0.5;
+  for (let u = 0; u <= gw; u++) { const L = tick(u), w = (u % 10 ? 1 : 1.6) * px;
+    line(x0 + u, y0, x0 + u, y0 - L, strong, w); line(x0 + u, y1, x0 + u, y1 + L, strong, w);
+    if (u % 10 === 0) { g.fillText(String(u / 10), X(x0 + u), Y(y0 - off)); g.fillText(String(u / 10), X(x0 + u), Y(y1 + off)); } }
+  for (let v = 0; v <= gh; v++) { const L = tick(v), w = (v % 10 ? 1 : 1.6) * px;
+    line(x0, y0 + v, x0 - L, y0 + v, strong, w); line(x1, y0 + v, x1 + L, y0 + v, strong, w);
+    if (v % 10 === 0) { g.fillText(String(v / 10), X(x0 - off - 0.5 * k), Y(y0 + v)); g.fillText(String(v / 10), X(x1 + off + 0.5 * k), Y(y0 + v)); } }
+  // the mat's size, a brand mark and a self-healing note along the bottom edge
+  const by = -MAT.h / 2 + m * 0.22, sz = MAT.label || '';
+  g.textAlign = 'right'; g.fillStyle = st.accent; g.font = `700 ${Math.max(1.6, 6 * k) * ppm}px "Barlow Condensed", system-ui, sans-serif`; g.fillText(('KITBASH BENCH  ' + sz).trim(), X(x1), Y(by));
+  if (k > 0.6) { g.textAlign = 'left'; g.fillStyle = st.text; g.font = `500 ${3.4 * k * ppm}px "Barlow Semi Condensed", system-ui, sans-serif`; g.fillText('SELF-HEALING CUTTING MAT · 1 cm squares · 0,0 bottom left', X(x0), Y(by)); }
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy()); return tex;
+}
+/**
+ * Mat sizes, in inches like the shop ones, smallest first. "Auto" picks the smallest that holds
+ * everything on the bench (turned whichever way fits best) and only changes when the pieces outgrow it.
+ */
+const MAT_SIZES = [[3, 3], [3, 9], [9, 12], [12, 18], [18, 24], [24, 36]];
+function matFor(size, box) {
+  const need = box.isEmpty() ? null : box.getSize(V());
+  const fits = (w, h) => { const m = matMargin(w, h); return need && need.x + 10 <= w - 2 * m && need.y + 10 <= h - 2 * m; };
+  const mm = ([a, b]) => [Math.max(a, b) * 25.4, Math.min(a, b) * 25.4];
+  if (size !== 'auto') { const [a, b] = size.split('x').map(Number), [W, H] = mm([a, b]);
+    const tall = need && need.y > need.x && a !== b;
+    return { w: tall ? H : W, h: tall ? W : H, label: `${Math.min(a, b)} × ${Math.max(a, b)} in` }; }
+  if (!need) return { w: 18 * 25.4, h: 12 * 25.4, label: '12 × 18 in' };
+  for (const s of MAT_SIZES) { const [W, H] = mm(s), label = `${s[0]} × ${s[1]} in`;
+    if (fits(W, H)) return { w: W, h: H, label };
+    if (fits(H, W)) return { w: H, h: W, label }; }
+  const [W, H] = mm(MAT_SIZES[MAT_SIZES.length - 1]); return { w: W, h: H, label: '24 × 36 in' };
+}
+const mat = new THREE.Group(); scene.add(mat);
+function setBench(style) {
+  while (mat.children.length) { const o = mat.children.pop(); o.geometry.dispose(); [].concat(o.material).forEach(m => { m.map?.dispose(); m.dispose(); }); }
+  const st = MAT_STYLES[style], plain = !st;
+  grid.visible = fine.visible = axes.visible = plain;
+  if (plain) return;
+  const top = new THREE.Mesh(new THREE.PlaneGeometry(MAT.w, MAT.h), new THREE.MeshBasicMaterial({ map: matTexture(st), color: '#d4d4d4', polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 }));   // unlit: a flat mat needs no lighting, and it keeps big views fast
+  top.position.z = -0.02; top.renderOrder = -1;
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(MAT.w, MAT.h, 1.6), new THREE.MeshStandardMaterial({ color: st.edge, roughness: 0.9 })); slab.position.z = -1.4;   // top at -0.6 mm, well under the print
+  mat.add(top, slab);
+  mat.position.set(MAT.cx || 0, MAT.cy || 0, 0);
+  matSeeThrough = null;
+}
+/** Resize (and re-centre) the mat when the bench's contents call for it. */
+let matHold = 0;                     // while a kit is coming in and the box opens, the mat waits and is sized once at the end
+function fitMat(force = false) {
+  if (matHold) return;
+  const style = $('set-bench').value; if (!MAT_STYLES[style]) return;
+  const box = benchBox(), want = matFor($('set-mat').value, box);
+  const c = box.isEmpty() ? V() : box.getCenter(V()), m = matMargin(MAT.w, MAT.h);
+  const inside = box.isEmpty() || (box.min.x >= (MAT.cx || 0) - MAT.w / 2 + m - 1e-6 && box.max.x <= (MAT.cx || 0) + MAT.w / 2 - m + 1e-6 &&
+                                   box.min.y >= (MAT.cy || 0) - MAT.h / 2 + m - 1e-6 && box.max.y <= (MAT.cy || 0) + MAT.h / 2 - m + 1e-6);
+  const same = Math.abs(want.w - MAT.w) < 0.01 && Math.abs(want.h - MAT.h) < 0.01;
+  if (!force && same && inside) return;
+  Object.assign(MAT, want, { cx: Math.round(c.x / 10) * 10, cy: Math.round(c.y / 10) * 10 });
+  if (box.isEmpty()) { MAT.cx = 0; MAT.cy = 0; }
+  setBench(style);
+}
+/**
+ * Seen from above, anything sunk below the mat shows through it as a glowing outline; seen from
+ * below, the mat itself turns see-through. The outline is drawn only where something hides the
+ * part (depth test reversed) and only for the part's surface under the mat.
+ */
+let matSeeThrough = null;
+function ghostMaterial(color) {
+  return new THREE.ShaderMaterial({
+    uniforms: { color: { value: new THREE.Color(color).lerp(new THREE.Color('#ffffff'), 0.35) } },
+    vertexShader: 'varying vec3 vView; varying float vZ; void main() { vec4 w = modelMatrix * vec4(position, 1.0); vZ = w.z; vec4 mv = viewMatrix * w; vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+    fragmentShader: `uniform vec3 color; varying vec3 vView; varying float vZ;
+      void main() {
+        if (vZ > -0.02) discard;                                 // only what's under the mat
+        vec3 n = normalize(cross(dFdx(vView), dFdy(vView)));
+        float rim = 1.0 - abs(dot(n, normalize(-vView)));        // strongest where the surface turns away: the outline
+        float a = smoothstep(0.5, 0.92, rim);
+        gl_FragColor = vec4(color, 0.07 + 0.88 * a);
+      }`,
+    transparent: true, depthWrite: false, depthFunc: THREE.GreaterDepth, side: THREE.DoubleSide,
+  });
+}
+function updateMatView() {
+  const on = mat.children.length > 0;
+  const below = on && camera.position.z < -0.02;
+  if (on && below !== matSeeThrough) {                   // looking up from underneath: see through the mat
+    matSeeThrough = below;
+    const [top, slab] = mat.children;
+    for (const [m, o] of [[top.material, 0.38], [slab.material, 0.1]]) { m.transparent = below; m.opacity = below ? o : 1; m.depthWrite = !below; m.needsUpdate = true; }
+    top.renderOrder = below ? 10 : -1; slab.renderOrder = below ? 10 : 0;
+    top.material.side = below ? THREE.DoubleSide : THREE.FrontSide; top.material.needsUpdate = true;   // its printed face shows through from underneath
+  }
+  for (const p of liveParts()) {
+    const want = on && !below && p.visible && worldBox(p).min.z < -0.05;
+    let g = p.userData.ghost;
+    if (want && !g) { g = p.userData.ghost = new THREE.Mesh(p.geometry, ghostMaterial(p.userData.part.color)); g.renderOrder = 20; g.raycast = () => {}; p.add(g); }
+    if (g) g.visible = want;
+  }
+}
+const world = new THREE.Group(); scene.add(world);
+const fx = new THREE.Group(); scene.add(fx);                 // pick highlights, markers
+const skeleton = new THREE.LineSegments(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({ color: '#d6a24a', depthTest: false, transparent: true, opacity: 0.85 }));
+skeleton.renderOrder = 998; scene.add(skeleton);
+
+const tc = new TransformControls(camera, renderer.domElement);
+tc.setSize(0.8); scene.add(tc);
+// the square plane handles sit out from the corner (three.js puts them almost on top of where the arrows meet)
+{ const gz = tc._gizmo || tc.children.find(c => c.isTransformControlsGizmo), out = 2.1;
+  for (const grp of [gz?.gizmo?.translate, gz?.picker?.translate]) grp?.children.forEach(h => {
+    if (!['XY', 'YZ', 'XZ'].includes(h.name)) return;
+    h.geometry.computeBoundingBox(); const c = h.geometry.boundingBox.getCenter(new THREE.Vector3());
+    h.geometry.translate(c.x * (out - 1), c.y * (out - 1), c.z * (out - 1));
+  }); }
+const proxy = new THREE.Object3D(); scene.add(proxy);
+tc.addEventListener('dragging-changed', e => { orbit.enabled = !e.value; });
+
+// ---------------------------------------------------------------------------
+// Parts, joints, registry
+// ---------------------------------------------------------------------------
+const PART_COLORS = ['#b9b3a6', '#8fa3a8', '#a89a86', '#9aa58c', '#a18f9b', '#8d99ad', '#b2a07c', '#93a49b'];
+const parts = [];             // every part ever made (mesh objects); deleted ones have no parent
+const joints = [];            // every joint ever made
+let colorIx = 0, selected = null, selection = [];   // selected: the active part (last clicked); selection: every selected part
+
+function isPart(o) { return o && o.userData.part; }
+function liveParts() { return parts.filter(m => m.parent); }
+
+function addPart(name, geom, opts = {}) {
+  let g = geom;
+  if (!opts.welded) { geom.deleteAttribute('normal'); geom.deleteAttribute('uv'); g = weldGeometry(geom); }
+  if (!g.boundingBox) g.computeBoundingBox();
+  if (!g.boundsTree) g.computeBoundsTree();                   // copies of one piece share the mesh and its BVH
+  const color = opts.color || PART_COLORS[colorIx++ % PART_COLORS.length];
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.72, metalness: 0.05, flatShading: true, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(g, mat);
+  mesh.name = name; mesh.userData.part = { color, topo: null, tris: g.index.count / 3, geomKey: opts.geomKey || THREE.MathUtils.generateUUID() };
+  if (opts.id) mesh.uuid = opts.id;
+  world.add(mesh);
+  if (opts.at) mesh.position.fromArray(opts.at);
+  if (opts.rot) mesh.rotation.set(...opts.rot);
+  parts.push(mesh);
+  if ($('set-plastic') && $('set-plastic').value !== 'parts') refreshPaint(mesh);
+  return mesh;
+}
+// ---------------------------------------------------------------------------
+// Plastic and paint: the bare-plastic look of every part, and colour brushed or filled onto them
+// ---------------------------------------------------------------------------
+const PLASTICS = {
+  parts: { name: 'Part colours', rough: 0.72 },
+  grey: { name: 'Grey plastic', color: '#8f9296', rough: 0.6 },
+  lightgrey: { name: 'Light grey resin', color: '#c3c5c7', rough: 0.42 },
+  cream: { name: 'Cream resin', color: '#d8cfb5', rough: 0.45 },
+  white: { name: 'White plastic', color: '#e3e1da', rough: 0.55 },
+  bone: { name: 'Bone plastic', color: '#cbbd9a', rough: 0.6 },
+  'black-primer': { name: 'Black primer', color: '#28292b', rough: 0.92 },
+  'grey-primer': { name: 'Grey primer', color: '#7b7d80', rough: 0.92 },
+  'white-primer': { name: 'White primer', color: '#dedcd6', rough: 0.92 },
+};
+const PAINTS = [['Chalk white', '#e9e6dc'], ['Bone', '#d2c49a'], ['Skin', '#d9a383'], ['Leather', '#7a4b2a'], ['Rust', '#8e3d1f'], ['Blood red', '#8a1414'], ['Bright red', '#c0262b'],
+  ['Orange', '#d9661f'], ['Ochre', '#c99a2e'], ['Yellow', '#e2c13b'], ['Moss green', '#5a6b2e'], ['Sickly green', '#8a9a3c'], ['Forest green', '#2f4a2a'], ['Teal', '#2b6b6b'],
+  ['Sky blue', '#5f93c5'], ['Deep blue', '#1f3a78'], ['Purple', '#4b2d5e'], ['Steel', '#9aa2a8'], ['Gunmetal', '#4a4f55'], ['Brass', '#b08d3c'], ['Gold', '#c9a237'], ['Copper', '#a86a3c'],
+  ['Mid grey', '#6e7074'], ['Black', '#1b1b1d']];
+const plastic = () => PLASTICS[$('set-plastic')?.value] || PLASTICS.parts;
+/** The colour of a part where it isn't brushed: its fill, or the plastic. */
+function baseColor(m) { const pt = m.userData.part; return pt.fill || plastic().color || pt.color; }
+/** Give a part its own geometry wrapper (same mesh data, its own colour layer) so copies don't share paint. */
+function ownGeometry(m) {
+  const g0 = m.geometry; if (g0.userData.owner === m.uuid) return g0;
+  const g = new THREE.BufferGeometry(); g.setIndex(g0.index); g.setAttribute('position', g0.attributes.position);
+  g.boundingBox = g0.boundingBox?.clone() || null; g.boundingSphere = g0.boundingSphere?.clone() || null; g.boundsTree = g0.boundsTree;
+  g.userData = { ...g0.userData, owner: m.uuid }; m.geometry = g; return g;
+}
+const _c = new THREE.Color();
+const SRGB2LIN = Float32Array.from({ length: 256 }, (_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); });
+const hexBytes = h => { const v = parseInt(h.slice(1), 16); return [(v >> 16) & 255, (v >> 8) & 255, v & 255]; };
+/** Show a part's plastic, fill and brushed paint. Paint is kept as ordinary (sRGB) bytes; the display layer is linear light. */
+function refreshPaint(m, range) {
+  const pt = m.userData.part, mat = m.material, base = _c.set(baseColor(m));        // linear
+  const br = base.r, bg = base.g, bb = base.b;
+  mat.roughness = plastic().rough;
+  if (!pt.paint) {
+    if (mat.vertexColors) { mat.vertexColors = false; mat.needsUpdate = true; }
+    if (m.geometry.attributes.color && m.geometry.userData.owner === m.uuid) m.geometry.deleteAttribute('color');
+    mat.color.set(baseColor(m)); return;
+  }
+  const g = ownGeometry(m), n = g.attributes.position.count, P = pt.paint;
+  let col = g.attributes.color;
+  if (!col || col.count !== n) { col = new THREE.BufferAttribute(new Float32Array(n * 3), 3); g.setAttribute('color', col); range = null; }
+  const a = col.array, [i0, i1] = range || [0, n - 1], L = SRGB2LIN;
+  for (let i = i0; i <= i1; i++) { const w = P[4*i+3] / 255;
+    a[3*i] = br + (L[P[4*i]] - br) * w; a[3*i+1] = bg + (L[P[4*i+1]] - bg) * w; a[3*i+2] = bb + (L[P[4*i+2]] - bb) * w; }
+  if (range) { col.clearUpdateRanges?.(); col.addUpdateRange?.(i0 * 3, (i1 - i0 + 1) * 3); }
+  col.needsUpdate = true;
+  if (!mat.vertexColors) { mat.vertexColors = true; mat.needsUpdate = true; }
+  mat.color.set('#ffffff');
+}
+const sprueColor = () => plastic().color || '#c9ccce';
+function applyPlastic() {
+  for (const m of liveParts()) refreshPaint(m);
+  if (typeof sprueMat !== 'undefined') { sprueMat.color.set(sprueColor()); sprueMat.roughness = Math.min(plastic().rough, 0.6); }
+  if (typeof renderOutliner === 'function') renderOutliner();
+}
+const brush = { color: '#8a1414', stroke: null };
+/** Brush paint around a world point on part m: full strength in the middle, softening to the rim. */
+function paintAt(m, wp, face = -1) {
+  const pt = m.userData.part, g = ownGeometry(m), n = g.attributes.position.count, st = brush.stroke;
+  if (!st.touched.has(m)) { st.touched.add(m); pt.paint = pt.paint ? pt.paint.slice() : new Uint8Array(n * 4); pt.paintVer = (pt.paintVer || 0) + 1; }   // copy on first touch: undo keeps the old one
+  m.updateMatrixWorld(true);
+  const inv = m.matrixWorld.clone().invert(), lp = wp.clone().applyMatrix4(inv), sc = new THREE.Vector3().setFromMatrixScale(m.matrixWorld);
+  const r = +$('paint-size').value / 2, rl = r / (Math.max(Math.abs(sc.x), Math.abs(sc.y), Math.abs(sc.z)) || 1), rl2 = rl * rl;
+  const pos = g.attributes.position.array, ix = g.index.array, P = pt.paint, erase = $('paint-erase').checked;
+  const [cr, cg, cb] = hexBytes(brush.color);
+  const seen = new Set(); let lo = Infinity, hi = -1;
+  g.boundsTree.shapecast({
+    intersectsBounds: box => box.distanceToPoint(lp) <= rl,
+    intersectsTriangle: (tri, ti) => { for (let k = 0; k < 3; k++) seen.add(ix[3 * ti + k]); return false; },
+  });
+  for (const i of seen) {
+    const dx = pos[3*i] - lp.x, dy = pos[3*i+1] - lp.y, dz = pos[3*i+2] - lp.z, d2 = dx*dx + dy*dy + dz*dz; if (d2 > rl2) continue;
+    const t = Math.sqrt(d2) / rl, w = t < 0.55 ? 1 : 1 - (t - 0.55) / 0.45;          // soft rim
+    if (erase) P[4*i+3] = Math.round(P[4*i+3] * (1 - w));
+    else { const a0 = P[4*i+3] / 255, k = a0 > 0 ? w : 1;                       // first coat takes the colour; later coats blend
+      P[4*i] = Math.round(P[4*i] + (cr - P[4*i]) * k); P[4*i+1] = Math.round(P[4*i+1] + (cg - P[4*i+1]) * k); P[4*i+2] = Math.round(P[4*i+2] + (cb - P[4*i+2]) * k);
+      P[4*i+3] = Math.max(P[4*i+3], Math.round(w * 255)); }
+    if (i < lo) lo = i; if (i > hi) hi = i;
+  }
+  if (hi < 0 && face >= 0 && !erase) for (let k = 0; k < 3; k++) {     // a blocky part with no points under the brush: colour the triangle it's on
+    const i = ix[3 * face + k]; P[4*i] = cr; P[4*i+1] = cg; P[4*i+2] = cb; P[4*i+3] = 255; lo = Math.min(lo, i); hi = Math.max(hi, i); }
+  if (hi >= 0) refreshPaint(m, [lo, hi]);
+}
+/** The colour showing at a point on a part (for Alt-click). */
+function colourAt(hit) {
+  const m = hit.object, pt = m.userData.part, ix = m.geometry.index.array, f = hit.faceIndex * 3;
+  const pos = m.geometry.attributes.position.array, lp = hit.point.clone().applyMatrix4(m.matrixWorld.clone().invert());
+  let best = ix[f], bd = Infinity; for (let k = 0; k < 3; k++) { const i = ix[f + k], d = (pos[3*i] - lp.x) ** 2 + (pos[3*i+1] - lp.y) ** 2 + (pos[3*i+2] - lp.z) ** 2; if (d < bd) { bd = d; best = i; } }
+  if (pt.paint && pt.paint[4 * best + 3] > 127) return '#' + [0, 1, 2].map(k => pt.paint[4 * best + k].toString(16).padStart(2, '0')).join('');
+  return '#' + new THREE.Color(baseColor(m)).getHexString();
+}
+function setBrushColor(hex) {
+  brush.color = hex; $('paint-color').value = hex;
+  document.querySelectorAll('#paint-swatches .swatch').forEach(b => b.setAttribute('aria-checked', String(b.dataset.c === hex)));
+}
+function clearPaint(list) {
+  const painted = list.filter(m => m.userData.part.paint || m.userData.part.fill); if (!painted.length) return 0;
+  pushUndo(); painted.forEach(m => { const pt = m.userData.part; pt.paint = null; pt.fill = null; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(m); });
+  markDirty(); renderOutliner(); renderPartPanel(); return painted.length;
+}
+function topoOf(mesh) { return mesh.userData.part.topo ||= (mesh.geometry.userData.topo ||= buildTopo(mesh.geometry)); }
+/** A part's candidate mating faces, worked out once per part and setting. */
+function facesOf(mesh, creaseDeg) {
+  const topo = topoOf(mesh), key = 'faces' + creaseDeg;
+  return (topo[key] ||= segmentRegions(topo, creaseDeg, 8));
+}
+
+function worldBox(o) {
+  const b = new THREE.Box3(); o.updateWorldMatrix(true, false);
+  if (isPart(o)) b.copy(o.geometry.boundingBox).applyMatrix4(o.matrixWorld);
+  return b;
+}
+/** Exact world box of a part (the quick box is loose for files saved at an angle). */
+function exactBox(m) {
+  m.updateMatrixWorld(true); const b = new THREE.Box3(), v = V(), pos = m.geometry.attributes.position;
+  for (let i = 0; i < pos.count; i++) b.expandByPoint(v.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld));
+  return b;
+}
+/** The true lowest point of some parts (the quick box is loose for files saved at an angle). */
+function lowestZ(list) {
+  let z = Infinity; const v = V();
+  for (const m of list) { m.updateMatrixWorld(true); const pos = m.geometry.attributes.position, e = m.matrixWorld.elements;
+    for (let i = 0; i < pos.count; i++) { v.fromBufferAttribute(pos, i); z = Math.min(z, e[2] * v.x + e[6] * v.y + e[10] * v.z + e[14]); } }
+  return z;
+}
+function subtreeParts(root) { const out = []; root.traverse(o => { if (isPart(o)) out.push(o); }); return out; }
+function sceneBox(list = liveParts()) { const b = new THREE.Box3(); list.forEach(p => b.union(worldBox(p))); return b; }
+
+/** Give `o` a new world matrix while keeping its parent. */
+function setWorld(o, W) {
+  o.parent.updateWorldMatrix(true, false);
+  const L = o.parent.matrixWorld.clone().invert().multiply(W);
+  L.decompose(o.position, o.quaternion, o.scale);
+  o.updateMatrixWorld(true);
+}
+function applyWorld(o, T) { o.updateWorldMatrix(true, false); setWorld(o, T.clone().multiply(o.matrixWorld)); }
+function isDescendant(o, anc) { for (let p = o.parent; p; p = p.parent) if (p === anc) return true; return false; }
+function jointOf(part) { return part.parent && part.parent.userData.joint ? part.parent : null; }
+function parentPart(part) { let p = part.parent; if (p && p.userData.joint) p = p.parent; return isPart(p) ? p : null; }
+
+function detach(part) {
+  const j = jointOf(part);
+  world.attach(part);
+  if (j && j.parent && !j.children.some(isPart)) j.parent.remove(j);      // a joint other options still hang off stays
+}
+
+function makeJoint(size) {
+  const j = new THREE.Object3D(); j.userData.joint = { rest: new THREE.Quaternion(), restPos: new THREE.Vector3(), size, type: 'pinned', min: null, max: null };
+  const h = new THREE.Group(); h.name = 'joint-helper';
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(size, 16, 10), new THREE.MeshBasicMaterial({ color: '#d6a24a', depthTest: false, transparent: true, opacity: .9 }));
+  const axis = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), V(0, 0, size * 5)]), new THREE.LineBasicMaterial({ color: '#f1d08f', depthTest: false }));
+  ball.renderOrder = axis.renderOrder = 999;
+  h.add(ball, axis); j.add(h); joints.push(j);
+  h.visible = $('set-joints').checked;
+  return j;
+}
+
+function attach(child, fixed, how, jointPos, axis) {
+  if (how === 'none') return null;
+  if (fixed === child || isDescendant(fixed, child)) return `Moved, but not attached: ${fixed.name} already hangs off ${child.name}`;
+  detach(child);
+  if (how === 'plain') { fixed.attach(child); return null; }
+  const size = Math.min(Math.max(worldBox(child).getSize(V()).length() * 0.025, 0.25), 2);
+  const j = makeJoint(size);
+  world.add(j);
+  j.position.copy(jointPos);
+  j.quaternion.setFromUnitVectors(V(0, 0, 1), axis.clone().normalize());
+  j.updateMatrixWorld(true);
+  fixed.attach(j);
+  j.userData.joint.rest.copy(j.quaternion); j.userData.joint.restPos.copy(j.position);
+  j.attach(child);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Connection types and linkages
+// ---------------------------------------------------------------------------
+/*
+ * Every link in the tree has a type:
+ *   pinned  turns any way about its point (a ball, or a pin in a socket): the default
+ *   hinge   turns about one axis only (its joint's Z), optionally between min and max degrees
+ *   roller  slides along one axis (its joint's Z at rest), optionally between min and max mm, and turns any way as it goes
+ *   fixed   doesn't move (no joint at all: the part sits straight on its parent)
+ * Hinges and rollers have their joint turned so its Z is the chosen axis, so the gizmo shows just that ring or arrow.
+ *
+ * Linkages (pistons, levers) close loops the tree can't: an extra connection between two parts that already
+ * have parents. kind 'pin': a point on A stays on a point on B. kind 'rail': a point on A stays on a line
+ * along one of B's own axes (a roller on a rail), optionally between min and max mm.
+ * While you pose, solveLinks() turns and slides the other joints in each loop so every connection holds.
+ */
+const TYPE_LABEL = { pinned: 'Pinned', hinge: 'Hinge', roller: 'Roller', fixed: 'Fixed' };
+const TYPE_ICON = { pinned: '◆', hinge: '◐', roller: '⇕', fixed: '└' };
+let links = [];                    // { id, a, b (part ids), pa, pb (points in each part's own frame), kind: 'pin' | 'rail', axis: 'x' | 'y' | 'z' | [x, y, z] in b's frame, axisName, min, max }
+const linkTypeOf = part => { const j = jointOf(part); return j ? j.userData.joint.type || 'pinned' : parentPart(part) ? 'fixed' : null; };
+const AXIS_V = { x: V(1, 0, 0), y: V(0, 1, 0), z: V(0, 0, 1) };
+/** A rail's direction in its own part's frame: one of the part's axes, or a direction taken from picked faces. */
+const railAxisLocal = l => Array.isArray(l.axis) ? V(...l.axis).normalize() : AXIS_V[l.axis || 'z'].clone();
+const railLabel = l => Array.isArray(l.axis) ? (l.axisName || 'the picked faces') : `its ${String(l.axis).toUpperCase()}`;
+/** One of a part's own axes, in world space. */
+function partAxis(part, ax) { part.updateMatrixWorld(true); const a = part.userData.part?.axes, d = AXIS_V[ax].clone(); if (a) d.applyQuaternion(new THREE.Quaternion().fromArray(a)); return d.transformDirection(part.matrixWorld).normalize(); }
+/*
+ * Each part has its own X, Y and Z (and an origin, the point it turns about), like an object in Blender. They start as
+ * the file had them; Edit axes turns or moves them without moving the mesh. Kept as a turn (and a point) in the part's
+ * own frame, so they ride along wherever the part goes.
+ */
+function partFrameQ(m) { m.updateMatrixWorld(true); const q = m.getWorldQuaternion(new THREE.Quaternion()), a = m.userData.part?.axes; return a ? q.multiply(new THREE.Quaternion().fromArray(a)) : q; }
+function partPivot(m) { const p = m.userData.part?.pivot; if (!p) return null; m.updateMatrixWorld(true); return V(...p).applyMatrix4(m.matrixWorld); }
+function setPartFrame(m, qWorld) {
+  const pt = m.userData.part, a = m.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(qWorld).normalize();
+  if (Math.abs(a.w) > 1 - 1e-9) delete pt.axes; else pt.axes = a.toArray().map(v => +v.toFixed(9));
+}
+let axesEdit = false, axesDrag = null;
+const axesFx = new THREE.Group(); axesFx.visible = false; axesFx.renderOrder = 998; scene.add(axesFx);
+for (const [d, col] of [[V(1, 0, 0), '#e5534b'], [V(0, 1, 0), '#5fbf4f'], [V(0, 0, 1), '#4f86e5']]) {
+  const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(), d]), new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true, linewidth: 2 }));
+  ln.renderOrder = 998; axesFx.add(ln);
+  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 8), new THREE.MeshBasicMaterial({ color: col, depthTest: false, transparent: true })); tip.position.copy(d); tip.renderOrder = 998; axesFx.add(tip);
+}
+{ const o = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 8), new THREE.MeshBasicMaterial({ color: '#f1d08f', depthTest: false, transparent: true })); o.renderOrder = 998; axesFx.add(o); }
+/** The selected part's axes, drawn from its origin (or its middle). */
+function showAxesFx(m) {
+  if (!m) { axesFx.visible = false; return; }
+  const at = partPivot(m) || sceneBox([m]).getCenter(V()), L = Math.max(exactBox(m).getSize(V()).length() * 0.35, 2);
+  axesFx.position.copy(at); axesFx.quaternion.copy(partFrameQ(m)); axesFx.scale.setScalar(L); axesFx.visible = true;
+}
+function setAxesEdit(on) {
+  axesEdit = on; document.querySelectorAll('#affect button').forEach(b => b.setAttribute('aria-pressed', String((b.dataset.v === 'axes') === on)));
+  if (on && !['move', 'rotate'].includes(tool)) setTool('rotate');
+  syncGizmo(); renderPartPanel();
+  if (on) toast('Editing axes: Rotate (R) turns the part\'s X, Y and Z, Move (G) moves its origin. The part stays where it is.');
+}
+function axesSquareToWorld(m) { pushUndo(); setPartFrame(m, new THREE.Quaternion()); afterAxes(m); toast(`${m.name}'s axes now line up with the world's.`); }
+function axesReset(m) { pushUndo(); delete m.userData.part.axes; delete m.userData.part.pivot; afterAxes(m); toast(`${m.name}'s axes and origin are back as the file had them.`); }
+function originToCentre(m) { pushUndo(); delete m.userData.part.pivot; afterAxes(m); }
+function axesFromFaces(m) {
+  startDirPick(`Pick faces on ${m.name} for its Z axis`, r => {
+    const ax = r.axes, Z = ax[r.which].clone().normalize(); let X = (r.which === 'along' ? ax.out : ax.along).clone();
+    X.addScaledVector(Z, -X.dot(Z)); if (X.lengthSq() < 1e-8) X = jointBasis(Z).X; X.normalize();
+    const Y = Z.clone().cross(X).normalize();
+    pushUndo(); setPartFrame(m, new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(X, Y, Z)));
+    m.updateMatrixWorld(true); m.userData.part.pivot = ax.centre.clone().applyMatrix4(m.matrixWorld.clone().invert()).toArray();
+    afterAxes(m); toast(`${m.name}'s Z now runs ${r.which === 'out' ? 'straight out of' : r.which} those faces, with its origin on them.`, 'ok');
+  }, { mesh: m });
+}
+function afterAxes(m) { markDirty(); syncGizmo(); renderPartPanel(); if (axesEdit) showAxesFx(m); }
+function axesRows(p, el) {
+  const pt = p.userData.part, box = document.createElement('div'); box.className = 'mods'; el.append(box);
+  const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = 'Axes & origin'; box.append(h);
+  const e = new THREE.Euler().setFromQuaternion(partFrameQ(p), 'XYZ'), deg = THREE.MathUtils.radToDeg;
+  const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
+  const ins = ['X', 'Y', 'Z'].map((k, i) => {
+    const l = document.createElement('label'); l.textContent = `Turned ${k}°`; l.title = `How far the part's axes are turned about the world's ${k}`;
+    const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = 1; n.value = +deg([e.x, e.y, e.z][i]).toFixed(2);
+    grid.append(l, n); return n;
+  });
+  ins.forEach(n => n.addEventListener('change', () => {
+    const v = ins.map(x => THREE.MathUtils.degToRad(+x.value || 0)); pushUndo();
+    setPartFrame(p, new THREE.Quaternion().setFromEuler(new THREE.Euler(v[0], v[1], v[2], 'XYZ'))); afterAxes(p);
+  }));
+  const note = document.createElement('p'); note.className = 'note';
+  note.textContent = (pt.axes ? 'Turned from how the file had them.' : 'As the file had them.') + (pt.pivot ? ' Its origin has been moved.' : ' Its origin is its middle.') + ' The mesh never moves.';
+  box.append(note);
+  const row = document.createElement('div'); row.className = 'btnrow'; box.append(row);
+  const b = (txt, fn, title, dis) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.title = title; x.disabled = !!dis; x.addEventListener('click', fn); row.append(x); };
+  b(axesEdit ? 'Done editing' : 'Edit axes', () => setAxesEdit(!axesEdit), 'Turn (R) or move (G) the axes and origin with the gizmo, leaving the part where it is');
+  if (axesEdit) row.lastChild.classList.add('primary');
+  b('Square to world', () => axesSquareToWorld(p), "Line its X, Y and Z up with the world's (like Apply rotation in Blender)");
+  b('From faces…', () => axesFromFaces(p), 'Click faces: Z runs along, across or straight out of them, with the origin on them');
+  b('Origin to middle', () => originToCentre(p), 'Put the origin back in the middle of the part', !pt.pivot);
+  b('Reset', () => axesReset(p), 'Axes and origin as the file had them', !pt.axes && !pt.pivot);
+}
+
+/** Turn a joint so its Z points along `dir` (world), without moving anything hanging off it; that becomes its rest. */
+function reframeJoint(j, dir) {
+  const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
+  j.updateMatrixWorld(true);
+  const z = dir.clone().normalize(), ref = Math.abs(z.x) < 0.9 ? V(1, 0, 0) : V(0, 1, 0), x = ref.clone().sub(z.clone().multiplyScalar(ref.dot(z))).normalize(), y = z.clone().cross(x);
+  const W = new THREE.Matrix4().makeBasis(x, y, z).setPosition(V().setFromMatrixPosition(j.matrixWorld));
+  setWorld(j, W); kids.forEach(k => j.attach(k));
+  const jd = j.userData.joint; jd.rest.copy(j.quaternion); jd.restPos.copy(j.position);
+}
+/** Where a part could pivot on its parent: the middle of where they touch, or else the point of the part nearest its parent. */
+function pivotPoint(part, par) {
+  let c = null; try { c = contactBetween(contactContext([par, part]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) {}
+  if (c) return { point: V().copy(c.centre || c.joint), axis: (c.nOut?.[0]?.lengthSq() > 1e-9 ? c.nOut[0].clone() : V(0, 0, 1)).normalize() };
+  return { point: closestBetween(part, par), axis: worldBox(part).getCenter(V()).sub(worldBox(par).getCenter(V())).normalize() };
+}
+/** Roughly where two parts come closest: the middle of the nearest points on each. */
+function closestBetween(a, b) {
+  a.updateMatrixWorld(true); b.updateMatrixWorld(true);
+  const onB = (m, p) => { const inv = m.matrixWorld.clone().invert(), h = m.geometry.boundsTree.closestPointToPoint(p.clone().applyMatrix4(inv)); return h.point.clone().applyMatrix4(m.matrixWorld); };
+  let p = worldBox(a).getCenter(V());
+  for (let i = 0; i < 3; i++) { const q = onB(b, p); p = onB(a, q); }
+  return p.clone().add(onB(b, p)).multiplyScalar(0.5);
+}
+/** Change how a part is connected to its parent. axis: 'x' | 'y' | 'z' (the part's own) or 'joint' (keep the joint's axis). */
+function setLinkType(part, type, axis = null) {
+  const par = parentPart(part); if (!par) return 'It isn\'t attached to anything.';
+  let j = jointOf(part);
+  if (type === 'fixed') { if (j) { detach(part); par.attach(part); } return null; }
+  if (!j) { const pv = pivotPoint(part, par); detach(part); attach(part, par, 'joint', pv.point, pv.axis); j = jointOf(part); }
+  const jd = j.userData.joint, was = jd.type || 'pinned';
+  jd.type = type;
+  if (type === 'pinned') { if (was !== 'pinned') { jd.min = jd.max = null; } return null; }
+  if (was !== type) { jd.min = jd.max = null; }
+  const ax = axis || jd.axis || (type === 'roller' ? 'z' : 'joint');
+  jd.axis = ax;
+  if (ax !== 'joint' && ax !== 'custom') reframeJoint(j, partAxis(part, ax));
+  else { const kids = j.children.filter(isPart); jd.rest.copy(j.quaternion); jd.restPos.copy(j.position); }
+  return null;
+}
+/** Hinge angle (degrees) about the joint's Z from its rest, or roller travel (mm) along it. */
+function jointValue(j) {
+  const jd = j.userData.joint;
+  if (jd.type === 'roller') return j.position.clone().sub(jd.restPos).dot(V(0, 0, 1).applyQuaternion(jd.rest));
+  if (jd.type === 'hinge') { const d = jd.rest.clone().invert().multiply(j.quaternion); return 2 * Math.atan2(d.z, d.w) * 180 / Math.PI; }
+  return 0;
+}
+/** Set a hinge's angle or a roller's travel, within its limits. */
+function setJointValue(j, v) {
+  const jd = j.userData.joint;
+  if (jd.min != null) v = Math.max(v, jd.min); if (jd.max != null) v = Math.min(v, jd.max);
+  if (jd.type === 'roller') { j.position.copy(jd.restPos).addScaledVector(V(0, 0, 1).applyQuaternion(jd.rest), v); }   // turned any way: only its slide is set
+  else if (jd.type === 'hinge') { let a = ((v + 180) % 360 + 360) % 360 - 180; j.quaternion.copy(jd.rest).multiply(new THREE.Quaternion().setFromAxisAngle(V(0, 0, 1), a * Math.PI / 180)); j.position.copy(jd.restPos); }
+  j.updateMatrixWorld(true);
+}
+/** After a drag: keep a joint to what its type allows (a hinge only turns about Z; a roller stays on its line, turned any way). */
+function constrainJoint(j) {
+  const jd = j.userData.joint;
+  if (jd.type === 'hinge' || jd.type === 'roller') setJointValue(j, jointValue(j));
+  else j.position.copy(jd.restPos);
+}
+const partByUuid = id => liveParts().find(p => p.uuid === id) || null;
+function tidyLinks() { links = links.filter(l => partByUuid(l.a) && partByUuid(l.b)); }
+/** Every link's error in world mm: a pin's ends apart, or a rail's point off its line (or past its ends). */
+function linkResiduals(list, out = []) {
+  for (const l of list) {
+    const a = l._a, b = l._b, pa = l._pa.clone().applyMatrix4(a.matrixWorld), pb = l._pb.clone().applyMatrix4(b.matrixWorld), d = pa.sub(pb);
+    if (l.kind === 'rail') { const ax = railAxisLocal(l).transformDirection(b.matrixWorld); let t = d.dot(ax);
+      if (l.min != null) t = Math.max(t, l.min); if (l.max != null) t = Math.min(t, l.max); d.addScaledVector(ax, -t); }
+    out.push(d.x, d.y, d.z);
+  }
+  return out;
+}
+/** The joints on the tree path between two parts (each one's own link up to where their branches meet). */
+function jointsBetween(a, b) {
+  const up = p => { const out = []; for (let c = p; c; c = parentPart(c)) out.push(c); return out; };
+  const ua = up(a), ub = up(b), meet = ua.find(x => ub.includes(x));
+  const path = meet ? [...ua.slice(0, ua.indexOf(meet)), ...ub.slice(0, ub.indexOf(meet))] : [...ua, ...ub];   // separate groups: every joint in both
+  return path.map(jointOf).filter(Boolean);
+}
+/**
+ * Keep every linkage closed: turn and slide the joints in each loop (never `driven`, the one being posed)
+ * until every pin meets and every rail point sits on its rail. Damped least squares; joints carrying more
+ * parts are stiffer, so the pistons move before the leg does. Returns the worst error left (mm).
+ */
+function solveLinks(driven = null, iters = 30, only = null) {
+  tidyLinks(); if (!links.length) return 0;
+  const list = links.map(l => ({ ...l, _a: partByUuid(l.a), _b: partByUuid(l.b), _pa: V(...l.pa), _pb: V(...l.pb) })).filter(l => l._a && l._b);
+  const js = [...new Set(list.flatMap(l => jointsBetween(l._a, l._b)))].filter(j => j !== driven && (!only || only.includes(j)));
+  const dofs = [];
+  for (const j of js) {
+    const jd = j.userData.joint, w = 1 + subtreeParts(j).length * 0.5;
+    if (jd.type === 'hinge' || jd.type === 'roller') dofs.push({ j, k: 'v', w: jd.type === 'roller' ? w * 0.2 : w });
+    if (jd.type !== 'hinge') for (const ax of ['x', 'y', 'z']) dofs.push({ j, k: ax, w });          // pinned and rollers turn any way
+  }
+  if (!dofs.length) return Math.max(0, ...linkResiduals(list).map(Math.abs));
+  const save = () => dofs.map(d => [d.j.position.clone(), d.j.quaternion.clone()]);
+  const load = st => { dofs.forEach((d, i) => { d.j.position.copy(st[i][0]); d.j.quaternion.copy(st[i][1]); }); js.forEach(j => j.updateMatrixWorld(true)); };
+  const nudge = (d, h) => {
+    if (d.k === 'v') { setJointValue(d.j, jointValue(d.j) + (d.j.userData.joint.type === 'hinge' ? h * 180 / Math.PI : h)); return; }
+    d.j.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(AXIS_V[d.k], h)); d.j.updateMatrixWorld(true);
+  };
+  const cost = r => r.reduce((s, v) => s + v * v, 0);
+  scene.updateMatrixWorld(true);
+  let r = linkResiduals(list), c = cost(r);
+  const run = sub => {
+    let lambda = 1e-3; const n = sub.length, m = r.length;
+    const saveS = () => sub.map(d => [d.j.position.clone(), d.j.quaternion.clone()]);
+    const loadS = st => { sub.forEach((d, i) => { d.j.position.copy(st[i][0]); d.j.quaternion.copy(st[i][1]); }); js.forEach(j => j.updateMatrixWorld(true)); };
+    for (let it = 0; it < iters && c > 1e-8; it++) {
+      const st = saveS(), J = sub.map(d => { const h = 1e-4; nudge(d, h); const r2 = linkResiduals(list); loadS(st); return r2.map((v, i) => (v - r[i]) / h); });
+      const A = Array.from({ length: n }, () => new Array(n).fill(0)), g = new Array(n).fill(0);
+      for (let a = 0; a < n; a++) { for (let i = 0; i < m; i++) g[a] -= J[a][i] * r[i]; for (let b = a; b < n; b++) { let v = 0; for (let i = 0; i < m; i++) v += J[a][i] * J[b][i]; A[a][b] = A[b][a] = v; } }
+      let improved = false;
+      for (let tries = 0; tries < 6 && !improved; tries++) {
+        const M = A.map((row, a) => row.map((v, b) => v + (a === b ? lambda * sub[a].w * (1 + A[a][a]) + 1e-9 : 0)));
+        const x = solveLinear(M, g); if (!x) { lambda *= 10; continue; }
+        sub.forEach((d, k) => nudge(d, Math.max(-0.3, Math.min(0.3, x[k]))));
+        const r2 = linkResiduals(list), c2 = cost(r2);
+        if (c2 < c) { r = r2; c = c2; lambda = Math.max(lambda / 3, 1e-6); improved = true; } else { loadS(st); lambda *= 10; }
+      }
+      if (!improved) break;
+    }
+  };
+  // A roller in a loop that already slides on a rail (a plate in its socket, its top in a channel) has two ways to make
+  // up a gap: slide on the rail, or slide itself, which walks its ball out of the socket. The rail goes first: those
+  // rollers only slide when turning and the rail can't close it. Rollers in loops without a rail (a piston rod in its
+  // cylinder) slide as freely as ever, since that's how the piston moves.
+  const railJs = new Set(list.filter(l => l.kind === 'rail').flatMap(l => jointsBetween(l._a, l._b)));
+  const slides = dofs.filter(d => d.k === 'v' && d.j.userData.joint.type === 'roller' && railJs.has(d.j)), turns = dofs.filter(d => !slides.includes(d));
+  if (turns.length) run(turns);
+  if (slides.length && c > 2.5e-5) run(dofs);                 // still more than 0.005 mm out: let the rollers slide too
+  holdFacing(list, driven);
+  return Math.sqrt(Math.max(0, ...Array.from({ length: r.length / 3 }, (_, i) => r[3 * i] ** 2 + r[3 * i + 1] ** 2 + r[3 * i + 2] ** 2)));
+}
+/*
+ * Keeping a face pointing the right way. A part on a ball (or a roller) whose far end is held by a link can still spin
+ * on the line from its joint to that end without breaking anything, so the solver lets it drift. A link with `face`
+ * holds that spin: a side of the part (face.sa, in its own frame) keeps pointing the same way relative to the part
+ * it's linked to (face.sb, in that part's frame), like armour that always faces out from the leg it slides on.
+ * Turning about that line never moves the linked end, so every connection still holds.
+ */
+function holdFacing(list, driven = null) {
+  for (const l of list) {
+    if (!l.face) continue;
+    const a = l._a, b = l._b, j = jointOf(a); if (!j || j === driven) continue;
+    const t = j.userData.joint.type || 'pinned'; if (t !== 'pinned' && t !== 'roller') continue;
+    j.updateMatrixWorld(true); a.updateMatrixWorld(true); b.updateMatrixWorld(true);
+    const P = V().setFromMatrixPosition(j.matrixWorld), u = l._pa.clone().applyMatrix4(a.matrixWorld).sub(P); if (u.lengthSq() < 1e-10) continue; u.normalize();
+    const c = V(...l.face.sa).transformDirection(a.matrixWorld).projectOnPlane(u), d = V(...l.face.sb).transformDirection(b.matrixWorld).projectOnPlane(u);
+    if (c.lengthSq() < 1e-8 || d.lengthSq() < 1e-8) continue;
+    const ang = Math.atan2(c.clone().cross(d).dot(u), c.dot(d)); if (Math.abs(ang) < 1e-6) continue;
+    const pq = j.parent.getWorldQuaternion(new THREE.Quaternion()), jq = j.getWorldQuaternion(new THREE.Quaternion());
+    j.quaternion.copy(pq.invert().multiply(new THREE.Quaternion().setFromAxisAngle(u, ang).multiply(jq))); j.updateMatrixWorld(true);
+  }
+}
+/** Remember which way a linked part faces now, relative to what it's linked to (see holdFacing). */
+function setFacing(l) {
+  const a = partByUuid(l.a), b = partByUuid(l.b), j = a && jointOf(a); if (!a || !b || !j) { delete l.face; return; }
+  scene.updateMatrixWorld(true);
+  const P = V().setFromMatrixPosition(j.matrixWorld), u = V(...l.pa).applyMatrix4(a.matrixWorld).sub(P); if (u.lengthSq() < 1e-10) { delete l.face; return; } u.normalize();
+  // the side: from the line out to the part's bulk (the armour plate), or any square direction if it sits on the line
+  let side = partCentroid(a).sub(P).projectOnPlane(u);
+  if (side.lengthSq() < 1e-6) side = (Math.abs(u.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).projectOnPlane(u);
+  side.normalize();
+  l.face = { sa: side.clone().transformDirection(a.matrixWorld.clone().invert()).toArray(), sb: side.clone().transformDirection(b.matrixWorld.clone().invert()).toArray() };
+}
+/** After the part itself has been turned by hand: its new facing is the one to keep. */
+function refreshFacing(j) { for (const l of links) if (l.face && jointOf(partByUuid(l.a)) === j) setFacing(l); }
+/** Every joint a linkage solve might move, plus `j`: their positions and turns, to put back later. */
+function linkedState(j) {
+  const set = new Set(j ? [j] : []);
+  for (const l of links) { const a = partByUuid(l.a), b = partByUuid(l.b); if (a && b) jointsBetween(a, b).forEach(x => set.add(x)); }
+  return [...set].map(o => [o, o.position.clone(), o.quaternion.clone()]);
+}
+function applyState(st) { for (const [o, p, q] of st) { o.position.copy(p); o.quaternion.copy(q); } scene.updateMatrixWorld(true); }
+/**
+ * `j` has just been moved (from the pose `prev`). Close every linkage around it; if they can't close (a rigid
+ * piston can't reach, a rail runs out), stop `j` at the furthest point they still can, like the real model jams.
+ * Returns { ok, frac }: frac is how far toward the requested pose it got.
+ */
+function poseWithLinks(j, prev) {
+  if (!links.length) return { ok: true, frac: 1 };
+  const tol = 0.01, want = [j.position.clone(), j.quaternion.clone()];
+  if (solveLinks(j) <= tol) return { ok: true, frac: 1 };
+  const now = linkedState(j);
+  applyState(prev); if (solveLinks(j, 0) > tol) { applyState(now); return { ok: true, frac: 1 }; }   // it didn't hold before either: just do our best
+  const p0 = prev.find(e => e[0] === j); let lo = 0, hi = 1, best = linkedState(j);
+  for (let i = 0; i < 10; i++) {
+    const mid = (lo + hi) / 2; applyState(prev);
+    j.position.lerpVectors(p0[1], want[0], mid); j.quaternion.slerpQuaternions(p0[2], want[1], mid); j.updateMatrixWorld(true);
+    if (solveLinks(j) <= tol) { lo = mid; best = linkedState(j); } else hi = mid;
+  }
+  applyState(best); return { ok: false, frac: lo };
+}
+/** Connect two parts that both keep their parents: a pin (or a rail along one of `to`'s axes) where they meet. */
+function addLink(part, to, kind = 'pin', axis = 'z') {
+  if (part === to) return null;
+  const pt = closestOrContact(part, to);
+  part.updateMatrixWorld(true); to.updateMatrixWorld(true);
+  const l = { id: uid(), a: part.uuid, b: to.uuid, pa: pt.clone().applyMatrix4(part.matrixWorld.clone().invert()).toArray(), pb: pt.clone().applyMatrix4(to.matrixWorld.clone().invert()).toArray(), kind, axis, min: null, max: null };
+  links.push(l); setFacing(l); return l;
+}
+function closestOrContact(a, b) {
+  let c = null; try { c = contactBetween(contactContext([b, a]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) {}
+  return c ? V().copy(c.centre || c.joint) : closestBetween(a, b);
+}
+
+
+/**
+ * Make `part` the base of its linked group: every link between it and the old base turns round,
+ * so what was its parent now hangs off it (and so on up). Nothing moves; joints keep their place,
+ * axis and current pose, and "Reset pose" still returns the same rest shape.
+ * Returns an error string, or null.
+ */
+/** Ask whether moving a part that hangs off another should bring its whole linked group. → 'alone' | 'group' | null (cancelled) */
+const linkAsk = { resolve: null, part: null };
+function groupLabel(part) {
+  const others = subtreeParts(rootOf(part)).filter(m => m !== part && !subtreeParts(part).includes(m)).length;
+  return { par: parentPart(part), others };
+}
+function askLink(part, verb, { fixed = null } = {}) {
+  if (!part || !parentPart(part)) return Promise.resolve('alone');
+  if (part.userData.part?.grower) return Promise.resolve('alone');                // a growth is moved on its own: that's the point of it
+  if (fixed && rootOf(fixed) === rootOf(part)) return Promise.resolve('alone');    // fitting it within its own group: the group can't come along
+  if (rerootCheck(part)) return Promise.resolve('alone');
+  const pref = $('set-linkmove').value; if (pref !== 'ask') return Promise.resolve(pref);
+  closeLinkAsk(null);
+  const { par, others } = groupLabel(part), esc = s => s.replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`);
+  $('linkask-text').innerHTML = `<b>${esc(part.name)}</b> hangs off <b>${esc(par.name)}</b>${others > 1 ? ` (in a group of ${others + subtreeParts(part).length})` : ''}. ${verb} just ${esc(part.name)}, or make it the base so ${esc(par.name)}${others > 1 ? ' and the rest' : ''} come${others > 1 ? '' : 's'} along?`;
+  $('linkask-alone').textContent = `Just ${part.name}`;
+  $('linkask-group').textContent = 'Bring the group';
+  $('linkask-remember').checked = false;
+  $('linkask').hidden = false; linkAsk.part = part;
+  $('linkask-group').focus({ preventScroll: true });
+  return new Promise(res => { linkAsk.resolve = res; });
+}
+function closeLinkAsk(answer) {
+  const r = linkAsk.resolve; linkAsk.resolve = null; linkAsk.part = null; linkAsk.soft = false; $('linkask').hidden = true;
+  if (answer && $('linkask-remember').checked) { $('set-linkmove').value = answer; $('set-linkmove').dispatchEvent(new Event('change')); toast(answer === 'group' ? 'Will bring the group from now on. Change it in Edit › Preferences.' : 'Will move just the part from now on. Change it in Edit › Preferences.'); }
+  r?.(answer);
+}
+function bindLinkAsk() {
+  $('linkask-alone').addEventListener('click', () => closeLinkAsk('alone'));
+  $('linkask-group').addEventListener('click', () => closeLinkAsk('group'));
+  $('linkask').addEventListener('keydown', e => { if (e.key === 'Escape') { e.stopPropagation(); closeLinkAsk(null); } });
+}
+/** Turn the links round so `part` is the base, with undo and a note. */
+function makeBase(part, quiet) {
+  const old = rootOf(part); if (old === part) return true;
+  const err = rerootCheck(part); if (err) { toast(err, 'bad'); return false; }
+  pushUndo(); reroot(part); afterHierarchyChange();
+  if (!quiet) toast(`${part.name} is now the base; ${old.name} and the rest hang off it.`, 'ok');
+  return true;
+}
+
+function linkPath(part) { const path = []; for (let c = part, p; (p = parentPart(c)); c = p) path.push({ p, c, j: jointOf(c) }); return path; }
+function rerootCheck(part) {
+  for (const e of linkPath(part)) if (e.j && e.j.children.filter(isPart).length > 1) return `${e.c.name} shares its joint with its alternates, so that link can't turn round. Pick the alternates' base instead.`;
+  return null;
+}
+function reroot(part) {
+  const path = linkPath(part); if (!path.length) return null;
+  const err = rerootCheck(part); if (err) return err;
+  const top = path[path.length - 1].p, home = top.parent;
+  scene.updateMatrixWorld(true);
+  // how far each joint is posed from its rest, measured before anything moves
+  for (const e of path) if (e.j) e.delta = e.j.userData.joint.rest.clone().invert().multiply(e.j.quaternion);
+  // unhook the chain (attach() keeps world placement)
+  for (const e of path) { home.attach(e.c); if (e.j) home.attach(e.j); }
+  // hook it back the other way round: child → joint → old parent
+  for (const e of path) {
+    if (e.j) { e.c.attach(e.j); e.j.attach(e.p); e.j.userData.joint.rest.copy(e.j.quaternion).multiply(e.delta); e.j.userData.joint.restPos.copy(e.j.position); }
+    else e.c.attach(e.p);
+  }
+  scene.updateMatrixWorld(true);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Undo
+// ---------------------------------------------------------------------------
+const undoStack = [], redoStack = [];
+function snapshot() {
+  const snap = [...parts, ...joints].filter(o => o.parent).map(o => ({
+    o, p: o.parent, pos: o.position.clone(), q: o.quaternion.clone(), s: o.scale.clone(), vis: o.visible, name: o.name, g: o.isMesh ? o.geometry : null, gk: o.userData.part?.geomKey,
+    rest: o.userData.joint ? o.userData.joint.rest.clone() : null, jd: o.userData.joint ? { type: o.userData.joint.type || 'pinned', restPos: o.userData.joint.restPos.clone(), min: o.userData.joint.min, max: o.userData.joint.max, axis: o.userData.joint.axis || null, axisName: o.userData.joint.axisName || '', pointOff: o.userData.joint.pointOff || null, partOff: o.userData.joint.partOff || null } : null, off: !!o.userData.optOff,
+    paint: o.userData.part?.paint || null, fill: o.userData.part?.fill || null,
+    mods: o.userData.part?.mods ? JSON.parse(JSON.stringify(o.userData.part.mods)) : null, base: o.userData.part?.base || null, owner: o.userData.part?.owner || null,
+    ooze: o.userData.part?.ooze ? JSON.parse(JSON.stringify(o.userData.part.ooze)) : null, grower: o.userData.part?.grower ? JSON.parse(JSON.stringify(o.userData.part.grower)) : null, prim: o.userData.part?.prim ? { ...o.userData.part.prim } : null, axes: o.userData.part?.axes ? [...o.userData.part.axes] : null, pivot: o.userData.part?.pivot ? [...o.userData.part.pivot] : null, noGrow: o.userData.part?.noGrow ? [...o.userData.part.noGrow] : null }));
+  snap.options = JSON.parse(JSON.stringify(options));
+  snap.sprues = sprues ? JSON.parse(JSON.stringify(sprues)) : null;
+  snap.kit = kit ? JSON.parse(JSON.stringify(kit)) : null;
+  snap.magnets = JSON.parse(JSON.stringify(magnets));
+  snap.links = JSON.parse(JSON.stringify(links));
+  snap.refs = JSON.parse(JSON.stringify(refs));
+  return snap;
+}
+function restore(snap) {
+  [...parts, ...joints].forEach(o => o.parent && o.parent.remove(o));
+  for (const e of snap) {
+    e.p.add(e.o); e.o.position.copy(e.pos); e.o.quaternion.copy(e.q); e.o.scale.copy(e.s); e.o.visible = e.vis; e.o.name = e.name;
+    if (e.g && e.o.geometry !== e.g) { e.o.geometry = e.g; const pt = e.o.userData.part; pt.geomKey = e.gk; pt.topo = null; pt.tris = e.g.index.count / 3; }
+    if (e.rest) e.o.userData.joint.rest.copy(e.rest);
+    if (e.jd) Object.assign(e.o.userData.joint, { ...e.jd, restPos: e.jd.restPos.clone() });
+    if (e.o.userData.part) { e.o.userData.optOff = e.off;
+      const pt = e.o.userData.part; if (pt.paint !== e.paint || pt.fill !== e.fill) { pt.paint = e.paint; pt.fill = e.fill; pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(e.o); }
+      pt.mods = e.mods ? JSON.parse(JSON.stringify(e.mods)) : null; pt.base = e.base; if (e.owner) pt.owner = e.owner; else delete pt.owner;
+      if (e.ooze) pt.ooze = JSON.parse(JSON.stringify(e.ooze)); else delete pt.ooze;
+      if (e.prim) pt.prim = { ...e.prim }; else delete pt.prim;
+      if (e.axes) pt.axes = [...e.axes]; else delete pt.axes; if (e.pivot) pt.pivot = [...e.pivot]; else delete pt.pivot;
+      if (e.grower) pt.grower = JSON.parse(JSON.stringify(e.grower)); else delete pt.grower; styleDraft(e.o, !!pt.grower?.draft); if (e.noGrow) pt.noGrow = [...e.noGrow]; else delete pt.noGrow; }
+  }
+  if (snap.options) options = JSON.parse(JSON.stringify(snap.options));
+  if ('sprues' in snap) sprues = snap.sprues ? JSON.parse(JSON.stringify(snap.sprues)) : null;
+  if (snap.magnets) { magnets = JSON.parse(JSON.stringify(snap.magnets)); }
+  if (snap.links) links = JSON.parse(JSON.stringify(snap.links));
+  if (connSel && !(connSel.kind === 'joint' ? snap.some(e => e.o.uuid === connSel.id && e.o.userData.joint) : links.some(l => l.id === connSel.id))) connSel = null;
+  if (snap.refs && JSON.stringify(snap.refs) !== JSON.stringify(refs)) { refs = JSON.parse(JSON.stringify(snap.refs)); rebuildRefs(); if (benchSel?.kind === 'ref' && !refById(benchSel.k)) { benchSel = null; benchMark.visible = false; } }
+  if ('kit' in snap && JSON.stringify(snap.kit) !== JSON.stringify(kit)) { kit = snap.kit ? JSON.parse(JSON.stringify(snap.kit)) : null; buildKit(); }
+  scene.updateMatrixWorld(true);
+}
+function pushUndo(before = snapshot()) { undoStack.push(before); if (undoStack.length > 80) undoStack.shift(); redoStack.length = 0; updateButtons(); }
+function undo() {
+  if (!undoStack.length) return;
+  cancelPick(); redoStack.push(snapshot()); restore(undoStack.pop()); lastOp = null; afterHierarchyChange();
+}
+function redo() {
+  if (!redoStack.length) return;
+  cancelPick(); undoStack.push(snapshot()); restore(redoStack.pop()); lastOp = null; afterHierarchyChange();
+}
+
+// ---------------------------------------------------------------------------
+// Tools and picking
+// ---------------------------------------------------------------------------
+const SNAP_STEPS = {
+  BALL: ["Click the BALL on the part that moves", "Click the SOCKET on the part it joins"],
+  PLANE: ["Click a flat face on the part that moves", "Click the flat face it should sit against"],
+  MID: ["Moving part: click its first outer surface", "Moving part: click the opposite outer surface",
+        "Fixed part: click one side of the gap", "Fixed part: click the other side of the gap"],
+  THREE: ["Moving part: point 1 (lands exactly)", "Moving part: point 2 (sets direction)", "Moving part: point 3 (sets the plane)",
+          "Fixed part: point 1", "Fixed part: point 2", "Fixed part: point 3"],
+  MATCH: ["Click the mating areas on the part that moves", "Click the areas it fits against"],
+};
+const PER_SIDE = { BALL: 1, PLANE: 1, MID: 2, THREE: 3, MATCH: 1 };
+const TOOL_NAMES = { BALL: "Ball & socket", PLANE: "Face to face", MID: "Midpoint of gap", THREE: "3-point align", MATCH: "Surface match", LUCKY: "Do ya feel lucky?" };
+let tool = 'select', picks = [], lastOp = null, luckyFirst = null, luckyStop = null;
+const settings = () => ({ smoothDeg: +$('set-smooth').value, maxRadius: +$('set-radius').value || 0, flatTol: +$('set-flat').value || 0.02, ballTol: +$('set-balltol').value || 3, creaseDeg: +$('set-crease').value || 30 });
+
+// ---- workspaces: tabs across the top, each with its own tools on the left and operations on the right
+let workspace = 'assemble';
+const WS_NAMES = { files: 'Files', assemble: 'Assemble', modify: 'Modify', prepare: 'Prepare', export: 'Export' };
+const wsHas = (el, ws = workspace) => !el?.dataset.ws || el.dataset.ws.split(' ').includes(ws);
+function setWorkspace(ws, o = {}) {
+  if (!WS_NAMES[ws]) ws = 'assemble';
+  const was = workspace; workspace = ws;
+  document.querySelectorAll('.wstab').forEach(t => { const on = t.dataset.ws === ws; t.setAttribute('aria-selected', String(on)); t.tabIndex = on ? 0 : -1; });
+  document.querySelectorAll('.tools [data-ws]').forEach(el => { el.hidden = !wsHas(el); });
+  document.querySelectorAll('.wsops').forEach(el => { el.hidden = el.dataset.ws !== ws; });
+  $('ws-title').textContent = WS_NAMES[ws]; $('ws-title').title = document.querySelector(`.wsops[data-ws="${ws}"] .wsnote`)?.textContent || '';
+  const g = $('dock-ws'); g.classList.remove('folded'); g.querySelector('.dfold').setAttribute('aria-expanded', 'true');
+  if (!o.keepTool && !wsHas(document.querySelector(`.tool[data-tool="${tool}"]`))) setTool('select');
+  if (ws === 'files' && !$('tab-files').hidden) showDockTab('tab-files');
+  else if (was === 'files' && ws !== 'files') showDockTab('tab-parts');
+  if (was === 'export' && ws !== 'export') $('dlg-export').hidden = true;
+  syncWsOps(); renderPartPanel();
+  try { localStorage.setItem('kitbash-ws', ws); } catch (e) {}
+}
+/** The workspace buttons follow the menu items they stand for: greyed out, ticked. */
+function syncWsOps() {
+  document.querySelectorAll('.wsop[data-click]').forEach(b => {
+    const id = b.dataset.click, t = $(id);
+    if (id === 'exp-sprue') b.disabled = $('exp-sprue-f').hidden;
+    else if (id.startsWith('exp-') || id === 'ws-sets' || id === 'ws-glue') b.disabled = !liveParts().length;
+    else if (id === 'ws-drop' || id === 'ws-square' || id === 'ws-paint' || id === 'ws-magnet') b.disabled = !liveParts().length || ((id === 'ws-drop' || id === 'ws-square') && !selected);
+    else if (t) b.disabled = t.disabled;
+    if (b.classList.contains('ctx')) b.hidden = b.disabled;              // (only there when it can be used)
+    if (id === 'ws-paint' || id === 'ws-magnet') b.setAttribute('aria-pressed', String(tool === (id === 'ws-paint' ? 'paint' : 'MAGNET')));
+    else if (t && t.hasAttribute('aria-checked')) b.setAttribute('aria-pressed', t.getAttribute('aria-checked'));
+  });
+}
+/** The part's buttons in Properties: only the ones for this workspace (and the ones for every workspace). */
+const WS_BTNS = { 'Reset pose': 'assemble', 'Detach': 'assemble', 'Mirror…': 'assemble modify', 'Array…': 'assemble modify', 'Scatter…': 'modify', 'Crack…': 'modify', 'Burst…': 'modify', 'Use as growth': 'modify', 'Split…': 'modify',
+  'Ooze…': 'modify', 'Change ooze…': 'modify', 'Clean inside': 'prepare', 'Drop to grid': 'assemble prepare', 'Square up': 'assemble prepare', 'Clear paint': 'modify' };
+function wsFilterButtons(row) {
+  for (const b of row.querySelectorAll('button')) { const t = b.textContent.trim(), w = WS_BTNS[t] || (/^(Swap with|Make .* the base|Make it the base)/.test(t) ? 'assemble' : null); if (w && !w.split(' ').includes(workspace)) b.hidden = true; }
+}
+function setTool(t) {
+  { const btn = document.querySelector(`.tool[data-tool="${t}"]`); if (btn && !wsHas(btn)) setWorkspace(btn.dataset.ws.split(' ')[0], { keepTool: true, quiet: true }); }
+  cancelPick(); if (typeof magPending !== 'undefined' && magPending) { magPending = null; rebuildMagnets(); } if (typeof clearHover === 'function') clearHover();
+  luckyFirst = null;
+  if (t !== 'ORIENT' && typeof closeOrient === 'function' && !$('orient').hidden) closeOrient();
+  tool = t;
+  document.querySelectorAll('.tool').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === t ? 'true' : 'false'));
+  syncGizmo(); updateStep(); syncOptbar(); if (typeof syncWsOps === 'function' && $('dock-ws')) syncWsOps();
+}
+/** The bar under the menus shows only the current tool's settings, like Photoshop's options bar. */
+function syncOptbar() {
+  const btn = document.querySelector(`.tool[data-tool="${tool}"]`); $('opt-tool').textContent = tool === 'LUCKY' ? TOOL_NAMES.LUCKY : btn ? [...btn.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim() : tool;
+  let any = false;
+  document.querySelectorAll('#optbar .ogroup').forEach(g => { const on = g.dataset.tools.split(' ').includes(tool); g.hidden = !on; any ||= on; });
+  $('opt-none').hidden = any;
+}
+function cancelPick() { picks = []; clearFx(); updateStep(); }
+function clearFx() { while (fx.children.length) { const c = fx.children.pop(); if (c.isSprite) c.material.dispose(); else c.geometry?.dispose(); } }   // sprites share one quad
+
+function updateStep() {
+  const el = $('step');
+  if (!SNAP_STEPS[tool]) {
+    const msgs = { select: "Click a part to select it. Ctrl-click or Ctrl-drag to select several", move: "Select parts, then drag the arrows (Ctrl-click to add)", rotate: "Select parts, then drag the rings (Ctrl-click to add)",
+                   pose: "Click a jointed part, then drag the rings to pose it around its joint",
+                   ORIENT: "Click a face to lay it flat or square it to the X, Y, Z planes",
+                   MAGNET: "Click where two parts meet to set a pair of magnet holes, one in each. Not touching yet? Click one part, then the other",
+                   LUCKY: luckyFirst ? `Now click the part ${luckyFirst.name} fits onto` : selection.length === 2 ? `Click the part that moves, then the part it fits onto. Enter: fit ${selection[0].name} onto ${selection[1].name}` : "Click the part that moves, then the part it fits onto. The bench works out how they go together",
+                   paint: "Drag on a part to paint it. Alt-click picks up a colour; drag off the parts to turn the view" };
+    el.hidden = false; $('step-count').textContent = ''; $('step-side').style.background = 'var(--muted)';
+    $('step-text').textContent = msgs[tool]; $('step-hint').textContent = ''; return;
+  }
+  $('step-actions').hidden = tool !== 'MATCH';
+  if (tool === 'MATCH') {
+    const nA = picks.filter(q => q.side === 'move').length, nB = picks.length - nA;
+    el.hidden = false;
+    $('step-side').style.background = nA && nB ? 'var(--accent)' : nA ? 'var(--fixed)' : 'var(--move)';
+    $('step-count').textContent = `Match ${nA} + ${nB}`;
+    $('step-text').textContent = !nA ? 'Click the mating areas on the part that moves'
+      : !nB ? `Moving part: ${nA} area${nA > 1 ? 's' : ''}. Click more, or click the part it fits against`
+      : `${nA} area${nA > 1 ? 's' : ''} ↔ ${nB} area${nB > 1 ? 's' : ''}${(() => { const k = new Set(picks.filter(q => q.side === 'fixed').map(q => q.mesh)).size; return k > 1 ? ` on ${k} parts` : ''; })()}. Add more on any part, then Fit parts`;
+    $('step-hint').textContent = picks.length ? 'Areas on other parts fit against them all at once. Click a picked area again to drop it. Enter: fit · Esc: clear' : 'Each area grows out to the sharp edge around it. Pick several where parts touch in more than one place.';
+    $('step-apply').disabled = !(nA && nB);
+    return;
+  }
+  const n = picks.length, total = PER_SIDE[tool] * 2, moving = n < PER_SIDE[tool];
+  el.hidden = false;
+  $('step-side').style.background = moving ? 'var(--move)' : 'var(--fixed)';
+  $('step-count').textContent = `${TOOL_NAMES[tool]} ${n + 1}/${total}`;
+  $('step-text').textContent = SNAP_STEPS[tool][n];
+  $('step-hint').textContent = tool === 'THREE' ? 'Shift+click: exact point'
+    : tool === 'PLANE' || tool === 'MID' ? 'Centres on the face. Click next to a peg or hole to centre on that instead.'
+    : tool === 'MATCH' ? 'The face grows out to the sharp edge around it.'
+    : (n ? 'Backspace: undo pick' : '');
+}
+
+let toastTimer;
+function toast(msg, kind = '') {
+  const t = $('toast'); t.textContent = msg; t.className = 'toast ' + kind; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 4500);
+}
+
+const raycaster = new THREE.Raycaster(); raycaster.firstHitOnly = true;
+function raycast(ev) {
+  const r = renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const hits = raycaster.intersectObjects(liveParts().filter(p => p.visible && isVisibleChain(p)), false);
+  return (secCutting() ? hits.find(h => secClip.distanceToPoint(h.point) >= -1e-6) : hits[0]) || null;      // the section's cut-away side can't be clicked
+}
+function isVisibleChain(o) { for (let p = o; p; p = p.parent) if (!p.visible) return false; return true; }
+
+function markerSize() { return Math.min(Math.max(sceneBox().getSize(V()).length() * 0.006, 0.2), 3); }
+function showRegion(mesh, list, color) {
+  const topo = topoOf(mesh), pos = new Float32Array(list.length * 9);
+  list.forEach((t, i) => { for (let k = 0; k < 3; k++) { const v = topo.idx[3*t+k]; pos.set(topo.pos.subarray(3*v, 3*v+3), i*9 + k*3); } });
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .55, side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4, depthWrite: false }));
+  mesh.updateMatrixWorld(true); m.matrixAutoUpdate = false; m.matrix.copy(mesh.matrixWorld); fx.add(m);
+}
+/** A pick marker: a thin ring with a pin-prick centre, the same size on screen at any zoom, so the surface under it stays visible. */
+const ringTex = new Map();
+function markerTexture(color) {
+  if (ringTex.has(color)) return ringTex.get(color);
+  const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d');
+  g.lineWidth = 7; g.strokeStyle = 'rgba(10,12,14,.75)'; g.beginPath(); g.arc(32, 32, 24, 0, Math.PI * 2); g.stroke();   // dark halo reads on pale parts
+  g.lineWidth = 3.5; g.strokeStyle = color; g.beginPath(); g.arc(32, 32, 24, 0, Math.PI * 2); g.stroke();
+  g.fillStyle = 'rgba(10,12,14,.75)'; g.beginPath(); g.arc(32, 32, 4.5, 0, Math.PI * 2); g.fill();
+  g.fillStyle = color; g.beginPath(); g.arc(32, 32, 2.8, 0, Math.PI * 2); g.fill();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; ringTex.set(color, t); return t;
+}
+function showMarker(p, color = '#ffe066', scale = 1) {
+  const m = new THREE.Sprite(new THREE.SpriteMaterial({ map: markerTexture(color), depthTest: false, depthWrite: false, sizeAttenuation: false, transparent: true }));
+  m.scale.setScalar(0.034 * scale); m.position.copy(p); m.renderOrder = 999; fx.add(m);
+}
+
+/** Match: collect any number of areas on each part; nothing moves until Fit parts. */
+function matchSides() { const a = picks.find(q => q.side === 'move')?.mesh || null, b = picks.find(q => q.side === 'fixed')?.mesh || null; return { a, b }; }
+function handleMatchPick(hit) {
+  if (!hit) { toast("Missed. Click on a part."); return; }
+  const mesh = hit.object, { a, b } = matchSides();
+  // clicking inside an area already picked drops it
+  const k = picks.findIndex(q => q.mesh === mesh && q.region.includes(hit.faceIndex));
+  if (k >= 0) { const q = picks.splice(k, 1)[0]; rebuildPickFx(); updateStep(); toast(`Dropped that ${q.side === 'move' ? 'moving' : 'fixed'} area.`); return; }
+  const side = !a || mesh === a ? 'move' : 'fixed';          // the fixed areas can be on several parts: the last piece of the puzzle
+  mesh.updateMatrixWorld(true);
+  const res = pickSurface(topoOf(mesh), mesh.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+  if (res.err) { toast(res.err, 'bad'); return; }
+  picks.push({ mesh, side, ...res });
+  rebuildPickFx(); clearHover(); updateStep();
+  toast(`Got ${res.info} on ${mesh.name} (${side === 'move' ? 'moves' : 'stays'}).`);
+}
+async function applyMatch() {
+  const A = picks.filter(q => q.side === 'move'), B = picks.filter(q => q.side === 'fixed');
+  if (!A.length || !B.length) { toast('Pick at least one area on each part first.', 'bad'); return; }
+  const union = list => [...new Set(list.flatMap(q => q.region))];
+  // several fixed parts: it attaches to the one with the most picked area, and fits against them all
+  const byMesh = new Map(); for (const q of B) { if (!byMesh.has(q.mesh)) byMesh.set(q.mesh, []); byMesh.get(q.mesh).push(q); }
+  const areaOf = qs => qs.reduce((a, q) => a + q.region.reduce((s2, t) => s2 + topoOf(q.mesh).fa[t], 0), 0);
+  const fixedParts = [...byMesh.entries()].sort((x, y) => areaOf(y[1]) - areaOf(x[1]));
+  const B0 = fixedParts[0][1];
+  const op = {
+    mode: 'MATCH', child: A[0].mesh, fixed: B0[0].mesh, a: [keepPick(A[0])], b: [keepPick(B0[0])], railRegion: union(B0),
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: defaultAttach(A[0].mesh, B0[0].mesh), centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat, rail: 'along', railEnds: true },
+    before: snapshot(),
+  };
+  op.match = { regionA: union(A), regionB: union(B0), groupsA: A.map(q => q.region), groupsB: B0.map(q => q.region), Ma: A[0].mesh.matrixWorld.clone(), Mb: B0[0].mesh.matrixWorld.clone(), results: [], chosen: 0,
+               flat: A.length === 1 && B.length === 1 && A[0].kind === 'flat' && B[0].kind === 'flat', areas: [A.length, B.length] };
+  if (fixedParts.length > 1) op.match.targets = fixedParts.map(([mesh, qs]) => ({ mesh, M: mesh.matrixWorld.clone(), groups: qs.map(q => q.region), region: union(qs) }));
+  const how = await askLink(op.child, 'Fit', { fixed: op.fixed });
+  if (!how) { toast('Still picking. Fit parts when ready.'); return; }
+  op.reroot = how === 'group';
+  clearHover(); picks = []; updateStep();
+  startMatch(op);
+}
+function handlePick(ev, hit) {
+  if (tool === 'MATCH') { handleMatchPick(hit); return; }
+  if (!hit) { toast("Missed. Click on a part."); return; }
+  const mesh = hit.object, n = picks.length, per = PER_SIDE[tool];
+  const first = picks[0]?.mesh;
+  if (n >= per && mesh === first) { toast("That's the moving part. Click the part it attaches to.", 'bad'); return; }
+  if (n > 0 && n < per && mesh !== first) { toast("Keep clicking on the moving part.", 'bad'); return; }
+  if (n > per && mesh !== picks[per].mesh) { toast("Keep clicking on the same fixed part.", 'bad'); return; }
+  mesh.updateMatrixWorld(true);
+  const topo = topoOf(mesh), M = mesh.matrixWorld.clone(), tri = hit.faceIndex;
+  const s = settings();
+  const res = tool === 'BALL' ? pickBall(topo, M, tri, hit.point, s)
+            : tool === 'THREE' ? pickPoint(topo, M, tri, hit.point, ev.shiftKey)
+            : tool === 'MATCH' ? pickSurface(topo, M, tri, hit.point, s)
+            : pickFlat(topo, M, tri, hit.point, s);
+  if (res.err) { toast(res.err, 'bad'); return; }
+  const side = n < per ? 'move' : 'fixed';
+  if (res.region) showRegion(mesh, res.region, side === 'move' ? '#4db4dc' : '#e2804f');
+  showMarker(res.point, '#ffe066', tool === 'THREE' ? 0.8 : 1.2);
+  picks.push({ mesh, ...res });
+  toast(`Got ${res.info}`);
+  if (picks.length < per * 2) { updateStep(); return; }
+  // all picks in: build the operation
+  const op = {
+    mode: tool, child: picks[0].mesh, fixed: picks[per].mesh,
+    a: picks.slice(0, per).map(keepPick),
+    b: picks.slice(per).map(keepPick),
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: defaultAttach(picks[0].mesh, picks[per].mesh), centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat, rail: 'along', railEnds: true },
+    before: snapshot(),
+  };
+  picks = [];
+  const go = async () => {
+    const how = await askLink(op.child, 'Snap', { fixed: op.fixed });
+    if (!how) { clearFx(); updateStep(); toast('Cancelled. Nothing moved.'); return; }
+    op.reroot = how === 'group';
+    if (op.mode === 'PLANE' && op.p.seat !== false) { toast('Fitting the parts together…'); await new Promise(r => setTimeout(r, 30)); }
+    const ok = runOp(op);
+    setTimeout(clearFx, 900);
+    if (ok) { pushUndo(op.before); lastOp = op; select(op.child); showAdjust(); }
+    updateStep();
+    if (ok && op.seat) toast(`Seated: ${seatSummary(op.seat.info)}`, 'ok');
+  };
+  go();
+}
+
+const regionSig = list => { let mn = Infinity; for (const t of list) if (t < mn) mn = t; return list.length + ':' + mn; };
+function matchResultFrom(r, A, B, label, listB) {
+  return { ...r, joint: B.centre.clone(), axis: B.normal.clone(), label, regionB: listB, regionA: A.list, sig: regionSig(A.list) + '|' + regionSig(listB) };
+}
+/** Fit the picked faces; also try the fixed part's other faces of a similar size, in case the click landed on the wrong one. */
+async function startMatch(op) {
+  const s = settings(), tA = topoOf(op.child), tB = topoOf(op.fixed), m = op.match;
+  toast('Matching surfaces…'); await nextFrame();
+  try {
+    if (m.targets) {                                                // the last piece: fit against several parts at once
+      const fits = multiFit(tA, m.Ma, m.groupsA, m.targets.map(t => ({ topo: topoOf(t.mesh), M: t.M, groups: t.groups })));
+      const nB = m.targets.reduce((a, t) => a + t.groups.length, 0), label = `your ${m.groupsA.length} + ${nB} areas on ${m.targets.length} parts`;
+      const sig = regionSig(m.regionA) + '|' + m.targets.map(t => regionSig(t.region)).join('|');
+      finishMatch(op, fits.map(r => ({ ...r, label, regionA: m.regionA, regionB: m.regionB, sig })));
+      return;
+    }
+    if (m.groupsA.length > 1 || m.groupsB.length > 1) {             // several areas: fit them all at once
+      const fits = multiFit(tA, m.Ma, m.groupsA, tB, m.Mb, m.groupsB);
+      const sig = regionSig(m.regionA) + '|' + regionSig(m.regionB), label = `your ${m.groupsA.length} + ${m.groupsB.length} areas`;
+      const results = fits.map(r => ({ ...r, label, regionA: m.regionA, regionB: m.regionB, sig }));
+      await nextFrame();
+      // let the parts settle into each other near that fit (small turns and slides only: the areas set the direction)
+      const seated = await seatMatches(op, results.slice(0, 2), { area: Math.min(...[m.regionA, m.regionB].map((l, i) => l.reduce((a, t) => a + (i ? tB : tA).fa[t], 0))) }, [0.35], { shift: 0.6 });
+      finishMatch(op, [...results, ...seated]);
+      return;
+    }
+    const A = regionSamples(tA, m.Ma, m.regionA), results = [];
+    const tryFace = (list, label, quick) => {
+      const B = regionSamples(tB, m.Mb, list, quick ? { nSurf: 600, nEdge: 200 } : {});
+      for (const r of matchRegions(A, B, quick ? { iters: 15, starts: 2 } : {})) results.push(matchResultFrom(r, A, B, label, list));
+    };
+    tryFace(m.regionB, 'your faces', false);
+    const clickedArea = A.area;
+    // seat the best fits of the faces you clicked: push the parts together along the face and let notches,
+    // keys and pegs settle the turn and slide. These rank first: they use the faces you chose and how the parts really meet.
+    const seated = await seatMatches(op, results.slice().sort((p, q) => p.score - q.score).slice(0, 2), A);
+    const others = facesOf(op.fixed, s.creaseDeg).filter(r => regionSig(r.list) !== regionSig(m.regionB));
+    for (const r of others.slice(0, 5)) {
+      const B0 = regionSamples(tB, m.Mb, r.list, { nSurf: 50, nEdge: 20, bvh: false });
+      if (Math.min(B0.area, clickedArea) / Math.max(B0.area, clickedArea) < 0.5) continue;
+      await nextFrame(); tryFace(r.list, `another face (${B0.area.toFixed(0)} mm²)`, true);
+    }
+    // the clicked faces don't fit well: maybe the click missed a narrow mating face. Look at every face.
+    const scored = results.map(r => ({ r, v: matchVerdict({ ...r, inside: insideFraction(op.child.geometry, m.Ma, r.T, op.fixed.geometry, m.Mb, 0.1, 250) }) }));
+    results.push(...seated);
+    if (!seated.some(r => seatGood(r.seated, clickedArea)) && !scored.some(x => x.v.good)) {
+      toast("The faces you clicked don't fit closely. Searching every face of both parts…");
+      results.push(...await searchFits(op, t => toast(t)));
+    }
+    finishMatch(op, results);
+  } catch (err) { console.error(err); toast("Couldn't match those faces. Try clicking nearer the middle of each mating face.", 'bad'); clearFx(); }
+}
+const seatGood = (st, area) => st && st.contact >= Math.max(0.5, 0.25 * area) && st.sunk < st.contact * 0.6;
+async function seatMatches(op, fits, A, spins = [Math.PI, 0.35], extra = {}) {
+  const m = op.match, out = [];
+  const rr = Math.max(regionRadius(op.child, m.Ma, m.regionA), regionRadius(op.fixed, m.Mb, m.regionB)), R = seatRadius(op, rr);
+  for (const r of fits) for (const spinRange of spins) {
+    await nextFrame();
+    let st = null;
+    try { st = seatSolve(op.child.geometry, r.T.clone().multiply(m.Ma), op.fixed.geometry, m.Mb, { o: r.joint, z: r.axis }, { R, spinRange, ...extra }); } catch (e) { console.error(e); }
+    if (!st) continue;
+    out.push({ ...r, T: st.T.clone().multiply(r.T), joint: r.joint.clone().applyMatrix4(st.T), seated: st, slides: false,
+               coverage: Math.min(1, st.contact / Math.max(A.area, 1e-6)), seatArea: A.area, label: (spinRange < 1 ? 'settled in place' : 'seated') + ' · ' + (r.label.startsWith('your ') ? r.label.slice(5) : 'faces') });
+  }
+  // a surface fit that already sits as well as its seated version keeps its exact pose
+  for (const r of fits) {
+    let st0 = null;
+    try { st0 = seatSolve(op.child.geometry, r.T.clone().multiply(m.Ma), op.fixed.geometry, m.Mb, { o: r.joint, z: r.axis }, { R, spinRange: 0, shift: 0, tilt: 0 }); } catch (e) { console.error(e); }
+    const best = Math.max(...out.filter(x => x.sig === r.sig).map(x => x.seated.score), -Infinity);
+    if (st0 && st0.score >= best * 0.97 - 1e-9) out.push({ ...r, seated: { ...st0, theta: 0, dx: 0, dy: 0, dz: 0 }, slides: false, seatArea: A.area,
+      coverage: Math.min(1, st0.contact / Math.max(A.area, 1e-6)), label: 'as matched · ' + (r.label.startsWith('your ') ? r.label.slice(5) : 'faces'), exact: true });
+  }
+  out.sort((p, q) => (q.seated.score + (q.exact ? q.seated.score * 0.03 : 0)) - (p.seated.score + (p.exact ? p.seated.score * 0.03 : 0)));
+  // seated fits rank above the bare surface fits, unless none of them actually seats (then a search may find better)
+  const any = out.some(r => seatGood(r.seated, A.area));
+  out.forEach((r, k) => { r.score = (any ? -10 : 10) + k * 0.01; });
+  return out;
+}
+function finishMatch(op, results, keepChoice) {
+  const m = op.match;
+  for (const r of results) if (r.inside == null) {
+    r.inside = m.targets ? Math.max(...m.targets.map(t => insideFraction(op.child.geometry, m.Ma, r.T, t.mesh.geometry, t.M))) : insideFraction(op.child.geometry, m.Ma, r.T, op.fixed.geometry, m.Mb);
+    if (!r.seated) r.score += r.inside * 4;                   // a seat already weighs any overlap
+  }
+  const seen = new Set(), list = results.sort((a, b) => a.score - b.score).filter(r => {
+    const key = r.sig + '|' + V().setFromMatrixPosition(r.T).toArray().map(v => v.toFixed(1)).join() + '|' + new THREE.Quaternion().setFromRotationMatrix(r.T).toArray().map(v => v.toFixed(2)).join();
+    if (seen.has(key)) return false; seen.add(key); return true; })
+    .filter((r, k, all) => {                                       // keep only fits worth trying
+      if (k === 0) return true;
+      if (r.seated) return r.seated.score > all[0].seated?.score * 0.6 || !all[0].seated;
+      const bestBare = all.find(x => !x.seated);
+      return r === bestBare || (r.coverage >= 0.2 && r.inside < 0.1 && r.score < bestBare.score + 0.12);
+    }).slice(0, 5);
+  if (!list.length) { toast("Couldn't find a fit between those faces.", 'bad'); clearFx(); return; }
+  op.match.results = list; op.match.chosen = 0;
+  if (lastOp === op) { rerunLast(); }
+  else { const ok = runOp(op); if (!ok) { clearFx(); return; } pushUndo(op.before); lastOp = op; select(op.child); }
+  showAdjust(); flashMatch();
+  const b = list[0];
+  toast(matchVerdict(b).good ? `Fitted: ${matchVerdict(b).text}` : `Best fit is loose: ${matchVerdict(b).text}. Check the other fits in Adjust.`, matchVerdict(b).good ? 'ok' : 'bad');
+}
+/** How well a Lucky guess locks in, in words: a peg in its socket is held every way but out; a part resting on a curve isn't. */
+function lockWords(l) { return l >= 0.88 ? 'locks in' : ''; }
+function matchVerdict(r) {
+  if (r.lucky) { const { contact, sunk } = r.lucky;
+    return { text: `${contact.toFixed(1)} mm² sitting flush` + (sunk >= 0.05 ? `, ${sunk.toFixed(1)} mm² overlapping` : ', nothing overlapping') + (lockWords(r.lucky.lock ?? 0) ? `, ${lockWords(r.lucky.lock)}` : ''), good: contact >= 2 && sunk < Math.max(0.3, contact * 0.05) }; }
+  if (r.seated) return { text: `seated: ${seatSummary(r.seated)}`, good: seatGood(r.seated, r.seatArea || 0) };
+  const parts = [`typical gap ${r.gap.toFixed(2)} mm`, `${Math.round(r.coverage * 100)}% within ${r.covTol.toFixed(2)} mm`];
+  if (r.ringErr != null) parts.push(`${r.rings > 1 ? 'pegs and holes' : 'peg and hole'} within ${r.ringErr.toFixed(2)} mm`);
+  if (r.edgeErr != null) parts.push(`outlines within ${r.edgeErr.toFixed(2)} mm`);
+  if (r.inside > 0.03) parts.push(`${Math.round(r.inside * 100)}% of it inside the other part`);
+  const good = r.coverage > 0.6 && r.gap < 0.2 && (r.edgeErr == null || r.edgeErr < Math.max(0.3, r.size * 0.1)) && (r.ringErr == null || r.ringErr < 0.3) && !(r.inside > 0.03);
+  return { text: parts.join(', '), good };
+}
+function flashMatch() {
+  const op = lastOp; if (!op?.match?.results.length) return;
+  const r = op.match.results[op.match.chosen]; clearFx(); scene.updateMatrixWorld(true);
+  showRegion(op.child, r.regionA, '#4db4dc');
+  if (op.match.targets) op.match.targets.forEach(t => showRegion(t.mesh, t.region, '#e2804f')); else showRegion(op.fixed, r.regionB, '#e2804f');
+  clearTimeout(flashCentres.t); flashCentres.t = setTimeout(clearFx, 1600);
+}
+/** Every candidate face of one part against every candidate face of the other. Returns fits. */
+async function searchFits(op, progress) {
+  const s = settings(), tA = topoOf(op.child), tB = topoOf(op.fixed), m = op.match;
+  progress('Finding the faces of both parts…'); await nextFrame();
+  const fa = [...facesOf(op.child, s.creaseDeg)], fb = [...facesOf(op.fixed, s.creaseDeg)];
+  if (!fa.some(r => regionSig(r.list) === regionSig(m.regionA))) fa.unshift({ list: m.regionA });
+  const sa = fa.map(r => regionSamples(tA, m.Ma, r.list, { nSurf: 500, nEdge: 160 })), sb = fb.map(r => regionSamples(tB, m.Mb, r.list, { nSurf: 500, nEdge: 160 }));
+  const pairs = []; sa.forEach((a, i) => sb.forEach((b, j) => { const k = Math.min(a.area, b.area) / Math.max(a.area, b.area);
+    if (k >= 0.4) pairs.push({ i, j, k: k * Math.sqrt((fa[i].rank || fa[i].area) / Math.max(fa[i].area, 1e-9) * (fb[j].rank || fb[j].area) / Math.max(fb[j].area, 1e-9)) }); }));
+  pairs.sort((x, y) => y.k - x.k);
+  const quick = []; let n = 0; const N = Math.min(pairs.length, 12);
+  for (const pr of pairs.slice(0, N)) {
+    progress(`Searching every face for a fit… ${++n} of ${N}`); await nextFrame();
+    const f = matchRegions(sa[pr.i], sb[pr.j], { iters: 8, starts: 2 })[0];
+    if (f) { f.inside = insideFraction(op.child.geometry, m.Ma, f.T, op.fixed.geometry, m.Mb, 0.1, 250); quick.push({ ...pr, f, s: f.score + f.inside * 4 }); }
+  }
+  quick.sort((x, y) => x.s - y.s);
+  const out = [];
+  for (const q of quick.slice(0, 3)) {
+    await nextFrame();
+    const A = regionSamples(tA, m.Ma, sa[q.i].list), B = regionSamples(tB, m.Mb, sb[q.j].list);
+    for (const r of matchRegions(A, B).slice(0, 2)) out.push(matchResultFrom(r, A, B, `found by search (${A.area.toFixed(0)} ↔ ${B.area.toFixed(0)} mm²)`, sb[q.j].list));
+  }
+  return out;
+}
+async function searchAllFaces() {
+  if (lastOp?.match?.targets) { toast('Search all faces works between two parts. Pick areas on just one fixed part to use it.', 'bad'); return; }
+  const op = lastOp; if (!op || op.mode !== 'MATCH') return;
+  $('adj-search').disabled = true;
+  try { const more = await searchFits(op, t => toast(t)); finishMatch(op, [...op.match.results, ...more]); }
+  catch (err) { console.error(err); toast("The search didn't finish. Try clicking the mating faces instead.", 'bad'); }
+  $('adj-search').disabled = false;
+}
+
+// ---------------------------------------------------------------------------
+// Do ya feel lucky?: click two parts and the bench works out how they fit
+// ---------------------------------------------------------------------------
+const LUCKY_EFFORT = { quick: 0.5, normal: 1, thorough: 2 };
+/** A part's triangles in world millimetres (mirrored parts get their winding flipped so faces still point out). */
+function worldCopy(m) {
+  m.updateMatrixWorld(true);
+  const g = m.geometry, p = g.attributes.position.array, e = m.matrixWorld.elements, out = new Float32Array(p.length);
+  for (let i = 0; i < p.length; i += 3) { const x = p[i], y = p[i + 1], z = p[i + 2];
+    out[i] = e[0] * x + e[4] * y + e[8] * z + e[12]; out[i + 1] = e[1] * x + e[5] * y + e[9] * z + e[13]; out[i + 2] = e[2] * x + e[6] * y + e[10] * z + e[14]; }
+  let idx = g.index ? g.index.array.slice() : null;
+  if (m.matrixWorld.determinant() < 0) {
+    const src = idx || Uint32Array.from({ length: p.length / 3 }, (_, i) => i); idx = new Uint32Array(src.length);
+    for (let t = 0; t < src.length; t += 3) { idx[t] = src[t]; idx[t + 1] = src[t + 2]; idx[t + 2] = src[t + 1]; }
+  }
+  return { pos: out, idx };
+}
+/**
+ * Every way `child` could sit on `fixed`, best first. The work is split between background helpers, one per
+ * spare processor core; if the browser won't start them, it runs here in small steps instead.
+ */
+async function luckySearch(child, fixed, effort, progress) {
+  const A = worldCopy(child), B = worldCopy(fixed), opts = { effort };
+  let stopped = false, stopNow; const stopP = new Promise((_, rej) => { stopNow = () => rej(new Error('stopped')); });
+  const phase = pr => Promise.race([pr, stopP]);
+  const n = Math.max(1, Math.min((navigator.hardwareConcurrency || 4) - 1, navigator.deviceMemory && navigator.deviceMemory <= 4 ? 2 : 6));
+  let workers = [];
+  try { for (let i = 0; i < n; i++) workers.push(new Worker(new URL('./lucky-worker.js', import.meta.url), { type: 'module' })); }
+  catch (e) { workers.forEach(w => w.terminate()); workers = []; }
+  luckyStop = () => { stopped = true; workers.forEach(w => w.terminate()); stopNow(); };
+  try {
+    if (!workers.length) return await phase(luckyHere(A, B, opts, progress, () => stopped));
+    const ask = (w, msg, until, onMsg) => new Promise((res, rej) => {
+      w.onmessage = e => { const d = e.data; if (d.type === 'error') rej(new Error(d.message)); else if (d.type === until) res(d); else onMsg?.(d); };
+      w.onerror = ev => { ev.preventDefault?.(); rej(new Error(ev.message || 'A search helper failed to start.')); };
+      w.postMessage(msg);
+    });
+    progress(0.01, `Measuring ${fixed.name}…`);
+    let ctx;
+    try { ({ ctx } = await phase(ask(workers[0], { type: 'prepare', A, B, opts }, 'ctx', d => { if (d.type === 'tick') progress(0.08 * d.f, `Measuring ${fixed.name}…`); }))); }
+    catch (e) { if (stopped) throw e; console.warn('Search helpers unavailable, searching on the page instead:', e); workers.forEach(w => w.terminate()); workers = []; return await phase(luckyHere(A, B, opts, progress, () => stopped)); }
+    await phase(Promise.all(workers.slice(1).map(w => ask(w, { type: 'ctx', ctx }, 'ready'))));
+    const lists = workers.map((_, i) => [...ctx.anchors.keys()].filter(a => a % workers.length === i)), done = workers.map(() => 0);
+    const found = await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'search', list: lists[i] }, 'found', d => {
+      if (d.type === 'progress') { done[i] = d.f; progress(0.1 + 0.72 * done.reduce((a, b) => a + b, 0) / workers.length, `Trying every way ${child.name} could sit on ${fixed.name}…`); } }))));
+    progress(0.83, 'Settling the best few into place…');
+    const starts = Lucky.pickStarts(ctx, found.flatMap(f => f.mine), found.flatMap(f => f.best), Math.round(900 * Math.sqrt(effort)));
+    const chunks = workers.map((_, i) => starts.filter((s2, k) => k % workers.length === i));
+    const refined = (await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'refine', starts: chunks[i] }, 'refined'))))).flatMap(r => r.out);
+    // pegs that landed a little off their sockets (wedged: touching but partly sunk): grid-seat them, shared out
+    progress(0.88, 'Seating pegs in their sockets…');
+    const wed = Lucky.wedged(ctx, refined);
+    const seated = (await phase(Promise.all(workers.map((w, i) => ask(w, { type: 'seat', wedged: wed.filter((_, k) => k % workers.length === i) }, 'seated'))))).flatMap(r => r.out);
+    refined.push(...seated);
+    progress(0.93, 'Settling the best few into place…');
+    const { fits } = await phase(ask(workers[0], { type: 'rank', refined, max: 6 }, 'ranked'));
+    progress(0.97, 'Marking where they touch…');
+    const { res } = await phase(ask(workers[0], { type: 'contact', fits: fits.map(f => ({ R: f.R, t: f.t })) }, 'contact'));
+    fits.forEach((f, k) => Object.assign(f, res[k]));
+    return fits;
+  } finally { workers.forEach(w => w.terminate()); luckyStop = null; }
+}
+/** The same search on the page itself, a little at a time so the page keeps drawing. */
+async function luckyHere(A, B, opts, progress, stopped) {
+  progress(0.02, 'Measuring…'); await nextFrame();
+  const ctx = Lucky.prepare(A, B, opts), mine = [], best = [], all = [...ctx.anchors.keys()];
+  for (let i = 0; i < all.length; i++) {
+    if (stopped()) throw new Error('stopped');
+    const r = Lucky.searchAnchors(ctx, [all[i]]); mine.push(...r.mine); best.push(...r.best);
+    best.sort((x, y) => y.score - x.score); best.length = Math.min(best.length, ctx.params.keep);
+    progress(0.1 + 0.72 * i / all.length, 'Trying every way they could fit…'); await nextFrame();
+  }
+  const starts = Lucky.pickStarts(ctx, mine, best, Math.round(900 * Math.sqrt(opts.effort || 1))), refined = [];
+  for (let i = 0; i < starts.length; i += 25) {
+    if (stopped()) throw new Error('stopped');
+    refined.push(...Lucky.refineAll(ctx, starts.slice(i, i + 25))); progress(0.83 + 0.13 * i / starts.length, 'Settling the best few into place…'); await nextFrame();
+  }
+  progress(0.9, 'Seating pegs in their sockets…'); await nextFrame();
+  const wed = Lucky.wedged(ctx, refined);
+  for (let i = 0; i < wed.length; i += 40) { if (stopped()) throw new Error('stopped'); refined.push(...wed.slice(i, i + 40).map(o => Lucky.gridSeat(ctx, o))); await nextFrame(); }
+  const fits = Lucky.rankFits(ctx, refined, 6);
+  fits.forEach(f => Object.assign(f, Lucky.contactOf(ctx, f, A, B)));
+  return fits;
+}
+function luckyResult(f, k) {
+  const R = f.R, t = f.t;
+  const T = new THREE.Matrix4().set(R[0], R[1], R[2], t[0], R[3], R[4], R[5], t[1], R[6], R[7], R[8], t[2], 0, 0, 0, 1);
+  return { T, joint: V(...f.joint), axis: V(...f.axis).normalize(), label: k ? `guess ${k + 1}` : 'best guess', regionA: f.regionA, regionB: f.regionB,
+           sig: 'lucky' + k, lucky: { contact: f.contact, sunk: f.sunk, lock: f.lock ?? null }, coverage: 1, covTol: 0, gap: 0, size: 1, inside: 0, score: -f.score };
+}
+function handleLuckyClick(hit) {
+  if (!hit) { toast(luckyFirst ? `Missed. Click the part ${luckyFirst.name} fits onto.` : 'Missed. Click the part that moves.'); return; }
+  const m = hit.object;
+  if (!luckyFirst) { luckyFirst = m; select(m); updateStep(); return; }
+  if (m === luckyFirst) { toast(`That's ${m.name} again. Click the part it fits onto.`, 'bad'); return; }
+  const a = luckyFirst; luckyFirst = null; updateStep(); feelLucky(a, m);
+}
+async function feelLucky(child, fixed) {
+  if (luckyStop) { toast('Already searching. Wait for it, or Stop it first.', 'bad'); return; }
+  const how = await askLink(child, 'Fit', { fixed });
+  if (!how) { toast('Cancelled. Nothing moved.'); updateStep(); return; }
+  scene.updateMatrixWorld(true);
+  const op = { mode: 'MATCH', child, fixed, a: [{ point: worldBox(child).getCenter(V()), normal: V(0, 0, 1) }], b: [{ point: worldBox(fixed).getCenter(V()), normal: V(0, 0, 1) }],
+    p: { spin: 0, gap: 0, flip: false, across: false, attach: defaultAttach(child, fixed), centre: lastCentre, offset: [0, 0, 0], frame: lastFrame, pivot: lastPivot, seat: lastSeat, rail: 'z', railEnds: false }, before: snapshot() };
+  op.reroot = how === 'group';
+  op.match = { lucky: true, regionA: [], regionB: [], groupsA: [], groupsB: [], Ma: child.matrixWorld.clone(), Mb: fixed.matrixWorld.clone(), results: [], chosen: 0, flat: false };
+  await startLucky(op);
+}
+async function startLucky(op) {
+  const effort = LUCKY_EFFORT[$('lucky-effort').value] || 1;
+  loading.show('Do ya feel lucky?'); loading.onStop(() => luckyStop?.());
+  let fits = null;
+  try { fits = await luckySearch(op.child, op.fixed, effort, (f, text) => loading.set(f, text)); }
+  catch (e) { loading.hide(); if (e.message === 'stopped') toast('Stopped. Nothing moved.'); else { console.error(e); toast("The search didn't finish. Try Quick in the options bar, or fit them with Match.", 'bad'); } return; }
+  loading.hide();
+  if (!fits.length) { toast(`Couldn't find a way ${op.child.name} sits on ${op.fixed.name}. Do they touch when assembled?`, 'bad'); return; }
+  const results = fits.map(luckyResult), b0 = results[0];
+  op.match.results = results; op.match.chosen = 0; op.match.regionA = b0.regionA; op.match.regionB = b0.regionB;
+  op.a = [{ point: b0.joint.clone().applyMatrix4(b0.T.clone().invert()), normal: b0.axis.clone().negate() }]; op.b = [{ point: b0.joint.clone(), normal: b0.axis.clone() }];
+  if (lastOp === op) rerunLast();
+  else { if (!runOp(op)) return; pushUndo(op.before); lastOp = op; select(op.child); }
+  showAdjust(); flashMatch();
+  const lead = results[1] ? results[0].lucky.contact - 5 * results[0].lucky.sunk - (results[1].lucky.contact - 5 * results[1].lucky.sunk) : Infinity;
+  const v = matchVerdict(b0);
+  toast(!v.good ? `Best guess is loose: ${v.text}. Check the other guesses in Adjust.`
+    : lead < 2 ? `Lucky? Maybe: ${v.text}, but guess 2 is close behind. Compare them in Adjust.` : `Feeling lucky: ${v.text}.`, v.good && lead >= 2 ? 'ok' : v.good ? '' : 'bad');
+}
+
+// ---------------------------------------------------------------------------
+// Mirror and array: mirrored copies, copies along a line, copies round an axis (each with everything attached)
+// ---------------------------------------------------------------------------
+const marr = { mode: 'mirror', roots: [], picked: null, picking: false };
+const marrGhost = new THREE.Group(); scene.add(marrGhost);
+const ghostMat = new THREE.MeshBasicMaterial({ color: '#7fb6d6', transparent: true, opacity: 0.32, depthWrite: false, side: THREE.DoubleSide });
+/** "Right Arm" ↔ "Left Arm", "Pauldron_L" ↔ "Pauldron_R"; anything else gets "(mirror)". */
+function mirrorName(n) {
+  const sw = { left: 'right', right: 'left', Left: 'Right', Right: 'Left', LEFT: 'RIGHT', RIGHT: 'LEFT' };
+  let out = n.replace(/\b(left|right|Left|Right|LEFT|RIGHT)\b/g, w => sw[w]);
+  if (out === n) out = n.replace(/([ _\-.])([LR])(?=$|[ _\-.\d])/g, (m0, sep, c) => sep + (c === 'L' ? 'R' : 'L'));
+  return out === n ? `${n} (mirror)` : out;
+}
+/** A mesh flipped across its own middle, square to an axis ('x', 'y' or 'z'), turned inside out the right way. */
+function mirroredGeometry(g, axis = 'x') {
+  const k = { x: 0, y: 1, z: 2 }[axis] ?? 0, out = g.clone(); if (!g.boundingBox) g.computeBoundingBox();
+  const c = g.boundingBox.min.getComponent(k) + g.boundingBox.max.getComponent(k), p = out.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setComponent(i, k, c - p.getComponent(i, k));
+  p.needsUpdate = true; out.deleteAttribute('normal');
+  const ix = out.index.array; for (let t = 0; t < ix.length; t += 3) { const q = ix[t + 1]; ix[t + 1] = ix[t + 2]; ix[t + 2] = q; }
+  out.boundingBox = null; out.boundsTree = null; out.computeBoundingBox(); out.computeBoundsTree();
+  return out;
+}
+/** What a file's mirrored copy is called: "Arm_L" → "Arm_R"; "Pad" (mirror for right arm) → "Pad (right arm)". */
+function mirrorCopyName(name, forName) {
+  const n = mirrorName(name);
+  return forName && n.endsWith(' (mirror)') ? `${name} (${forName})` : n;
+}
+/** The next free numbered name: "Rivet" → "Rivet 2", "Rivet 3" → "Rivet 4" (whatever's taken). */
+function nextName(n) {
+  const base = n.replace(/ \d+$/, ''), esc = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), re = new RegExp('^' + esc + ' (\\d+)$');
+  let k = 1; for (const m of liveParts()) { const mm = m.name.match(re); if (mm) k = Math.max(k, +mm[1]); }
+  return `${base} ${k + 1}`;
+}
+/** A copy of one part: same mesh (shared), its own colour, fill and brushed paint. */
+function clonePartAlone(m, name) {
+  const pt = m.userData.part, c = addPart(name, m.geometry, { welded: true, geomKey: pt.geomKey, color: pt.color }), ct = c.userData.part;
+  ct.topo = pt.topo; ct.fill = pt.fill || null; if (pt.prim && !pt.mods?.length) ct.prim = { ...pt.prim }; if (pt.axes) ct.axes = [...pt.axes]; if (pt.pivot) ct.pivot = [...pt.pivot];
+  if (pt.paint) { ownGeometry(c); ct.paint = pt.paint.slice(); ct.paintVer = 1; }
+  refreshPaint(c); c.visible = m.visible;
+  return c;
+}
+/** A copy of a part and everything attached to it, joints and all (the chosen option of a slot only). */
+function cloneTree(root, rename) {
+  const rec = m => {
+    const c = clonePartAlone(m, rename(m.name));
+    for (const k of liveParts().filter(x => parentPart(x) === m && !x.userData.optOff)) {
+      const kc = rec(k), j = jointOf(k);
+      if (j) { const jd = j.userData.joint, nj = makeJoint(jd.size); Object.assign(nj.userData.joint, { ...jd, rest: jd.rest.clone(), restPos: jd.restPos.clone(), long: jd.long?.clone() });
+        nj.position.copy(j.position); nj.quaternion.copy(j.quaternion); c.add(nj); nj.add(kc); }
+      else c.add(kc);
+      kc.position.copy(k.position); kc.quaternion.copy(k.quaternion); kc.scale.copy(k.scale);
+    }
+    return c;
+  };
+  return rec(root);
+}
+/** Hang `part` where `orig` hangs, as `T` would carry that connection (a mirrored or turned joint, same type and limits). */
+function attachLike(part, orig, T, info) {
+  const par = info.par; if (!par) return;
+  if (info.type === 'fixed') { par.attach(part); return; }
+  const jp = info.jp.clone().applyMatrix4(T), ax = info.jz.clone().transformDirection(T);
+  attach(part, par, 'joint', jp, ax);
+  const nj = jointOf(part); if (!nj) return;
+  Object.assign(nj.userData.joint, { type: info.type, min: info.min, max: info.max, axis: info.type === 'pinned' ? null : 'joint' });
+}
+function linkInfo(m) {
+  const par = parentPart(m), j = jointOf(m); scene.updateMatrixWorld(true);
+  return { par, type: linkTypeOf(m) || 'fixed', jp: j ? V().setFromMatrixPosition(j.matrixWorld) : null, jz: j ? V(0, 0, 1).transformDirection(j.matrixWorld) : null, min: j?.userData.joint.min ?? null, max: j?.userData.joint.max ?? null };
+}
+const marrParts = () => [...new Set(marr.roots.flatMap(subtreeParts))].filter(m => m.visible);
+/** The centre choices: [value, label, point]. */
+function marrPivots() {
+  const r0 = marr.roots[0], own = new Set(marrParts()), out = [['self', 'Its own centre', sceneBox(marrParts()).getCenter(V())]];
+  const par = parentPart(r0); if (par) out.push(['parent', `${par.name} (what it's attached to)`, worldBox(par).getCenter(V())]);
+  const j = jointOf(r0); if (j) out.push(['joint', 'Its joint', V().setFromMatrixPosition(j.matrixWorld)]);
+  if (marr.picked) out.push(['pick', 'The spot you picked', marr.picked.clone()]);
+  out.push(['origin', 'World origin', V()]);
+  for (const m of liveParts()) if (!own.has(m) && m !== par && m.visible) out.push(['part:' + m.uuid, m.name, worldBox(m).getCenter(V())]);
+  return out;
+}
+/** The axis choices: [value, label, direction]. */
+function marrAxes() {
+  const r0 = marr.roots[0], out = [['x', 'X (left–right)', V(1, 0, 0)], ['y', 'Y (front–back)', V(0, 1, 0)], ['z', 'Z (up–down)', V(0, 0, 1)], ['view', 'The view direction', fwd()]];
+  const j = jointOf(r0); if (j) { j.updateMatrixWorld(true); out.push(['joint', 'Its joint axis', V(0, 0, 1).transformDirection(j.matrixWorld)]); }
+  const pv = $('ma-pivot').value, pp = pv === 'parent' ? parentPart(r0) : pv.startsWith('part:') ? partByUuid(pv.slice(5)) : null;
+  if (pp) for (const a of ['x', 'y', 'z']) out.push(['p' + a, `${pp.name}'s ${a.toUpperCase()}`, partAxis(pp, a)]);
+  return out;
+}
+function fillSelect(sel, opts, keep) { const v = keep ?? sel.value; sel.innerHTML = ''; for (const [k, t] of opts) { const o = document.createElement('option'); o.value = k; o.textContent = t; sel.append(o); } if (opts.some(o => o[0] === v)) sel.value = v; }
+/** The transforms (world) that make each copy (or, mirroring in place, move the original). */
+function marrTransforms() {
+  const pv = marrPivots().find(o => o[0] === $('ma-pivot').value) || marrPivots()[0], c = pv[2];
+  const ax = (marrAxes().find(o => o[0] === $('ma-axis').value) || marrAxes()[0])[2].clone().normalize();
+  if (marr.mode === 'mirror') {
+    const n = ax, R = new THREE.Matrix4().set(1 - 2 * n.x * n.x, -2 * n.x * n.y, -2 * n.x * n.z, 0, -2 * n.y * n.x, 1 - 2 * n.y * n.y, -2 * n.y * n.z, 0, -2 * n.z * n.x, -2 * n.z * n.y, 1 - 2 * n.z * n.z, 0, 0, 0, 0, 1);
+    return [Tr(c).multiply(R).multiply(Tr(c.clone().negate()))];
+  }
+  const count = Math.max(1, Math.min(200, Math.round(+$('ma-count').value || 1))), out = [];
+  if (marr.mode === 'linear') { const d = V(+$('ma-dx').value || 0, +$('ma-dy').value || 0, +$('ma-dz').value || 0); for (let k = 1; k <= count; k++) out.push(Tr(d.clone().multiplyScalar(k))); return out; }
+  const A = (+$('ma-angle').value || 360) * Math.PI / 180, full = Math.abs(A) >= 2 * Math.PI - 1e-6, step = full ? A / (count + 1) : A / count;
+  const c0 = sceneBox(marrParts()).getCenter(V());
+  for (let k = 1; k <= count; k++) {
+    const T = Tr(c).multiply(new THREE.Matrix4().makeRotationAxis(ax, step * k)).multiply(Tr(c.clone().negate()));
+    out.push($('ma-turn').checked ? T : Tr(c0.clone().applyMatrix4(T).sub(c0)));
+  }
+  return out;
+}
+function marrPreview() {
+  while (marrGhost.children.length) marrGhost.children.pop();
+  if ($('marr').hidden) return;
+  let Ts; try { Ts = marrTransforms(); } catch (e) { return; }
+  scene.updateMatrixWorld(true);
+  for (const T of Ts) for (const m of marrParts()) { const g = new THREE.Mesh(m.geometry, ghostMat); g.matrixAutoUpdate = false; g.matrix.copy(T).multiply(m.matrixWorld); g.renderOrder = 5; marrGhost.add(g); }
+  const n = Ts.length, what = marr.roots.length > 1 ? `${marr.roots.length} parts` : marr.roots[0].name, extra = marrParts().length - marr.roots.length;
+  $('ma-sum').textContent = `${what}${extra > 0 ? ` + ${extra} attached` : ''}`;
+  $('ma-apply').textContent = marr.mode === 'mirror' ? ($('ma-keep').checked ? 'Make mirrored copy' : 'Mirror it') : `Make ${n} cop${n === 1 ? 'y' : 'ies'}`;
+  $('ma-note').textContent = marr.mode === 'mirror' ? 'The plane goes through the centre, square to the axis. Blue shows where it goes.'
+    : marr.mode === 'linear' ? 'Each copy is one step further on. Blue shows where they go.'
+    : `${Math.abs(+$('ma-angle').value) >= 360 ? 'Evenly round a full turn, the original included.' : 'Spread up to the angle, the last copy at the end.'} Blue shows where they go.`;
+}
+function syncMarr() {
+  document.querySelectorAll('#ma-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === marr.mode)));
+  const m = marr.mode;
+  document.querySelectorAll('#marr .ma-mir').forEach(e => { e.hidden = m !== 'mirror'; });
+  document.querySelectorAll('#marr .ma-arr').forEach(e => { e.hidden = m === 'mirror'; });
+  document.querySelectorAll('#marr .ma-rad').forEach(e => { e.hidden = m !== 'radial'; });
+  document.querySelectorAll('#marr .ma-lin').forEach(e => { e.hidden = m !== 'linear'; });
+  for (const id of ['ma-pivot', 'ma-pivot-l', 'ma-axis', 'ma-axis-l', 'ma-pick']) $(id).hidden = m === 'linear';
+  $('ma-pivot-l').textContent = m === 'mirror' ? 'Through' : 'Around';
+  $('ma-axis-l').textContent = m === 'mirror' ? 'Across (square to)' : 'Axis';
+  fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)));
+  fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2)));
+  marrPreview();
+}
+function openMarr(mode = 'mirror') {
+  const roots = selection.length ? selectionRoots() : selected ? [selected] : [];
+  if (!roots.length) { toast('Select the parts to mirror or copy first (Ctrl-click for several).', 'bad'); return; }
+  if (!$('orient').hidden) closeOrient(); closeAutorig(false); lastOp = null; $('adjust').hidden = true; showFit();
+  marr.roots = roots; marr.picked = null; marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false');
+  marr.mode = mode === 'array' ? 'linear' : mode;
+  $('marr').hidden = false;
+  fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)), parentPart(roots[0]) ? 'parent' : 'self');
+  fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2)), marr.mode === 'radial' ? 'z' : 'x');
+  syncMarr();
+}
+function closeMarr() { $('marr').hidden = true; marr.picking = false; marrPreview(); }
+function applyMarr() {
+  const Ts = marrTransforms(); if (!Ts.length) return;
+  pushUndo(); lastOp = null; scene.updateMatrixWorld(true);
+  const made = [], attachOn = $('ma-attach').checked;
+  const infos = new Map(marr.roots.map(r => [r, linkInfo(r)]));
+  if (marr.mode === 'mirror' && !$('ma-keep').checked) {
+    const T = Ts[0];
+    for (const r of marr.roots) { const info = infos.get(r); detach(r); applyWorld(r, T); if (info.par) attachLike(r, r, T, info); }
+    closeMarr(); afterHierarchyChange(); selectMany(marr.roots);
+    toast(`Mirrored ${marr.roots.length > 1 ? `${marr.roots.length} parts` : marr.roots[0].name}.`, 'ok'); return;
+  }
+  Ts.forEach((T, k) => {
+    for (const r of marr.roots) {
+      const name = marr.mode === 'mirror' ? mirrorName : nextName;
+      const c = cloneTree(r, name); r.updateMatrixWorld(true);
+      setWorld(c, T.clone().multiply(r.matrixWorld));
+      if (attachOn) attachLike(c, r, T, infos.get(r));
+      made.push(c);
+    }
+  });
+  closeMarr(); afterHierarchyChange(); selectMany(made);
+  const n = made.length;
+  toast(marr.mode === 'mirror' ? `Made ${made.map(m => m.name).join(', ')}${attachOn && infos.get(marr.roots[0]).par ? `, attached to ${infos.get(marr.roots[0]).par.name}` : ''}.` : `Made ${n} cop${n === 1 ? 'y' : 'ies'}.`, 'ok');
+}
+function bindMarr() {
+  document.querySelectorAll('#ma-mode button').forEach(b => b.addEventListener('click', () => { marr.mode = b.dataset.v; fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2)), marr.mode === 'radial' ? 'z' : 'x'); syncMarr(); }));
+  $('ma-pivot').addEventListener('change', () => { fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2))); marrPreview(); });
+  for (const id of ['ma-axis', 'ma-count', 'ma-angle', 'ma-dx', 'ma-dy', 'ma-dz', 'ma-keep', 'ma-turn', 'ma-attach']) $(id).addEventListener('input', marrPreview);
+  $('ma-pick').addEventListener('click', () => { marr.picking = !marr.picking; $('ma-pick').setAttribute('aria-pressed', String(marr.picking)); if (marr.picking) toast('Click a spot on any part to use as the centre.'); });
+  $('ma-apply').addEventListener('click', applyMarr);
+  $('ma-cancel').addEventListener('click', closeMarr); $('ma-close').addEventListener('click', closeMarr);
+}
+
+// ---------------------------------------------------------------------------
+// Orient: lay a face flat, square a part or a seam to the X, Y, Z planes
+// ---------------------------------------------------------------------------
+const ori = { part: null, before: null, sources: [], p: { source: 0, target: '-z', square: true, spin: 0, ground: true, scope: 'assembly' } };
+function rootOf(part) { let r = part; while (parentPart(r)) r = parentPart(r); return r; }
+/** The seams in a part's assembly: every joint or fixed link between two parts. */
+function seamsAround(part) {
+  const out = [], root = rootOf(part);
+  for (const child of subtreeParts(root)) {
+    const parent = parentPart(child); if (!parent) continue;
+    const j = jointOf(child);
+    const frame = j || child;
+    frame.updateMatrixWorld(true);
+    const q = frame.getWorldQuaternion(new THREE.Quaternion()), c = V().setFromMatrixPosition(frame.matrixWorld);
+    const n = j ? V(0, 0, 1).applyQuaternion(q) : worldBox(child).getCenter(V()).sub(worldBox(parent).getCenter(V())).normalize();
+    const long = j?.userData.joint.long ? j.userData.joint.long.clone().applyQuaternion(q) : j ? V(1, 0, 0).applyQuaternion(q) : null;
+    out.push({ kind: 'seam', label: `Seam: ${child.name} ↔ ${parent.name}`, n, c, long, child });
+  }
+  return out;
+}
+function orientFromFace(hit) {
+  const mesh = hit.object, topo = topoOf(mesh); mesh.updateMatrixWorld(true);
+  const M = mesh.matrixWorld.clone(), r = pickSurface(topo, M, hit.faceIndex, hit.point, settings());
+  if (r.err) { toast(r.err, 'bad'); return; }
+  const pl = regionPlane(topo, r.region), n = worldNormal(M, pl.n), c = pl.p.clone().applyMatrix4(M);
+  showRegion(mesh, r.region, '#d6a24a'); clearTimeout(flashCentres.t); flashCentres.t = setTimeout(clearFx, 1200);
+  openOrient(mesh, { kind: 'face', label: `The ${r.kind} face you clicked (${(pl.A).toFixed(0)} mm²)`, n, c, long: faceLongAxis(topo, M, r.region, n) });
+}
+function openOrient(part, first) {
+  clearHover(); lastOp = null; $('adjust').hidden = true; showFit(); closeAutorig(false);
+  pushUndo(); ori.before = snapshot(); ori.part = part;
+  if (first.kind === 'auto' && !first.label) first.label = 'Square up automatically';
+  ori.sources = [first, ...(first.kind === 'auto' ? [] : [{ kind: 'auto', label: 'Square up automatically' }]), ...seamsAround(part).filter(sm => sm.label !== first.label)];
+  Object.assign(ori.p, { source: 0, spin: 0, target: first.kind === 'seam' ? '+z' : '-z' });
+  ori.selection = selection.length > 1 && selection.includes(part) ? selectionRoots() : null;
+  ori.p.scope = ori.selection ? 'selection' : ori.p.scope === 'selection' ? 'assembly' : ori.p.scope;
+  const sel = $('or-source'); sel.innerHTML = '';
+  ori.sources.forEach((sr, k) => { const o = document.createElement('option'); o.value = k; o.textContent = sr.label; sel.append(o); });
+  $('orient').hidden = false; if (!ori.selection) select(part);
+  applyOrient();
+}
+function applyOrient() {
+  const src = ori.sources[ori.p.source]; if (!src) return;
+  restore(ori.before);
+  const part = ori.part, objs = ori.p.scope === 'selection' && ori.selection ? ori.selection : [ori.p.scope === 'assembly' ? rootOf(part) : part];
+  const moving = [...new Set(objs.flatMap(subtreeParts))];
+  const spin = ori.p.spin * Math.PI / 180;
+  let R;
+  if (src.kind === 'auto') {
+    const dd = dominantDirections(ori.p.scope === 'part' ? [part] : moving), q = squareUpQuat(dd);
+    const c = sceneBox(moving).getCenter(V());
+    R = Tr(c).multiply(new THREE.Matrix4().makeRotationAxis(V(0, 0, 1), spin)).multiply(Tr(c.clone().negate())).multiply(rotAbout(q, c));
+  } else {
+    const target = AXES[ori.p.target], q = orientQuat(src.n, target, { inPlane: src.long, square: ori.p.square, spin });
+    R = rotAbout(q, src.c);
+  }
+  for (const o of objs) applyWorld(o, R);
+  if (ori.p.ground) { scene.updateMatrixWorld(true); const dz = -lowestZ(moving); for (const o of objs) applyWorld(o, Tr(V(0, 0, dz))); }
+  afterHierarchyChange();
+  renderOrient();
+}
+function renderOrient() {
+  const src = ori.sources[ori.p.source], auto = src?.kind === 'auto', seam = src?.kind === 'seam';
+  $('or-source').value = ori.p.source;
+  const root = rootOf(ori.part), n = subtreeParts(root).length;
+  $('or-sum').textContent = ori.p.scope === 'selection' && ori.selection ? `${ori.selection.length} selected parts` : ori.p.scope === 'assembly' && n > 1 ? `${root.name} + ${n - 1} attached` : ori.part.name;
+  $('or-scope-sel').hidden = !ori.selection;
+  $('or-target-f').hidden = auto; $('or-square-f').hidden = auto;
+  $('or-target-label').textContent = seam ? 'Point the seam (its facing)' : 'Point the face';
+  $('or-spin-label').textContent = auto ? 'Turn about Z (°)' : 'Turn about that axis (°)';
+  document.querySelectorAll('#or-target button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === ori.p.target ? 'true' : 'false'));
+  document.querySelectorAll('#or-scope button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === ori.p.scope ? 'true' : 'false'));
+  $('or-square').checked = ori.p.square; $('or-ground').checked = ori.p.ground;
+  if (document.activeElement !== $('or-spin')) $('or-spin').value = ori.p.spin;
+  $('or-note').textContent = auto ? 'Turns it the least it can so its biggest flat faces (or, on organic parts, its long directions) line up with X, Y and Z.'
+    : seam ? `Pointing the seam ${ori.p.target === '+z' || ori.p.target === '-z' ? 'up or down lays the plane the parts meet on flat' : 'along X or Y stands that plane upright'}.`
+    : ori.p.target === '-z' ? 'Lays this face flat on the grid.' : '';
+}
+function closeOrient() { $('orient').hidden = true; ori.before = null; }
+function bindOrient() {
+  $('or-source').addEventListener('change', () => { ori.p.source = +$('or-source').value; ori.p.spin = 0;
+    if (ori.sources[ori.p.source].kind === 'seam' && ori.p.target === '-z') ori.p.target = '+z'; applyOrient(); });
+  document.querySelectorAll('#or-target button').forEach(b => b.addEventListener('click', () => { ori.p.target = b.dataset.v; ori.p.spin = 0; applyOrient(); }));
+  document.querySelectorAll('#or-scope button').forEach(b => b.addEventListener('click', () => { ori.p.scope = b.dataset.v; applyOrient(); }));
+  $('or-square').addEventListener('change', () => { ori.p.square = $('or-square').checked; applyOrient(); });
+  $('or-ground').addEventListener('change', () => { ori.p.ground = $('or-ground').checked; applyOrient(); });
+  $('or-spin').addEventListener('change', () => { ori.p.spin = +$('or-spin').value || 0; applyOrient(); });
+  const turn = d => { ori.p.spin = ((ori.p.spin + d + 540) % 360) - 180; applyOrient(); };
+  $('or-m90').addEventListener('click', () => turn(-90)); $('or-p90').addEventListener('click', () => turn(90)); $('or-flip').addEventListener('click', () => turn(180));
+  $('or-done').addEventListener('click', () => { closeOrient(); toast('Oriented.', 'ok'); });
+  $('or-close').addEventListener('click', closeOrient);
+  $('or-revert').addEventListener('click', () => { restore(ori.before); afterHierarchyChange(); closeOrient(); toast('Put back where it was.'); });
+  $('adj-seam').addEventListener('click', () => {
+    const op = lastOp; if (!op?.seam) return;
+    const label = `Seam: ${op.child.name} ↔ ${op.fixed.name}`;
+    openOrient(op.child, { kind: 'seam', label, n: op.seam.n.clone(), c: op.seam.c.clone(), long: op.seam.long?.clone() || null });
+  });
+}
+
+let lastAttach = 'joint', lastCentre = 'auto', lastFrame = 'world', lastPivot = 'parent', lastSeat = true;
+const keepPick = q => ({ point: q.point.clone(), normal: q.normal.clone(), candidates: q.candidates, ringInfo: q.ringInfo, ringNear: q.ringNear, radius: q.radius, kind: q.kind, region: q.region });
+/** Can this snap close a loop instead of re-attaching? The moving part already hangs off something else. */
+function canLoop(child, fixed) { const par = parentPart(child); return !!par && par !== fixed && fixed !== child && !isDescendant(fixed, child); }
+let lastLoopAttach = 'rail';
+/** How a new snap attaches: re-attach as before, or, for a part already on a joint elsewhere (a piston in its socket), ride a rail on the new part. */
+function defaultAttach(child, fixed) {
+  if (canLoop(child, fixed)) return lastLoopAttach;
+  return lastAttach === 'rail' || lastAttach === 'link' ? 'joint' : lastAttach;
+}
+function resolvedOp(op) {
+  const res = e => ({ ...e, point: resolveCentre(e, op.p.centre).point.clone() });
+  return { ...op, a: op.a.map(res), b: op.b.map(res) };
+}
+/** The moving part's own contact point (before the snap): ball centre, face point, gap midpoint, point 1. */
+function childPoint(rop) { return rop.mode === 'MID' ? rop.a[0].point.clone().add(rop.a[1].point).multiplyScalar(0.5) : rop.a[0].point.clone(); }
+/** Joint axes for an op, worked out from the snap alone so nudges never tilt them. */
+function opBasis(op) { return jointBasis(op.baseAxis || V(0, 0, 1)); }
+function offsetWorld(op) {
+  const [x, y, z] = op.p.offset || [0, 0, 0];
+  if (op.p.frame !== 'joint') return V(x, y, z);
+  const { X, Y, Z } = opBasis(op);
+  return X.multiplyScalar(x).addScaledVector(Y, y).addScaledVector(Z, z);
+}
+/** Biggest distance from a picked region's middle to its edge (mm, world). */
+function regionRadius(mesh, M, list) {
+  const t = topoOf(mesh), v = V(), c = V(), step = Math.max(1, Math.floor(list.length / 4000)); let n = 0, r = 0;
+  for (let k = 0; k < list.length; k += step) { const i = list[k]; c.add(v.set(t.fc[3*i], t.fc[3*i+1], t.fc[3*i+2]).applyMatrix4(M)); n++; }
+  if (!n) return 0; c.multiplyScalar(1 / n);
+  for (let k = 0; k < list.length; k += step) { const i = list[k]; r = Math.max(r, v.set(t.fc[3*i], t.fc[3*i+1], t.fc[3*i+2]).applyMatrix4(M).distanceTo(c)); }
+  return r;
+}
+/** How much of the parts around the joint the seat looks at: the picked faces and a margin, so nearby notches and pegs count. */
+function seatRadius(op, rr) {
+  const d = Math.min(worldBox(op.child).getSize(V()).length(), worldBox(op.fixed).getSize(V()).length());
+  return Math.min(Math.max(2.5 * rr, 0.3 * d, 2), Math.max(0.5 * d, 2));
+}
+function seatSummary(st) {
+  const deg = st.theta * 180 / Math.PI, slide = Math.hypot(st.dx, st.dy);
+  const bits = [];
+  if (Math.abs(deg) >= 0.5) bits.push(`turned ${Math.abs(deg).toFixed(0)}°`);
+  if (slide >= 0.02) bits.push(`slid ${slide.toFixed(2)} mm`);
+  if (Math.abs(st.dz) >= 0.02) bits.push(st.dz < 0 ? `pushed in ${(-st.dz).toFixed(2)} mm` : `backed out ${st.dz.toFixed(2)} mm`);
+  return `${bits.length ? bits.join(', ') : 'already sat right'} · ${st.contact.toFixed(1)} mm² touching` + (st.sunk > 0.05 ? `, ${st.sunk.toFixed(1)} mm² pressed into each other` : '');
+}
+/** Face to face: after the faces meet, turn and slide the moving part about the joint until it fits best (cached per centre/flip choice). */
+function ensureSeat(op, rop) {
+  if (op.mode !== 'PLANE' || op.p.seat === false) return;
+  const key = `${op.p.flip}|${op.p.centre}`;
+  if (op.seatKey === key) return;
+  op.seatKey = key; op.seat = null;
+  op.child.updateWorldMatrix(true, false); op.fixed.updateWorldMatrix(true, false);
+  const base = computeSnap({ ...rop, p: { ...rop.p, spin: 0, gap: 0 }, seat: null }); if (base.err) return;
+  const rr = Math.max(regionRadius(op.child, op.child.matrixWorld, op.a[0].region || []), regionRadius(op.fixed, op.fixed.matrixWorld, op.b[0].region || []));
+  try {
+    const st = seatSolve(op.child.geometry, base.T.clone().multiply(op.child.matrixWorld), op.fixed.geometry, op.fixed.matrixWorld, { o: base.joint, z: base.axis }, { R: seatRadius(op, rr) });
+    if (st) op.seat = { T: st.T, joint: base.joint.clone().applyMatrix4(st.T), info: st };
+  } catch (e) { console.error(e); }
+}
+function runOp(op) {
+  if (op.reroot) { const e = reroot(op.child); if (e) { toast(e, 'bad'); op.reroot = false; } }   // the moving part leads its whole group
+  ensureSeat(op, resolvedOp(op));
+  const rop = resolvedOp(op); if (op.mode === 'PLANE' && op.p.seat === false) rop.seat = null;
+  const r = computeSnap(rop);
+  if (r.err) { toast(r.err, 'bad'); return false; }
+  let axis = r.axis;
+  if (!axis) {                           // ball: point the joint along the limb (measured before any nudge)
+    axis = worldBox(op.child).getCenter(V()).applyMatrix4(r.T).sub(r.joint);
+    if (axis.length() < 1e-6) axis = V(0, 0, 1);
+  }
+  op.baseAxis = axis.clone().normalize();
+  if ((op.p.attach === 'rail' || op.p.attach === 'link') && canLoop(op.child, op.fixed)) return runLinkOp(op, rop, r);
+  if (op.p.attach === 'rail' || op.p.attach === 'link') op.p.attach = 'joint';
+  const T = Tr(offsetWorld(op)).multiply(r.T);
+  const childPt = childPoint(rop).applyMatrix4(T);
+  const joint = op.p.pivot === 'child' ? childPt : r.joint.clone();
+  op.result = { ...r, T, joint, parentPoint: r.joint.clone(), childPoint: childPt };
+  applyWorld(op.child, T);
+  op.jointAxis = op.baseAxis.clone();
+  const warn = attach(op.child, op.fixed, op.p.attach, joint, axis);
+  if (warn) toast(warn, 'bad');
+  { const sl = slotOf(op.child); if (sl && parentPart(op.child)) shareSlotJoint(sl, op.child); }   // the other options follow onto this joint
+  op.seam = { n: axis.clone().normalize(), c: joint.clone(), long: null };
+  if (op.mode === 'MATCH' && op.match?.results.length) {      // the seam line's own direction, from the matched face
+    const m = op.match.results[op.match.chosen]; if (m.regionB?.length) op.seam.long = faceLongAxis(topoOf(op.fixed), op.match.Mb, m.regionB, op.seam.n);
+  }
+  const j = jointOf(op.child); if (j && op.seam.long) j.userData.joint.long = op.seam.long.clone().applyQuaternion(j.getWorldQuaternion(new THREE.Quaternion()).invert());
+  afterHierarchyChange();
+  return true;
+}
+
+/*
+ * Closing a loop with a snap (a piston already pinned in its socket, its other end going into a channel): the part keeps
+ * its own joint. It turns on that joint as close as it can to where the snap would put it, then gets a second
+ * connection to the part it was snapped to: a rail along the channel ('rail') or a pin ('link'). Posing then keeps
+ * both: the part turns in its socket and slides up and down the channel.
+ */
+function runLinkOp(op, rop, r) {
+  const child = op.child, fixed = op.fixed;
+  let j = jointOf(child);
+  if (!j || (j.userData.joint.type || 'pinned') === 'fixed') { setLinkType(child, 'pinned'); j = jointOf(child); }
+  if (!j) { toast(`${child.name} needs a joint on ${parentPart(child)?.name || 'its parent'} to move on.`, 'bad'); return false; }
+  scene.updateMatrixWorld(true);
+  const T = Tr(offsetWorld(op)).multiply(r.T), cp = childPoint(rop), target = cp.clone().applyMatrix4(T);
+  const cpLocal = cp.clone().applyMatrix4(child.matrixWorld.clone().invert());
+  // turn about the joint to best match where the snap would take it: its contact point counts most
+  const P = V().setFromMatrixPosition(j.matrixWorld), bb = exactBox(child), X = [], Y = [], w = [];
+  const add = (pt, wt) => { X.push(pt.clone().sub(P)); Y.push(pt.clone().applyMatrix4(T).sub(P)); w.push(wt); };
+  add(cp, 20); for (let i = 0; i < 8; i++) add(V(i & 1 ? bb.max.x : bb.min.x, i & 2 ? bb.max.y : bb.min.y, i & 4 ? bb.max.z : bb.min.z), 1);
+  const q = bestTurn(X, Y, w);
+  const pq = j.parent.getWorldQuaternion(new THREE.Quaternion()), jq = j.getWorldQuaternion(new THREE.Quaternion());
+  j.quaternion.copy(pq.invert().multiply(q.multiply(jq))); j.updateMatrixWorld(true); constrainJoint(j); scene.updateMatrixWorld(true);
+  // the connection: from the part's contact point to the target, along the channel
+  const kind = op.p.attach === 'rail' ? 'rail' : 'pin', inv = fixed.matrixWorld.clone().invert();
+  const l = { id: uid(), a: child.uuid, b: fixed.uuid, pa: cpLocal.toArray(), pb: target.clone().applyMatrix4(inv).toArray(), kind, axis: 'z', axisName: '', min: null, max: null };
+  let dir = null, info = '';
+  if (kind === 'rail') {
+    const d = railDirection(op, target); dir = d.dir; info = d.info;
+    l.axis = dir.clone().transformDirection(inv).normalize().toArray(); l.axisName = d.name;
+    if (op.p.railEnds !== false) { const ends = channelEnds(op, target, dir); if (ends) { l.min = ends.min; l.max = ends.max;
+      const fmt = v => v == null ? 'no end' : `${Math.abs(v).toFixed(1)} mm`; info += (info ? ' · ' : '') + `travel ${fmt(ends.min)} one way, ${fmt(ends.max)} the other`; } }
+  }
+  links.push(l);
+  const err = solveLinks(null, 80, [j]);
+  scene.updateMatrixWorld(true);
+  // a pinned part can still turn on the line from its joint to the connection without coming off it. A ball in a
+  // channel says nothing about that turn, so by default it faces away from the part it slides on (armour outward),
+  // then any turn asked for in Adjust goes on top
+  op.twistInfo = '';
+  if ((j.userData.joint.type || 'pinned') === 'pinned') {
+    const P = V().setFromMatrixPosition(j.matrixWorld), axisW = cpLocal.clone().applyMatrix4(child.matrixWorld).sub(P);
+    if (axisW.lengthSq() > 1e-8) {
+      axisW.normalize();
+      let turn = 0;
+      if (op.p.faceAway ?? op.mode === 'BALL') {
+        const c = partCentroid(child), mid = c.clone().add(target).multiplyScalar(0.5), R = 0.6 * worldBox(child).getSize(V()).length();
+        const near = trisNear(fixed, mid, R), t = topoOf(fixed), f = V(), v = V(); let A = 0;
+        for (const i of near) { const a = t.fa[i]; f.addScaledVector(v.set(t.fc[3 * i], t.fc[3 * i + 1], t.fc[3 * i + 2]).applyMatrix4(fixed.matrixWorld), a); A += a; }
+        if (A) {
+          f.multiplyScalar(1 / A);
+          const perp = x => x.sub(P).addScaledVector(axisW, -x.clone().sub(P).dot(axisW) + 0).projectOnPlane(axisW);
+          const u = perp(c.clone()), w = perp(f.clone()).negate();
+          if (u.lengthSq() > 1e-8 && w.lengthSq() > 1e-8) { turn = Math.atan2(u.clone().cross(w).dot(axisW), u.dot(w)); op.twistInfo = `turned ${Math.abs(turn * 180 / Math.PI).toFixed(0)}° on its axis to face away from ${fixed.name}`; }
+        }
+      }
+      turn += (op.p.twist || 0) * Math.PI / 180;
+      if (Math.abs(turn) > 1e-6) {
+        const qt = new THREE.Quaternion().setFromAxisAngle(axisW, turn), pq2 = j.parent.getWorldQuaternion(new THREE.Quaternion()), jq2 = j.getWorldQuaternion(new THREE.Quaternion());
+        j.quaternion.copy(pq2.invert().multiply(qt.multiply(jq2))); j.updateMatrixWorld(true); scene.updateMatrixWorld(true);
+      }
+    }
+  }
+  if (op.p.keepFacing !== false) setFacing(l);
+  const at = cpLocal.clone().applyMatrix4(child.matrixWorld);
+  op.result = { ...r, T, joint: target.clone(), parentPoint: target.clone(), childPoint: at, link: l.id };
+  op.jointAxis = (dir || op.baseAxis).clone(); op.baseAxis = op.jointAxis.clone();
+  op.linkNote = (kind === 'rail' ? `Rides a rail along ${l.axisName}` : 'Pinned to it as well') + (info ? ` (${info})` : '') + '.'
+    + (op.twistInfo ? ` It ${op.twistInfo}.` : '') + (err > 0.05 ? ` It can't quite reach on its joint: ${err.toFixed(2)} mm off. Check its joint is where it should be, or try "Pinned" to re-attach it instead.` : '');
+  op.seam = { n: op.jointAxis.clone(), c: target.clone(), long: null };
+  afterHierarchyChange();
+  return true;
+}
+/** Where a part's bulk is (the middle of its corners, world). */
+function partCentroid(m) {
+  const g = m.geometry, pos = g.attributes.position;
+  if (!g.userData.centroid) { const c = V(), v = V(), step = Math.max(1, Math.floor(pos.count / 50000)); let n = 0; for (let i = 0; i < pos.count; i += step) { c.add(v.fromBufferAttribute(pos, i)); n++; } g.userData.centroid = c.multiplyScalar(1 / n); }
+  m.updateMatrixWorld(true); return g.userData.centroid.clone().applyMatrix4(m.matrixWorld);
+}
+/** The turn (about the origin) that best takes the points X onto Y, weighted (Horn's quaternion method). */
+function bestTurn(X, Y, w) {
+  const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  X.forEach((x, i) => { const a = x.toArray(), b = Y[i].toArray(); for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) S[r][c] += w[i] * a[r] * b[c]; });
+  const [[xx, xy, xz], [yx, yy, yz], [zx, zy, zz]] = S;
+  const N = [[xx + yy + zz, yz - zy, zx - xz, xy - yx], [yz - zy, xx - yy - zz, xy + yx, zx + xz], [zx - xz, xy + yx, -xx + yy - zz, yz + zy], [xy - yx, zx + xz, yz + zy, -xx - yy + zz]];
+  const v = eigenSym(N)[0].vector;
+  return new THREE.Quaternion(v[1], v[2], v[3], v[0]).normalize();
+}
+/*
+ * Picking faces for a direction (a rail along a groove, a roller up a channel): click faces on one part, then take
+ * the direction along them, across them, or straight out of them. onDone gets { dir (world), name, mesh, axes, which }.
+ */
+let dirPick = null;
+function startDirPick(title, onDone, { mesh = null, onCancel = null } = {}) {
+  endDirPick(); cancelPick();
+  dirPick = { onDone, onCancel, regions: [], mesh };
+  $('dp-title').textContent = title; $('dirpick').hidden = false; syncDirPick();
+  toast(mesh ? `Click faces on ${mesh.name}.` : 'Click the faces that set the direction.');
+}
+function cancelDirPick() { const cb = dirPick?.onCancel; endDirPick(); toast('Cancelled picking faces.'); cb?.(); }
+function endDirPick() { if (!dirPick) return; dirPick = null; $('dirpick').hidden = true; clearFx(); }
+function dirPickList() { return [...new Set(dirPick.regions.flatMap(r => r.list))]; }
+function syncDirPick() {
+  const ax = dirPick.regions.length ? faceAxes(dirPick.regions[0].mesh, dirPickList()) : null;
+  dirPick.axes = ax;
+  ['along', 'across', 'out'].forEach(k => { $('dp-' + k).disabled = !ax; });
+  $('dp-note').textContent = !ax ? 'Click the faces that set the direction: a groove\'s walls and floor, or a flat strip. Click more to add; click one again to drop it. Esc cancels.'
+    : `${dirPick.regions.length} area${dirPick.regions.length > 1 ? 's' : ''} on ${dirPick.regions[0].mesh.name}, read as ${ax.kind === 'groove' ? 'a channel: Along runs down it' : ax.kind === 'flat' ? 'a flat face: Along is its long way' : ax.kind === 'strip' ? 'a long strip: Along runs the length of it' : 'a round surface: Along has no clear meaning, Out points from its middle'}.`;
+  clearFx(); for (const r of dirPick.regions) showRegion(r.mesh, r.list, '#d6a24a');
+  if (ax) {                                                   // the three directions, drawn from the faces' middle
+    const L = Math.max(2, Math.sqrt(ax.area) * 0.8), mk = (d, col) => { const g = new THREE.BufferGeometry().setFromPoints([ax.centre.clone().addScaledVector(d, -L), ax.centre.clone().addScaledVector(d, L)]);
+      const ln = new THREE.Line(g, new THREE.LineBasicMaterial({ color: col, depthTest: false })); ln.renderOrder = 999; fx.add(ln); };
+    mk(ax.along, '#f1d08f'); mk(ax.across, '#7fb3d9'); mk(ax.out, '#e2804f');
+  }
+}
+function dirPickClick(hit) {
+  if (!hit) { toast('Missed. Click on a part.'); return; }
+  const m = hit.object;
+  if (dirPick.mesh && m !== dirPick.mesh) { toast(`Click faces on ${dirPick.mesh.name}.`, 'bad'); return; }
+  if (dirPick.regions.length && m !== dirPick.regions[0].mesh) { toast(`Keep to one part: these faces are on ${dirPick.regions[0].mesh.name}.`, 'bad'); return; }
+  const had = dirPick.regions.findIndex(r => r.list.includes(hit.faceIndex));
+  if (had >= 0) { dirPick.regions.splice(had, 1); syncDirPick(); return; }
+  m.updateMatrixWorld(true);
+  const res = pickSurface(topoOf(m), m.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+  if (res.err) { toast(res.err, 'bad'); return; }
+  dirPick.regions.push({ mesh: m, list: res.region }); syncDirPick();
+}
+function finishDirPick(which) {
+  const dp = dirPick, ax = dp?.axes; if (!ax) return;
+  const what = ax.kind === 'groove' ? 'channel' : ax.kind === 'flat' ? 'face' : ax.kind === 'strip' ? 'strip' : 'surface', mesh = dp.regions[0].mesh;
+  const name = which === 'along' ? (ax.kind === 'groove' ? `the channel on ${mesh.name}` : `the ${what} on ${mesh.name}`) : `${which === 'across' ? 'across' : 'out of'} the ${what} on ${mesh.name}`;
+  endDirPick(); dp.onDone({ dir: ax[which].clone(), name, mesh, axes: ax, which });
+}
+function bindDirPick() {
+  ['along', 'across', 'out'].forEach(k => $('dp-' + k).addEventListener('click', () => finishDirPick(k)));
+  $('dp-cancel').addEventListener('click', cancelDirPick);
+}
+/** Triangles of a mesh with their centres within R (world mm) of a world point. */
+function trisNear(mesh, pWorld, R) {
+  mesh.updateMatrixWorld(true);
+  const inv = mesh.matrixWorld.clone().invert(), S = V().setFromMatrixScale(mesh.matrixWorld), sc = Math.max(S.x, S.y, S.z) || 1;
+  const sphere = new THREE.Sphere(pWorld.clone().applyMatrix4(inv), R / sc), out = [], c = V();
+  mesh.geometry.boundsTree.shapecast({
+    intersectsBounds: box => box.intersectsSphere(sphere),
+    intersectsTriangle: (tri, i) => { tri.getMidpoint(c); if (c.distanceTo(sphere.center) <= sphere.radius) out.push(i); return false; },
+  });
+  return out;
+}
+/**
+ * The directions some picked faces give (world): along them (down a groove, where their normals all lie square to
+ * one line; or the long way along a flat face), across them, and straight out of them.
+ */
+function faceAxes(mesh, list) {
+  if (!list?.length) return null;
+  mesh.updateMatrixWorld(true);
+  const t = topoOf(mesh), M = mesh.matrixWorld, nm = new THREE.Matrix3().getNormalMatrix(M), C = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], nb = V(), n = V(), c = V(); let A = 0;
+  for (const i of list) {
+    const a = t.fa[i]; if (!a) continue;
+    n.set(t.fn[3 * i], t.fn[3 * i + 1], t.fn[3 * i + 2]).applyMatrix3(nm).normalize(); A += a; nb.addScaledVector(n, a);
+    c.addScaledVector(V(t.fc[3 * i], t.fc[3 * i + 1], t.fc[3 * i + 2]).applyMatrix4(M), a);
+    const x = n.toArray(); for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) C[r][k] += a * x[r] * x[k];
+  }
+  if (!A) return null;
+  const ev = eigenSym3(C), l1 = ev[0].value, l2 = ev[1].value, l3 = ev[2].value;
+  let kind, along, out = nb.clone();
+  if (l2 > 0.12 * l1 && l3 < 0.6 * l2) { kind = 'groove'; along = ev[2].vector.clone(); }
+  else if (l2 <= 0.12 * l1) { kind = 'flat'; out.normalize(); along = faceLongAxis(t, M, list, out) || ev[1].vector.clone(); }
+  else {
+    // normals every which way (a ribbed tube, a ball socket): if the picked area is a long strip, it runs along that
+    kind = 'round'; along = ev[2].vector.clone();
+    const P = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], m = c.clone().multiplyScalar(1 / A), q = V();
+    for (const i of list) { const a = t.fa[i]; if (!a) continue; q.set(t.fc[3 * i], t.fc[3 * i + 1], t.fc[3 * i + 2]).applyMatrix4(M).sub(m); const x = q.toArray(); for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) P[r][k] += a * x[r] * x[k]; }
+    const pe = eigenSym3(P);
+    if (pe[0].value > 2.25 * pe[1].value) { kind = 'strip'; along = pe[0].vector.clone(); }
+  }
+  if (kind === 'round') {                                   // no direction along it: Out is the way most of the faces face
+    out = ev[0].vector.clone(); if (out.dot(nb) < 0) out.negate(); along.addScaledVector(out, -along.dot(out));
+    if (along.lengthSq() < 1e-10) along = (Math.abs(out.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).addScaledVector(out, -(Math.abs(out.z) < 0.9 ? out.z : out.x));
+    along.normalize();
+  } else { out.addScaledVector(along, -out.dot(along)); if (out.lengthSq() < 1e-10) out = ev[0].vector.clone(); out.normalize(); }
+  if (along.z < -1e-6 || (Math.abs(along.z) <= 1e-6 && along.x < 0)) along.negate();
+  return { kind, along: along.normalize(), across: along.clone().cross(out).normalize(), out, centre: c.multiplyScalar(1 / A), area: A };
+}
+/** Which way a new rail runs, from the op's choice. Returns { dir (world), name, info }. */
+function railDirection(op, target) {
+  const fixed = op.fixed, ch = op.p.rail || 'along';
+  if (ch === 'x' || ch === 'y' || ch === 'z') return { dir: partAxis(fixed, ch), name: `${fixed.name}'s ${ch.toUpperCase()}`, info: '' };
+  if (ch === 'picked' && op.p.railPick) {
+    const pk = op.p.railPick, d = V(...pk.dir).transformDirection(fixed.matrixWorld).normalize();
+    return { dir: d, name: pk.name, info: '' };
+  }
+  // the faces picked on the part it slides in; for a ball, the socket's surface and a little round it
+  let ax = null;
+  const own = op.railRegion || op.b[0]?.region;
+  if (own?.length) ax = faceAxes(fixed, own);
+  if (!ax || ax.kind === 'round') {
+    const R = op.mode === 'BALL' && op.a[0].radius ? op.a[0].radius * 2.5 : Math.max(3, 0.08 * worldBox(fixed).getSize(V()).length());
+    const wide = faceAxes(fixed, trisNear(fixed, target, R)); if (wide && (!ax || wide.kind !== 'round')) ax = wide;
+  }
+  op.railAxes = ax;
+  if (!ax) return { dir: partAxis(fixed, 'z'), name: `${fixed.name}'s Z`, info: 'no faces to read a direction from' };
+  const which = ch === 'across' ? 'across' : ch === 'out' ? 'out' : 'along';
+  const what = ax.kind === 'groove' ? 'the channel' : ax.kind === 'flat' ? 'the face' : ax.kind === 'strip' ? 'the strip' : 'the socket';
+  const name = which === 'along' ? (ax.kind === 'groove' ? 'the channel' : `the ${what.slice(4)}`) : which === 'across' ? `across ${what}` : `out of ${what}`;
+  const info = ax.kind === 'round' && which === 'along' ? 'no clear channel here: pick its faces, or choose X, Y or Z' : '';
+  return { dir: ax[which].clone(), name, info };
+}
+/**
+ * How far a ball can slide each way along a channel before it runs out (the walls fall away, or something closes it off):
+ * walk along the line and watch the distance to the surface. For faces, how far the picked faces run. Returns { min, max } or null.
+ */
+function channelEnds(op, target, dir) {
+  const fixed = op.fixed;
+  if (op.mode === 'BALL' && op.a[0].radius) {
+    const r = op.a[0].radius, inv = fixed.matrixWorld.clone().invert(), S = V().setFromMatrixScale(fixed.matrixWorld), sc = Math.max(S.x, S.y, S.z) || 1, bvh = fixed.geometry.boundsTree;
+    const dist = t => { const h = bvh.closestPointToPoint(target.clone().addScaledVector(dir, t).applyMatrix4(inv)); return h ? h.distance * sc : Infinity; };
+    const d0 = dist(0), step = r / 4, maxT = 40 * r, ends = [];
+    for (const sg of [-1, 1]) { let t = 0; while (t < maxT) { const n = t + step, d = dist(sg * n); if (Math.abs(d - d0) > 0.35 * r) break; t = n; } ends.push(t >= maxT ? null : sg * t); }
+    if (ends[0] == null && ends[1] == null) return null;
+    return { min: ends[0], max: ends[1] };
+  }
+  const list = op.railRegion || op.b[0]?.region; if (!list?.length) return null;
+  const t = topoOf(fixed), M = fixed.matrixWorld; let lo = Infinity, hi = -Infinity; const v = V();
+  for (const i of list) for (let k = 0; k < 3; k++) { const d = v.fromArray(t.pos, t.idx[3 * i + k] * 3).applyMatrix4(M).sub(target).dot(dir); lo = Math.min(lo, d); hi = Math.max(hi, d); }
+  return hi - lo > 1e-3 ? { min: Math.min(0, lo), max: Math.max(0, hi) } : null;
+}
+
+// ---------------------------------------------------------------------------
+// Section view: a plane you move and turn like a part. It cuts the view open (with solid caps where it cuts
+// through a part, red where two solids overlap) and draws three cross-sections: on the plane, and square to it.
+// ---------------------------------------------------------------------------
+const fit = { zoom: 1, cuts: null, R: 5, pending: false, pinned: false };       // the panel's state (the name is from the old fit check)
+const sec = { on: false, cut: true, show: true, size: 40, helpers: new Map() };
+const secObj = new THREE.Group(); secObj.name = 'section-plane'; secObj.visible = false; scene.add(secObj);
+const secGfx = new THREE.Group(); secObj.add(secGfx);
+const secQuad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .12, side: THREE.DoubleSide, depthWrite: false }));
+secQuad.userData.section = true; secQuad.renderOrder = 996; secGfx.add(secQuad);
+const secEdge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([V(-.5, -.5), V(.5, -.5), V(.5, .5), V(-.5, .5)]), new THREE.LineBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .9 }));
+secQuad.add(secEdge);
+const secCross = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints([V(-.5, 0), V(.5, 0), V(0, -.5), V(0, .5)]), new THREE.LineBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .35 }));
+secQuad.add(secCross);
+const secArrow = new THREE.ArrowHelper(V(0, 0, 1), V(), 1, 0xd6a24a, 0.25, 0.14); secGfx.add(secArrow);     // points to the side that stays
+const secClip = new THREE.Plane(), secPlanes = [secClip];
+// caps: every part is drawn again into the stencil (back faces add, front faces take away), so wherever the plane cuts
+// through solid the count is 1, and 2 or more where solids overlap. The caps fill those in.
+const secStBack = new THREE.MeshBasicMaterial({ side: THREE.BackSide, colorWrite: false, depthWrite: false, depthTest: false, clippingPlanes: secPlanes,
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc, stencilFail: THREE.IncrementWrapStencilOp, stencilZFail: THREE.IncrementWrapStencilOp, stencilZPass: THREE.IncrementWrapStencilOp });
+const secStFront = secStBack.clone(); secStFront.side = THREE.FrontSide; secStFront.clippingPlanes = secPlanes;
+secStFront.stencilFail = secStFront.stencilZFail = secStFront.stencilZPass = THREE.DecrementWrapStencilOp;
+const secCapMat = new THREE.MeshStandardMaterial({ color: '#c8a35e', roughness: 0.9, metalness: 0, side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp });
+const secOverMat = new THREE.MeshBasicMaterial({ color: '#e36b6b', side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 2, stencilFunc: THREE.LessEqualStencilFunc, stencilFail: THREE.KeepStencilOp, stencilZFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp });
+const secCap = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), secCapMat), secOver = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), secOverMat);
+secCap.renderOrder = 2; secOver.renderOrder = 3; secOver.onAfterRender = r => r.clearStencil();
+secObj.add(secCap, secOver);
+const secHelpers = new THREE.Group(); secHelpers.name = 'section-stencil'; scene.add(secHelpers);
+const cutPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: '#d6a24a', transparent: true, opacity: .14, side: THREE.DoubleSide, depthWrite: false }));
+const cutEdge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([V(-.5,-.5), V(.5,-.5), V(.5,.5), V(-.5,.5)]), new THREE.LineBasicMaterial({ color: '#d6a24a', depthTest: false }));
+cutPlane.add(cutEdge); cutPlane.visible = false; cutPlane.renderOrder = 997; scene.add(cutPlane);
+
+const secCutting = () => sec.on && sec.cut;
+/** Every frame: the clip plane follows the plane object, parts get (or lose) the clip, and the stencil copies follow their parts. */
+function updateSection() {
+  const cutting = secCutting();
+  if (sec.on) { secObj.updateMatrixWorld(true); const n = V(0, 0, 1).transformDirection(secObj.matrixWorld); secClip.setFromNormalAndCoplanarPoint(n, secObj.position); }
+  const live = liveParts();
+  for (const m of live) { const want = cutting ? secPlanes : null, mat = m.material;
+    if (mat && (mat.clippingPlanes || null) !== want) { mat.clippingPlanes = want; mat.needsUpdate = true; } }
+  secCap.visible = secOver.visible = cutting;
+  if (!cutting) { if (sec.helpers.size) { secHelpers.clear(); sec.helpers.clear(); } return; }
+  const alive = new Set(live);
+  for (const [m, h] of sec.helpers) if (!alive.has(m)) { secHelpers.remove(h.back, h.front); sec.helpers.delete(m); }
+  for (const m of live) {
+    let h = sec.helpers.get(m);
+    if (!h) { h = { back: new THREE.Mesh(m.geometry, secStBack), front: new THREE.Mesh(m.geometry, secStFront) };
+      for (const x of [h.back, h.front]) { x.matrixAutoUpdate = false; x.renderOrder = 1; x.raycast = () => {}; secHelpers.add(x); } sec.helpers.set(m, h); }
+    m.updateWorldMatrix(true, false); const vis = isVisibleChain(m);
+    for (const x of [h.back, h.front]) { if (x.geometry !== m.geometry) x.geometry = m.geometry; x.matrix.copy(m.matrixWorld); x.matrixWorldNeedsUpdate = true; x.visible = vis; }
+  }
+  const big = Math.max(sceneBox().getSize(V()).length() * 3, sec.size * 4, 100); secCap.scale.set(big, big, 1); secOver.scale.copy(secCap.scale);
+}
+/** Where to put the plane when it's turned on: through the joint or the selection (or the middle of everything), facing you. */
+function sectionStart() {
+  scene.updateMatrixWorld(true);
+  const sel = selection.length ? selection : selected ? [selected] : [];
+  let point, axis = null, R;
+  const A = selected || sel[sel.length - 1];
+  if (A) {
+    const B = sel.length >= 2 ? sel.find(m => m !== A) : parentPart(A), j = B && parentPart(A) === B ? jointOf(A) : null;
+    if (j) { point = V().setFromMatrixPosition(j.matrixWorld); axis = V(0, 0, 1).transformDirection(j.matrixWorld); R = jointRadius(A, B); }
+    else { const b = sceneBox([...new Set(sel)]); point = b.getCenter(V()); R = Math.max(b.getSize(V()).length() * 0.6, 3); }
+  } else { const b = sceneBox(liveParts().filter(isVisibleChain)); if (b.isEmpty()) { point = orbit.target.clone(); R = 20; } else { point = b.getCenter(V()); R = Math.max(b.getSize(V()).length() * 0.6, 3); } }
+  const look = orbit.target.clone().sub(camera.position).normalize();
+  let n;
+  if (axis) { const bs = jointBasis(axis); n = Math.abs(bs.X.dot(look)) >= Math.abs(bs.Y.dot(look)) ? bs.X : bs.Y; }      // the plane runs along the joint
+  else { const ax = [V(1, 0, 0), V(0, 1, 0), V(0, 0, 1)]; n = ax.reduce((a, b) => Math.abs(b.dot(look)) > Math.abs(a.dot(look)) ? b : a).clone(); }
+  if (n.dot(look) < 0) n.negate();                        // the side away from you stays: you look into the cut
+  setSectionPlane(point, n, Math.min(Math.max(R * 2, 4), 400));
+}
+function setSectionPlane(point, n, size = sec.size) {
+  const bs = jointBasis(n); secObj.position.copy(point); secObj.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(bs.X, bs.Y, bs.Z));
+  sec.size = size; sizeSection(); secObj.updateMatrixWorld(true); fit.zoom = 1;
+}
+function sizeSection() { const si = $('sec-size'); if (si && document.activeElement !== si) si.value = +sec.size.toFixed(1); secQuad.scale.set(sec.size, sec.size, 1); secArrow.setLength(sec.size * 0.18, sec.size * 0.05, sec.size * 0.03); }
+function scheduleFit() { if (fit.pending || !sec.on) return; fit.pending = true; requestAnimationFrame(() => { fit.pending = false; drawFit(); }); }
+/** K, View › Section view: on puts the plane through what's selected, facing you, and picks it up to move. */
+function setFitPinned(on) {
+  if (on && !sec.on) sectionStart();
+  sec.on = on; fit.pinned = on;
+  secObj.visible = on; secGfx.visible = sec.show; $('fit-body').hidden = false;
+  $('menu-fit')?.setAttribute('aria-checked', String(on)); $('sec-cut').checked = sec.cut; $('sec-show').checked = sec.show;
+  if (on) { selectBench('section'); if (!['move', 'rotate'].includes(tool)) setTool('move'); }
+  else { if (benchSel?.kind === 'section') { benchSel = null; benchMark.visible = false; syncGizmo(); renderPartPanel(); } cutPlane.visible = false; }
+  updateSection(); showFit();
+}
+function jointRadius(A, B) { const d = Math.min(worldBox(A).getSize(V()).length(), worldBox(B).getSize(V()).length()); return Math.min(Math.max(d * 0.3, 1.5), 60); }
+function showFit() { $('fitcheck').hidden = !sec.on; $('menu-fit')?.setAttribute('aria-checked', String(sec.on)); if (sec.on) scheduleFit(); }
+/** The three cuts: on the plane, and square to it along each of its edges. */
+function sectionCuts() {
+  secObj.updateMatrixWorld(true);
+  const e = secObj.matrixWorld.elements, u = V(e[0], e[1], e[2]).normalize(), v = V(e[4], e[5], e[6]).normalize(), n = V(e[8], e[9], e[10]).normalize(), o = secObj.position.clone();
+  const mk = (name, normal, cu, cv, line) => ({ name, normal, u: cu, v: cv, origin: o, plane: new THREE.Plane().setFromNormalAndCoplanarPoint(normal, o), line });
+  return [mk('Section', n, u, v, null), mk('Across', u, n.clone().negate(), v, 'v'), mk('Along', v, u, n, 'h')];
+}
+function drawFit() {
+  if (!sec.on || $('fitcheck').hidden || $('fit-body').hidden) return;
+  scene.updateMatrixWorld(true);
+  const R = sec.size / 2 * fit.zoom; fit.R = R;
+  fit.cuts = sectionCuts();
+  const ball = new THREE.Sphere(secObj.position, R * 1.5), shown = liveParts().filter(m => isVisibleChain(m) && worldBox(m).intersectsSphere(ball));
+  const sel = new Set(selection.length ? selection : selected ? [selected] : []);
+  let cutN = 0;
+  fit.cuts.forEach((c, i) => {
+    const items = [];
+    for (const m of shown) { if (!worldBox(m).intersectsPlane(c.plane)) continue; const seg = sliceMesh(m.geometry, m.matrixWorld, c.plane, c.origin, R, c.u, c.v, BVH); if (seg.length) items.push({ m, seg, color: '#' + _c.set(baseColor(m)).getHexString(), sel: sel.has(m) }); }
+    if (i === 0) cutN = items.length;
+    drawCut($('cut' + i), $('cut' + i + '-read'), items, R, c);
+  });
+  $('fit-a').textContent = cutN ? `${cutN} part${cutN === 1 ? '' : 's'} cut` : 'nothing cut';
+}
+
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+function niceStep(span) { const raw = span / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), m = raw / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
+function drawCut(cv, read, items, R, cut) {
+  const dpr = Math.min(devicePixelRatio || 1, 2), size = Math.max(cv.clientWidth, 60), px = Math.round(size * dpr);
+  if (cv.width !== px) { cv.width = cv.height = px; }
+  const ctx = cv.getContext('2d'), s = px / (2 * R), X = x => px / 2 + x * s, Y = y => px / 2 - y * s;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, px, px);
+  const step = niceStep(2 * R);
+  ctx.strokeStyle = '#232a30'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let g = Math.ceil(-R / step) * step; g <= R; g += step) { ctx.moveTo(X(g), 0); ctx.lineTo(X(g), px); ctx.moveTo(0, Y(g)); ctx.lineTo(px, Y(g)); }
+  ctx.stroke();
+  // on the side cuts: the plane as a line, the side it cuts away shaded
+  if (cut.line) {
+    if (secCutting()) { ctx.fillStyle = 'rgba(0,0,0,.35)'; if (cut.line === 'v') ctx.fillRect(X(0), 0, px - X(0), px); else ctx.fillRect(0, Y(0), px, px - Y(0)); }
+    ctx.strokeStyle = '#d6a24a'; ctx.lineWidth = Math.max(1, dpr); ctx.setLineDash([4 * dpr, 3 * dpr]); ctx.beginPath();
+    if (cut.line === 'v') { ctx.moveTo(X(0), 0); ctx.lineTo(X(0), px); } else { ctx.moveTo(0, Y(0)); ctx.lineTo(px, Y(0)); }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  const path = seg => { const p2 = new Path2D(); for (const l of chainSegments(seg, R)) { p2.moveTo(X(l.pts[0]), Y(l.pts[1]));
+      for (let i = 2; i < l.pts.length; i += 2) p2.lineTo(X(l.pts[i]), Y(l.pts[i+1])); if (l.closed) p2.closePath(); } return p2; };
+  const paths = items.map(it => path(it.seg));
+  ctx.globalAlpha = 0.35; items.forEach((it, i) => { ctx.fillStyle = it.color; ctx.fill(paths[i], 'evenodd'); }); ctx.globalAlpha = 1;
+  // overlap: count how many solids cover each pixel
+  let over = 0;
+  if (items.length >= 2) {
+    const off = drawCut.off ||= document.createElement('canvas'); off.width = off.height = px;
+    const o = off.getContext('2d', { willReadFrequently: true }), cnt = new Uint8Array(px * px);
+    o.setTransform(1, 0, 0, 1, 0, 0); o.fillStyle = '#fff';
+    for (const p2 of paths) { o.clearRect(0, 0, px, px); o.fill(p2, 'evenodd'); const d = o.getImageData(0, 0, px, px).data; for (let k = 0, q = 3; k < cnt.length; k++, q += 4) if (d[q] > 128) cnt[k]++; }
+    const img = o.createImageData(px, px), d = img.data;
+    for (let k = 0; k < cnt.length; k++) if (cnt[k] >= 2) { over++; d[4*k] = 227; d[4*k+1] = 107; d[4*k+2] = 107; d[4*k+3] = 235; }
+    o.clearRect(0, 0, px, px); o.putImageData(img, 0, 0); ctx.drawImage(off, 0, 0);
+  }
+  items.forEach((it, i) => { ctx.lineWidth = (it.sel ? 2 : 1.2) * dpr; ctx.strokeStyle = it.sel ? '#ffffff' : it.color; ctx.stroke(paths[i]); });
+  ctx.strokeStyle = '#d6a24a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(X(0), Y(0), 3 * dpr, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = '#8d969e'; ctx.font = `${10 * dpr}px "IBM Plex Mono", monospace`;
+  const bar = step * s; ctx.fillRect(6 * dpr, px - 8 * dpr, bar, 2 * dpr);
+  ctx.fillText(`${+step.toPrecision(3)} mm`, 6 * dpr, px - 12 * dpr);
+  const area = over / (s * s);
+  if (!items.length) { read.textContent = 'nothing here'; read.className = 'read'; return; }
+  if (area > Math.max(4 / (s * s), R * R * 1e-5)) { read.textContent = `overlap ${area.toFixed(area < 1 ? 3 : 2)} mm²`; read.className = 'read bad'; return; }
+  if (items.length === 2) { const gap = segmentsGap(items[0].seg, items[1].seg);
+    if (gap < 0.005) { read.textContent = 'touching'; read.className = 'read ok'; } else { read.textContent = `gap ${gap.toFixed(gap < 1 ? 3 : 2)} mm`; read.className = 'read gap'; } return; }
+  read.textContent = items.length === 1 ? items[0].m.name : `${items.length} parts, no overlap`; read.className = 'read' + (items.length > 1 ? ' ok' : '');
+}
+/** Turn it so you look straight into the cut, keeping its middle. */
+function sectionFaceView() { const look = orbit.target.clone().sub(camera.position).normalize(); setSectionPlane(secObj.position.clone(), look, sec.size); markBench(); syncGizmo(); scheduleFit(); }
+function sectionFlip() { secObj.rotateX(Math.PI); secObj.updateMatrixWorld(true); markBench(); syncGizmo(); scheduleFit(); }
+function sectionAtSelection() { const keep = benchSel?.kind === 'section'; sectionStart(); if (keep) { markBench(); syncGizmo(); } scheduleFit(); }
+function bindFit() {
+  $('fit-head').addEventListener('click', e => { if (e.target.closest('button, input, label')) return; $('fit-body').hidden = !$('fit-body').hidden; cutPlane.visible = false; scheduleFit(); });
+  $('sec-pick').addEventListener('click', () => { selectBench('section'); if (!['move', 'rotate'].includes(tool)) setTool('move'); });
+  $('sec-flip').addEventListener('click', sectionFlip);
+  $('sec-face').addEventListener('click', sectionFaceView);
+  $('sec-here').addEventListener('click', sectionAtSelection);
+  $('sec-cut').addEventListener('change', () => { sec.cut = $('sec-cut').checked; updateSection(); scheduleFit(); });
+  $('sec-show').addEventListener('change', () => { sec.show = $('sec-show').checked; secGfx.visible = sec.show; });
+  $('sec-size').addEventListener('change', () => { const v = +$('sec-size').value; if (v > 0) { sec.size = Math.min(Math.max(v, 1), 2000); sizeSection(); markBench(); scheduleFit(); } });
+  document.querySelectorAll('.cut').forEach(fig => {
+    const cv = fig.querySelector('canvas'), i = +fig.dataset.i;
+    cv.addEventListener('wheel', e => { e.preventDefault(); fit.zoom = Math.min(Math.max(fit.zoom * (e.deltaY > 0 ? 1.15 : 1 / 1.15), 0.05), 20); scheduleFit(); }, { passive: false });
+    cv.addEventListener('dblclick', () => { fit.zoom = 1; scheduleFit(); });
+    fig.addEventListener('mouseenter', () => {
+      const c = fit.cuts?.[i]; if (!c || i === 0) return;
+      const R = fit.R; cutPlane.position.copy(c.origin);
+      cutPlane.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(c.u, c.v, c.normal));
+      cutPlane.scale.set(2 * R, 2 * R, 1); cutPlane.visible = true;
+    });
+    fig.addEventListener('mouseleave', () => { cutPlane.visible = false; });
+  });
+  // hand the keys back to the view after using a control here (so G, R, X and K keep working)
+  $('fitcheck').querySelectorAll('.fit-foot button, .fit-foot input[type=checkbox]').forEach(x => x.addEventListener('click', () => setTimeout(() => x.blur(), 0)));
+  new ResizeObserver(() => scheduleFit()).observe($('fitcheck'));
+}
+function flashCentres() {          // briefly show the centres now in use
+  if (!lastOp) return; clearFx(); scene.updateMatrixWorld(true);
+  const T = lastOp.result?.T || new THREE.Matrix4();
+  for (const e of lastOp.a) showMarker(resolveCentre(e, lastOp.p.centre).point.clone().applyMatrix4(T), '#4db4dc', 1.3);
+  for (const e of lastOp.b) showMarker(resolveCentre(e, lastOp.p.centre).point, '#e2804f', 1.3);
+  clearTimeout(flashCentres.t); flashCentres.t = setTimeout(clearFx, 1400);
+}
+function rerunLast() {
+  if (!lastOp) return;
+  restore(lastOp.before);
+  runOp(lastOp);
+  syncGizmo();
+}
+
+// ---------------------------------------------------------------------------
+// Adjust Last Operation panel
+// ---------------------------------------------------------------------------
+/** Keep the snap as it is: the Adjust panel and the pick markers go away. */
+function acceptSnap() {
+  if (!lastOp) return;
+  const name = lastOp.child?.name; lastOp = null; $('adjust').hidden = true; clearFx(); showFit(); renderPartPanel(); updateStep();
+  toast(name ? `${name} placed.` : 'Placed.', 'ok');
+}
+function showAdjust() {
+  const op = lastOp, el = $('adjust');
+  showFit();
+  if (!op) { el.hidden = true; return; }
+  el.hidden = false;
+  $('adjust-title').textContent = `Adjust: ${op.match?.lucky ? TOOL_NAMES.LUCKY : TOOL_NAMES[op.mode]}`;
+  $('adj-search').hidden = !!op.match?.lucky;
+  $('adj-chain').innerHTML = '';
+  const mk = (txt, col, bold) => { const s = document.createElement('span'); if (col) { const d = document.createElement('i'); d.className = 'dot'; d.style.background = col; s.append(d, ' '); }
+    const t = document.createElement(bold ? 'b' : 'span'); t.textContent = txt; s.append(t); return s; };
+  const loop = canLoop(op.child, op.fixed) || !!op.result?.link;
+  $('adj-chain').append(mk(op.child.name, 'var(--move)', true), mk(op.p.attach === 'none' ? 'moved to' : op.p.attach === 'rail' ? 'slides in' : op.p.attach === 'link' ? 'also pinned to' : 'attached to'), mk(op.fixed.name, 'var(--fixed)', true));
+  if (op.p.attach === 'rail' || op.p.attach === 'link') $('adj-chain').append(mk(`· keeps its joint on ${parentPart(op.child)?.name || 'its parent'}`));
+  $('adj-loop').hidden = !loop; $('adj-pivot-f').hidden = op.p.attach === 'rail' || op.p.attach === 'link';
+  $('adj-rail-f').hidden = op.p.attach !== 'rail';
+  if (op.p.attach === 'rail') {
+    const ax = op.railAxes, faceOk = !!ax;
+    document.querySelectorAll('#adj-rail button').forEach(b => { b.setAttribute('aria-pressed', b.dataset.v === (op.p.rail || 'along') ? 'true' : 'false'); if (['along', 'across', 'out'].includes(b.dataset.v)) b.disabled = !faceOk && op.p.rail !== 'picked'; });
+    $('adj-rail-ends').checked = op.p.railEnds !== false;
+    $('adj-face-away').checked = op.p.faceAway ?? op.mode === 'BALL'; if (document.activeElement !== $('adj-twist')) $('adj-twist').value = op.p.twist || 0;
+    $('adj-rail-note').textContent = (op.linkNote || '') + (ax ? ` Faces read as ${ax.kind === 'groove' ? 'a channel' : ax.kind === 'flat' ? 'a flat face' : ax.kind === 'strip' ? 'a long strip' : 'a round socket (no clear direction)'}.` : '');
+  }
+  if (op.match?.targets) $('adj-chain').append(mk('· also fitted against'), mk(op.match.targets.slice(1).map(t => t.mesh.name).join(', '), 'var(--fixed)', true));
+  const geo = op.mode === 'PLANE' || op.mode === 'MID', isMatch = op.mode === 'MATCH';
+  $('adj-spin-f').hidden = !(geo || isMatch); $('adj-gap-f').hidden = !(geo || isMatch); $('adj-flip-f').hidden = !geo; $('adj-across-f').hidden = op.mode !== 'MID';
+  $('adj-match-f').hidden = !isMatch;
+  if (isMatch) {
+    const box = $('adj-matches'); box.innerHTML = '';
+    op.match.results.forEach((r, k) => {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.setAttribute('aria-pressed', k === op.match.chosen ? 'true' : 'false');
+      const t = document.createElement('span'); t.textContent = r.lucky ? `Guess ${k + 1}: ${r.lucky.contact.toFixed(1)} mm² flush` : r.seated ? `Fit ${k + 1}: ${r.seated.contact.toFixed(1)} mm² touching` : `Fit ${k + 1}: ${Math.round(r.coverage * 100)}% contact`;
+      const sm = document.createElement('small'); sm.textContent = r.lucky ? (r.lucky.sunk >= 0.05 ? `${r.lucky.sunk.toFixed(1)} mm² overlapping` : 'nothing overlapping') + (lockWords(r.lucky.lock ?? 0) ? ` · ${lockWords(r.lucky.lock)}` : '') : r.seated ? `${r.label}` : `gap ${r.gap.toFixed(2)} mm · ${r.label}`;
+      b.append(t, sm); b.addEventListener('click', () => { op.match.chosen = k; rerunLast(); showAdjust(); flashMatch(); });
+      box.append(b);
+    });
+  }
+  $('adj-centre-f').hidden = !geo; $('adj-seat-f').hidden = op.mode !== 'PLANE'; $('adj-seat').checked = op.p.seat !== false;
+  document.querySelectorAll('#adj-centre button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.centre ? 'true' : 'false'));
+  if (geo) {
+    const lab = list => [...new Set(list.map(e => resolveCentre(e, op.p.centre).label))].join(' / ');
+    $('adj-centre-used').textContent = `Moving: ${lab(op.a)} · Fixed: ${lab(op.b)}`;
+  }
+  $('adj-gap-label').textContent = op.mode === 'MID' ? 'Offset across the gap (mm)' : op.mode === 'MATCH' ? 'Gap between the surfaces (mm)' : 'Gap between faces (mm)';
+  $('adj-flip-label').textContent = op.mode === 'MID' ? 'Swap sides' : 'Face the same way';
+  $('adj-spin').value = $('adj-spin-n').value = op.p.spin;
+  $('adj-gap').value = op.p.gap; $('adj-flip').checked = op.p.flip; $('adj-across').checked = op.p.across;
+  document.querySelectorAll('#adj-parent button, #adj-loop button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.attach ? 'true' : 'false'));
+  document.querySelectorAll('#adj-frame button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.frame ? 'true' : 'false'));
+  document.querySelectorAll('#adj-pivot button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === op.p.pivot ? 'true' : 'false'));
+  ['x', 'y', 'z'].forEach((k, i) => { const el = $('adj-off-' + k); if (el && document.activeElement !== el) el.value = (op.p.offset[i] || 0).toFixed(3); });
+  const world = op.p.frame !== 'joint';
+  const names = world ? [['← Left', 0, -1], ['Right →', 0, 1], ['↑ Up', 2, 1], ['← Back', 1, -1], ['Forward →', 1, 1], ['↓ Down', 2, -1]]
+                      : [['−X', 0, -1], ['+X', 0, 1], ['+Z out', 2, 1], ['−Y', 1, -1], ['+Y', 1, 1], ['−Z in', 2, -1]];
+  document.querySelectorAll('#adj-slides button').forEach((b, i) => { const [t, ax, sg] = names[i]; b.textContent = t; b.dataset.ax = ax; b.dataset.sg = sg;
+    b.title = world ? `Slide ${t.replace(/[←→↑↓] ?| ?[←→↑↓]/g, '').toLowerCase()} until it touches ${op.fixed.name}` : `Slide along ${t.split(' ')[0]} of the joint until it touches ${op.fixed.name}`; });
+  if (op.result) {
+    const d = op.result.childPoint.distanceTo(op.result.parentPoint);
+    $('adj-pivot-note').textContent = d < 1e-3 ? 'Both points meet, so either gives the same pivot.' : `The points are ${d.toFixed(3)} mm apart.`;
+  }
+  const fit = $('adj-fit');
+  if (op.mode === 'MID' && op.result) {
+    const { widthA: wA, widthB: wB } = op.result, side = (wB - wA) / 2;
+    fit.hidden = false; fit.className = 'fit ' + (side >= 0 ? 'ok' : 'bad');
+    fit.textContent = `Part ${wA.toFixed(3)} mm in gap ${wB.toFixed(3)} mm\n`;
+    fit.textContent += side >= 0 ? `${side.toFixed(3)} mm clearance each side` : `${(-side).toFixed(3)} mm too wide each side`;
+    fit.style.whiteSpace = 'pre-line';
+  } else if (op.mode === 'PLANE' && op.p.seat !== false && op.seat) {
+    const st = op.seat.info; fit.hidden = false; fit.className = 'fit ' + (st.contact > 0.5 ? 'ok' : 'bad'); fit.style.whiteSpace = 'pre-line';
+    fit.textContent = `Seated: ${seatSummary(st)}` + (op.p.spin ? `\nSpin is on top of the seated turn.` : '');
+  } else if (isMatch && op.match.results.length) {
+    const r = op.match.results[op.match.chosen], v = matchVerdict(r);
+    fit.hidden = false; fit.className = 'fit ' + (v.good ? 'ok' : 'bad'); fit.style.whiteSpace = 'pre-line';
+    fit.textContent = v.text[0].toUpperCase() + v.text.slice(1) + (r.slides ? '\nThese flat faces differ in size, so the shapes can\'t say exactly where it sits. Slide it into place with Move.' : '');
+  } else fit.hidden = true;
+}
+function bindAdjust() {
+  const upd = () => { if (!lastOp) return;
+    lastOp.p.spin = +$('adj-spin').value; lastOp.p.gap = +$('adj-gap').value || 0;
+    lastOp.p.flip = $('adj-flip').checked; lastOp.p.across = $('adj-across').checked; rerunLast(); showAdjust(); };
+  $('adj-spin').addEventListener('input', () => { $('adj-spin-n').value = $('adj-spin').value; upd(); });
+  $('adj-spin-n').addEventListener('change', () => { $('adj-spin').value = $('adj-spin-n').value; upd(); });
+  ['adj-gap', 'adj-across'].forEach(id => $(id).addEventListener('input', upd));
+  // these may need a fresh seat, which takes a moment: let the message paint first
+  const slow = fn => () => { if (!lastOp) return; if (lastOp.mode === 'PLANE' && lastOp.p.seat !== false) { toast('Fitting the parts together…'); setTimeout(fn, 30); } else fn(); };
+  $('adj-flip').addEventListener('input', slow(upd));
+  $('adj-seat').addEventListener('change', slow(() => { lastOp.p.seat = lastSeat = $('adj-seat').checked; rerunLast(); showAdjust(); if (lastOp.p.seat && lastOp.seat) toast(`Seated: ${seatSummary(lastOp.seat.info)}`, 'ok'); }));
+  document.querySelectorAll('#adj-centre button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp) return; slow(() => { lastOp.p.centre = lastCentre = b.dataset.v; rerunLast(); showAdjust(); flashCentres(); })(); }));
+  document.querySelectorAll('#adj-parent button, #adj-loop button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp) return; const v = b.dataset.v; lastOp.p.attach = v;
+    if (canLoop(lastOp.child, lastOp.fixed) || lastOp.result?.link) lastLoopAttach = v; if (v !== 'rail' && v !== 'link') lastAttach = v;
+    rerunLast(); showAdjust(); if (lastOp.linkNote && (v === 'rail' || v === 'link')) toast(lastOp.linkNote, 'ok'); }));
+  document.querySelectorAll('#adj-rail button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp) return; lastOp.p.rail = b.dataset.v; rerunLast(); showAdjust(); }));
+  $('adj-rail-ends').addEventListener('change', () => { if (!lastOp) return; lastOp.p.railEnds = $('adj-rail-ends').checked; rerunLast(); showAdjust(); });
+  $('adj-face-away').addEventListener('change', () => { if (!lastOp) return; lastOp.p.faceAway = $('adj-face-away').checked; rerunLast(); showAdjust(); });
+  const twist = d => { if (!lastOp) return; lastOp.p.twist = ((((lastOp.p.twist || 0) + d) % 360) + 540) % 360 - 180; rerunLast(); showAdjust(); };
+  $('adj-twist').addEventListener('change', () => { if (!lastOp) return; lastOp.p.twist = +$('adj-twist').value || 0; rerunLast(); showAdjust(); });
+  $('adj-tw-m').addEventListener('click', () => twist(-90)); $('adj-tw-p').addEventListener('click', () => twist(90));
+  $('adj-rail-pick').addEventListener('click', () => {
+    if (!lastOp) return; const op = lastOp;
+    startDirPick('Pick faces for the rail', dirs => {
+      if (!lastOp || lastOp !== op) return;
+      op.fixed.updateMatrixWorld(true);
+      op.p.rail = 'picked'; op.p.railPick = { dir: dirs.dir.clone().transformDirection(op.fixed.matrixWorld.clone().invert()).normalize().toArray(), name: dirs.name };
+      rerunLast(); showAdjust(); toast(`Slides ${dirs.name}.`, 'ok');
+    });
+  });
+  $('adjust-head').addEventListener('click', () => { $('adjust-body').hidden = !$('adjust-body').hidden; });
+  $('adj-accept').addEventListener('click', acceptSnap);
+  $('adj-undo').addEventListener('click', () => { undo(); toast('Snap undone.'); });
+  $('adj-search').addEventListener('click', searchAllFaces);
+
+  // nudges
+  const box = $('adj-nudges');
+  ['x', 'y', 'z'].forEach((k, i) => {
+    const ax = document.createElement('span'); ax.className = 'ax ' + k; ax.textContent = k.toUpperCase();
+    const minus = document.createElement('button'); minus.type = 'button'; minus.className = 'btn'; minus.textContent = '−'; minus.setAttribute('aria-label', `Move ${k.toUpperCase()} down one step`);
+    const num = document.createElement('input'); num.type = 'number'; num.step = 'any'; num.className = 'num'; num.id = 'adj-off-' + k; num.value = '0.000'; num.setAttribute('aria-label', `${k.toUpperCase()} offset in mm`);
+    const plus = document.createElement('button'); plus.type = 'button'; plus.className = 'btn'; plus.textContent = '+'; plus.setAttribute('aria-label', `Move ${k.toUpperCase()} up one step`);
+    const bump = sgn => { if (!lastOp) return; lastOp.p.offset[i] = +((lastOp.p.offset[i] || 0) + sgn * +$('adj-step').value).toFixed(6); rerunLast(); showAdjust(); };
+    minus.addEventListener('click', () => bump(-1)); plus.addEventListener('click', () => bump(1));
+    num.addEventListener('change', () => { if (!lastOp) return; lastOp.p.offset[i] = +num.value || 0; rerunLast(); showAdjust(); });
+    box.append(ax, minus, num, plus);
+  });
+  // world/joint axes: keep the part where it is, re-express the offset
+  document.querySelectorAll('#adj-frame button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp || lastOp.p.frame === b.dataset.v) return;
+    const w = offsetWorld(lastOp);
+    lastOp.p.frame = lastFrame = b.dataset.v;
+    if (b.dataset.v === 'joint') { const { X, Y, Z } = opBasis(lastOp); lastOp.p.offset = [w.dot(X), w.dot(Y), w.dot(Z)]; }
+    else lastOp.p.offset = [w.x, w.y, w.z];
+    showAdjust();
+  }));
+  // slide until touching
+  const slides = $('adj-slides');
+  for (let i = 0; i < 6; i++) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'btn';
+    b.addEventListener('click', () => {
+      const op = lastOp; if (!op) return;
+      const ax = +b.dataset.ax, sg = +b.dataset.sg;
+      const unit = op.p.frame === 'joint' ? Object.values(opBasis(op))[ax].multiplyScalar(sg) : V(...[0, 1, 2].map(k => (k === ax ? sg : 0)));
+      toast('Finding contact…');
+      setTimeout(() => {
+        const res = slideToContact(op.child, op.fixed, unit);
+        if (res.dist === Infinity) { toast(res.overlapping ? `Can't back ${op.child.name} out that way.` : `Nothing of ${op.fixed.name} lies that way.`, 'bad'); return; }
+        if (res.dist < 1e-4) { toast(`Already touching ${op.fixed.name} that way.`); return; }
+        op.p.offset[ax] = +((op.p.offset[ax] || 0) + sg * res.dist).toFixed(6);
+        rerunLast(); showAdjust();
+        toast(res.overlapping ? `Backed out ${res.dist.toFixed(3)} mm: now just touching.` : `Slid ${res.dist.toFixed(3)} mm: now touching.`, 'ok');
+      }, 20);
+    });
+    slides.append(b);
+  }
+  // pivot host
+  document.querySelectorAll('#adj-pivot button').forEach(b => b.addEventListener('click', () => {
+    if (!lastOp) return; lastOp.p.pivot = lastPivot = b.dataset.v; rerunLast(); showAdjust(); flashPivot(); }));
+  // swap roles: the other part moves and becomes the child
+  $('adj-swap').addEventListener('click', () => {
+    const op = lastOp; if (!op) return;
+    if (op.match?.targets) { toast(`${op.child.name} was fitted against ${op.match.targets.length} parts, so it can't swap roles with one of them.`, 'bad'); return; }
+    restore(op.before);
+    Object.assign(op, { child: op.fixed, fixed: op.child, a: op.b, b: op.a });
+    op.p.offset = [0, 0, 0]; op.p.spin = 0;
+    if (op.mode === 'MATCH') {
+      const m = op.match; Object.assign(m, { regionA: m.regionB, regionB: m.regionA, Ma: m.Mb, Mb: m.Ma, results: [], chosen: 0 });
+      if (m.lucky) startLucky(op); else startMatch(op);
+      return;
+    }
+    if (runOp(op)) { select(op.child); showAdjust(); toast(`Swapped: ${op.child.name} now moves and attaches to ${op.fixed.name}.`, 'ok'); }
+  });
+}
+function flashPivot() {
+  if (!lastOp?.result) return; clearFx();
+  showMarker(lastOp.result.parentPoint, '#e2804f', 1.2); showMarker(lastOp.result.childPoint, '#4db4dc', 1.2);
+  showMarker(lastOp.result.joint, '#d6a24a', 1.8);
+  clearTimeout(flashCentres.t); flashCentres.t = setTimeout(clearFx, 1400);
+}
+
+// ---------------------------------------------------------------------------
+// Selection, gizmos, outliner, part panel
+// ---------------------------------------------------------------------------
+const isSel = m => selection.includes(m);
+function paintSelection() { liveParts().forEach(m => m.material.emissive.set(m === selected ? '#4a3510' : isSel(m) ? '#2a1f09' : '#000000')); }
+/** mode: 'replace' (plain click), 'toggle' (Ctrl-click), 'add' */
+function select(mesh, mode = 'replace') {
+  if (benchSel) { benchSel = null; benchMark.visible = false; }
+  connSel = null;
+  const m = mesh && mesh.parent ? mesh : null;
+  if (mode === 'replace') selection = m ? [m] : [];
+  else if (m && mode === 'toggle') selection = isSel(m) ? selection.filter(x => x !== m) : [...selection, m];
+  else if (m && mode === 'add' && !isSel(m)) selection = [...selection, m];
+  selected = m && isSel(m) ? m : selection[selection.length - 1] || null;
+  paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); renderOptions(); updateButtons();
+  if (sec.on) scheduleFit();
+}
+function selectMany(list, add = false) {
+  selection = add ? [...new Set([...selection, ...list])] : [...new Set(list)];
+  selected = selection[selection.length - 1] || null;
+  paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); renderOptions(); updateButtons();
+  if (sec.on) scheduleFit();
+}
+/** Selected parts that aren't inside another selected part's attachments (those move with it anyway). */
+function selectionRoots() { return selection.filter(m => m.parent && !selection.some(o => o !== m && isDescendant(m, o))); }
+let gizmoBase = null;
+/** Some tool is waiting for clicks on parts (cracking, bursting, ooze, placing a growth, picking faces). */
+function placingSpot() { try { return !!(dirPick || oz || modHit || dm || bz || gp); } catch (e) { return false; } }
+function syncGizmo() {
+  tc.detach(); tc.showX = tc.showY = tc.showZ = true;
+  slideJ = null; $('pose-roller').hidden = true; connDrag = null; axesDrag = null; axesFx.visible = false;
+  if (placingSpot()) return;                         // clicking spots on parts: no gizmo in the way (it would take the click)
+  if (connSel && ['move', 'rotate'].includes(tool)) {
+    const ci = connInfo(connSel); if (!ci) return;
+    proxy.position.copy(ci.point); proxy.scale.set(1, 1, 1);
+    // its own axes (rest axes for a joint) unless the bar says world
+    const q = moveFrame === 'world' ? new THREE.Quaternion() : ci.kind === 'joint' ? ci.restQ.clone() : ci.q.clone();
+    proxy.quaternion.copy(q); proxy.updateMatrixWorld(true);
+    if (tool === 'rotate' && ci.kind === 'link' && ci.type !== 'rail') { toast('A pin has no axes to turn. Use Move to drag its point.'); return; }
+    tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace(moveFrame === 'world' ? 'world' : 'local'); tc.attach(proxy);
+    connDrag = { c: connSel };
+    $('move-frame-note').textContent = moveFrame === 'world' ? 'world axes' : 'the connection\'s own axes'; return;
+  }
+  if (benchSel?.kind === 'section' && ['move', 'rotate'].includes(tool)) {             // the section plane moves and turns in its own frame: Z pushes it through
+    if (!sec.on) return; proxy.position.copy(secObj.position); proxy.quaternion.copy(secObj.quaternion); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+    tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace('local'); tc.attach(proxy); return;
+  }
+  if (benchSel && ['move', 'rotate'].includes(tool)) {
+    const o = benchObj(); if (!o) return;
+    const c = new THREE.Box3().setFromObject(o).getCenter(V());
+    proxy.position.copy(c); proxy.quaternion.identity(); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+    const turn = tool === 'rotate' && benchSel.kind !== 'sprue';
+    tc.setMode(turn ? 'rotate' : 'translate'); tc.setSpace('world');
+    if (turn && benchSel.kind !== 'ref') { tc.showX = tc.showY = false; }                 // a box on the mat only turns about the up axis
+    if (benchSel.kind === 'ref') { proxy.quaternion.copy(o.quaternion); tc.setSpace('local'); }   // a picture moves and turns in its own frame
+    tc.attach(proxy); return;
+  }
+  if (!selected || !['move', 'rotate'].includes(tool)) { linkAsk.gizmoFor = null; if (linkAsk.soft) closeLinkAsk(null); }
+  if (!selected || !['move', 'rotate', 'pose'].includes(tool)) return;      // only these tools have a gizmo
+  if (tool === 'pose') {
+    const j = jointOf(selected);
+    if (!j) { toast(parentPart(selected) ? `${selected.name} is fixed to ${parentPart(selected).name}. Make it Pinned, Hinge or Roller in Properties to pose it.` : `${selected.name} has no joint yet. Snap it onto a parent first.`); return; }
+    const t = j.userData.joint.type || 'pinned';
+    if (t === 'roller') {
+      $('pose-roller').hidden = false; document.querySelectorAll('#pose-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)));
+      if (poseMode === 'slide') {
+        // the slide arrow runs along the roller's line, which stays put in its parent however the roller has turned
+        j.updateMatrixWorld(true);
+        proxy.position.setFromMatrixPosition(j.matrixWorld); proxy.quaternion.copy(j.parent.getWorldQuaternion(new THREE.Quaternion()).multiply(j.userData.joint.rest)); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+        tc.setMode('translate'); tc.setSpace('local'); tc.showX = tc.showY = false; tc.attach(proxy);
+        slideJ = { j }; return;
+      }
+      tc.setMode('rotate'); tc.setSpace('local'); tc.attach(j); return;           // turns any way
+    }
+    tc.setMode('rotate'); tc.setSpace('local');
+    if (t !== 'pinned') { tc.showX = tc.showY = false; }          // a hinge turns about its Z only
+    tc.attach(j); return;
+  }
+  if (axesEdit && selection.length <= 1) {            // Edit axes: the gizmo turns and moves the part's axes and origin, not the part
+    showAxesFx(selected); proxy.position.copy(axesFx.position); proxy.quaternion.copy(partFrameQ(selected)); proxy.scale.set(1, 1, 1); proxy.updateMatrixWorld(true);
+    tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace('local'); tc.attach(proxy); axesDrag = { part: selected };
+    $('move-frame-note').textContent = `${selected.name}'s axes`; return;
+  }
+  const c = (selection.length <= 1 && partPivot(selected)) || sceneBox(selection.length ? selection : [selected]).getCenter(V());
+  proxy.position.copy(c); proxy.scale.set(1, 1, 1);
+  const fr = gizmoFrame(selected);
+  proxy.quaternion.copy(fr.q); proxy.updateMatrixWorld(true);
+  tc.setMode(tool === 'move' ? 'translate' : 'rotate'); tc.setSpace(fr.local ? 'local' : 'world'); tc.attach(proxy);
+  $('move-frame-note').textContent = fr.note;
+  gizmoLinkAsk();
+}
+/*
+ * Which way the Move and Rotate arrows point: the world's X/Y/Z, the part's own axes (as it was modelled, turned with
+ * it), or the axes of what it's attached to: its joint, if it has one, or else its parent part.
+ */
+let moveFrame = (() => { try { return localStorage.getItem('kitbash-moveframe') || 'world'; } catch (e) { return 'world'; } })();
+let poseMode = (() => { try { return localStorage.getItem('kitbash-posemode') || 'turn'; } catch (e) { return 'turn'; } })();
+let slideJ = null;                  // posing a roller by its slide arrow: { j, v0, p0 }
+let connDrag = null;                // dragging a selected connection's point or axes: { c, p, q }
+function gizmoFrame(part) {
+  const q = new THREE.Quaternion();
+  if (moveFrame === 'part') { q.copy(partFrameQ(part)); return { q, local: true, note: `${part.name}'s own axes` }; }
+  if (moveFrame === 'parent') {
+    const j = jointOf(part), par = parentPart(part);
+    if (j) { j.getWorldQuaternion(q); return { q, local: true, note: `${par.name}: its joint's axes` }; }
+    if (par) { par.getWorldQuaternion(q); return { q, local: true, note: `${par.name}'s axes` }; }
+    part.getWorldQuaternion(q); return { q, local: true, note: `not attached: ${part.name}'s own axes` };
+  }
+  return { q, local: false, note: '' };
+}
+function setMoveFrame(v) {
+  moveFrame = v; try { localStorage.setItem('kitbash-moveframe', v); } catch (e) {}
+  document.querySelectorAll('#move-frame button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v))); syncGizmo();
+}
+function setPoseMode(v) {
+  poseMode = v; try { localStorage.setItem('kitbash-posemode', v); } catch (e) {}
+  document.querySelectorAll('#pose-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v))); syncGizmo();
+}
+/** The gizmo just landed on a part that hangs off another: offer to bring its group (once per pick of that part). */
+function gizmoLinkAsk() {
+  const part = selected;
+  if (linkAsk.gizmoFor === part) return;
+  linkAsk.gizmoFor = part;
+  if (linkAsk.soft) closeLinkAsk(null);
+  if (selection.length > 1 || !parentPart(part)) return;
+  const pref = $('set-linkmove').value;
+  if (pref === 'group') { makeBase(part); return; }
+  if (pref !== 'ask') return;
+  askLink(part, tool === 'move' ? 'Move' : 'Turn').then(a => { if (a === 'group' && part.parent && selected === part) makeBase(part); });
+  linkAsk.soft = true;
+}
+let poseHeld = null;                // while posing with linkages: the last pose where every connection held
+tc.addEventListener('mouseDown', () => {
+  poseHeld = tc.object?.userData.joint && links.length ? linkedState(tc.object) : null;
+  if (linkAsk.soft && linkAsk.resolve) closeLinkAsk('alone');        // dragged without answering: just this part
+  lastOp = null; $('adjust').hidden = true; showFit();
+  pushUndo();
+  if (tc.object === proxy && benchSel) {
+    const o = benchObj(); if (!o) return; o.updateMatrixWorld(true);
+    const items = benchSel.kind === 'sprue' ? piecesOn(benchSel.k).map(m => { m.updateMatrixWorld(true); return { m, W0: m.matrixWorld.clone() }; }) : [];
+    gizmoBase = { M0inv: proxy.matrixWorld.clone().invert(), items, bench: { o, W0: o.matrixWorld.clone(), sel: { ...benchSel } } };
+    return;
+  }
+  if (tc.object === proxy && axesDrag) return;
+  if (tc.object === proxy && connDrag) { connDrag.p = proxy.position.clone(); connDrag.q = proxy.quaternion.clone(); return; }
+  if (tc.object === proxy && slideJ) { slideJ.v0 = jointValue(slideJ.j); slideJ.p0 = proxy.position.clone(); poseHeld = links.length ? linkedState(slideJ.j) : null; return; }
+  if (tc.object === proxy && selected) {
+    const items = (selection.length ? selectionRoots() : [selected]).map(m => { m.updateMatrixWorld(true); return { m, W0: m.matrixWorld.clone() }; });
+    gizmoBase = { M0inv: proxy.matrixWorld.clone().invert(), items };
+  }
+});
+tc.addEventListener('objectChange', () => {
+  if (sec.on) scheduleFit();          // the cross-sections follow the drag
+  if (tc.object === proxy && axesDrag) {
+    const m = axesDrag.part; proxy.updateMatrixWorld(true);
+    if (tc.mode === 'rotate') setPartFrame(m, proxy.quaternion.clone());
+    else { m.updateMatrixWorld(true); m.userData.part.pivot = proxy.position.clone().applyMatrix4(m.matrixWorld.clone().invert()).toArray().map(v => +v.toFixed(6)); }
+    showAxesFx(m); return;
+  }
+  if (tc.object === proxy && connDrag?.p) {
+    const ci = connInfo(connDrag.c); if (!ci) return;
+    if (tc.mode === 'translate') {
+      const dW = proxy.position.clone().sub(connDrag.p); connDrag.p = proxy.position.clone(); if (dW.lengthSq() < 1e-14) return;
+      // into the same axes the offsets are kept in
+      const frameQ = ci.kind === 'joint' ? ci.restQ : ci.b.getWorldQuaternion(new THREE.Quaternion()), d = dW.clone().applyQuaternion(frameQ.clone().invert());
+      if (ci.kind === 'link') { const S = V().setFromMatrixScale(ci.b.matrixWorld); d.divide(S); }
+      shiftConn(ci, 'point', d.toArray());
+    } else {
+      const dq = proxy.quaternion.clone().multiply(connDrag.q.clone().invert()); connDrag.q = proxy.quaternion.clone();
+      if (ci.kind === 'joint') turnPivot(ci.j, dq);
+      else if (ci.type === 'rail') { const ax = railAxisLocal(ci.l).transformDirection(ci.b.matrixWorld).applyQuaternion(dq); ci.l.axis = ax.transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray(); ci.l.axisName = 'a direction turned by hand'; }
+    }
+    if (links.length) solveLinks(ci.kind === 'joint' ? ci.j : null, 15);
+    return;
+  }
+  if (tc.object === proxy && slideJ && slideJ.p0) {
+    const j = slideJ.j, ax = V(0, 0, 1).applyQuaternion(proxy.quaternion), prev = poseHeld || linkedState(j);
+    setJointValue(j, slideJ.v0 + proxy.position.clone().sub(slideJ.p0).dot(ax));
+    if (links.length) { const r = poseWithLinks(j, prev); poseHeld = linkedState(j);
+      if (!r.ok && performance.now() - (poseHeld.t || 0) > 1500) { toast("That's as far as the linkage goes: a piston or rail won't reach any further.", 'bad'); poseHeld.t = performance.now(); } }
+    posePanelLive(); if (magnets.length) rebuildMagnets(); return;
+  }
+  if (tc.object?.userData.joint) {
+    const j = tc.object; constrainJoint(j);
+    if (links.length) {
+      const r = poseWithLinks(j, poseHeld || linkedState(j)); poseHeld = linkedState(j);
+      if (!r.ok && performance.now() - (poseHeld.t || 0) > 1500) { toast("That's as far as the linkage goes: a piston or rail won't reach any further.", 'bad'); poseHeld.t = performance.now(); }
+    }
+    if (tool === 'pose') posePanelLive();
+  }
+  if (tc.object !== proxy && magnets.length) rebuildMagnets();       // posing a joint carries its magnets
+  if (tc.object === proxy && gizmoBase) {
+    proxy.updateMatrixWorld(true);
+    const D = proxy.matrixWorld.clone().multiply(gizmoBase.M0inv);          // the same move for every selected part
+    for (const it of gizmoBase.items) setWorld(it.m, D.clone().multiply(it.W0));
+    if (magnets.length) rebuildMagnets();             // the hole previews ride along
+    if (gizmoBase.bench) { setWorld(gizmoBase.bench.o, D.clone().multiply(gizmoBase.bench.W0)); markBench(); }
+  }
+});
+tc.addEventListener('mouseUp', () => {
+  const bb = gizmoBase?.bench;
+  if (bb) {                                           // keep where the box, booklet or sprue was put
+    const o = bb.o;
+    if (bb.sel.kind === 'box') { kit.at = o.position.toArray(); kit.rot = o.rotation.z; }
+    else if (bb.sel.kind === 'book') { kit.bookAt = o.position.toArray(); kit.bookRot = o.rotation.z; }
+    else if (bb.sel.kind === 'ref') { const r = refById(bb.sel.k); if (r) { r.pos = o.position.toArray(); r.quat = o.quaternion.toArray(); } }
+    else if (bb.sel.kind === 'section') { /* the plane is its own record */ }
+    else if (sprues?.frames[bb.sel.k]) { shiftSprue(bb.sel.k, o.position.clone()); }
+  }
+  const slid = slideJ?.p0; if (slideJ) slideJ.p0 = null;
+  if (connDrag?.p) { const c = connDrag.c; connDrag.p = null; connChanged(c); renderPartPanel(); syncGizmo(); markDirty(); return; }
+  if (tc.object?.userData.joint && links.some(l => l.face)) refreshFacing(tc.object);
+  gizmoBase = null; renderPartPanel(); markDirty(); if (sprues) rebuildSprues(); refreshGrowers();
+  if (bb || slid) syncGizmo();                        // the slide arrow goes back to where the roller stopped
+});
+
+const eyeOpen = '<svg viewBox="0 0 16 16"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z"/><circle cx="8" cy="8" r="2"/></svg>';
+const eyeShut = '<svg viewBox="0 0 16 16"><path d="M2 10c1.5 1.5 3.5 2.5 6 2.5s4.5-1 6-2.5M3.5 11.5l-1 1.5M12.5 11.5l1 1.5M8 12.5V14"/></svg>';
+function renderOutliner() {
+  const box = $('outliner'); box.innerHTML = '';
+  const roots = liveParts().filter(p => !parentPart(p));
+  $('part-count').textContent = liveParts().length ? `${liveParts().length} parts` : '';
+  if (!roots.length && !refs.length) { box.innerHTML = '<div class="empty">No parts yet. Import STL files or load the sample kit.</div>'; return; }
+  const kids = p => liveParts().filter(c => parentPart(c) === p);
+  const row = (p, depth) => {
+    const sl = slotOf(p);
+    const r = document.createElement('div'); r.className = 'orow dnd-row' + (p.userData.optOff ? ' opt-off' : p.visible ? '' : ' hidden-part'); r.draggable = true; r._key = p;
+    r.title = 'Drag onto another part: on its name to attach, on its right end to make it an alternate for it, onto empty space to set it loose';
+    r.setAttribute('role', 'treeitem'); r.setAttribute('aria-selected', isSel(p) ? 'true' : 'false'); if (p === selected) r.classList.add('active');
+    r.style.paddingLeft = (12 + depth * 14) + 'px';
+    const link = document.createElement('span'); link.className = 'link';
+    const lt = linkTypeOf(p); link.textContent = depth ? TYPE_ICON[lt] : ''; link.title = lt === 'fixed' ? 'Fixed to its parent' : `${TYPE_LABEL[lt]} (pose with P)`;
+    if (links.some(l => l.a === p.uuid || l.b === p.uuid)) { link.textContent += '⛓'; link.title += ' · also connected to another part'; }
+    if (depth && jointOf(p)) {
+      link.classList.add('pick'); link.title += ' · click to select this connection'; const jid = jointOf(p).uuid;
+      if (connSel?.kind === 'joint' && connSel.id === jid) link.classList.add('on');
+      link.addEventListener('click', ev => { ev.stopPropagation(); selectConn({ kind: 'joint', id: jid }); });
+    }
+    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = baseColor(p);
+    const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = p.name;
+    const eye = document.createElement('button'); eye.className = 'eye'; eye.type = 'button'; eye.title = p.visible ? 'Hide' : 'Show';
+    eye.innerHTML = p.visible ? eyeOpen : eyeShut;
+    eye.addEventListener('click', e => { e.stopPropagation();
+      if (p.userData.optOff && sl) { chooseOption(sl, p.uuid); return; }        // showing a hidden option makes it the choice
+      p.visible = !p.visible; renderOutliner(); markDirty(); if (sprues) rebuildSprues(); });
+    if (sl) { eye.title = p.userData.optOff ? `Show this option of ${sl.name}` : eye.title; }
+    r.append(link, sw, nm);
+    if (boxed(p)) { r.classList.add('in-box'); const tg = document.createElement('span'); tg.className = 'opt-tag'; tg.textContent = 'in box'; tg.title = 'Still sealed in the kit box. Click to open the box.'; r.append(tg); }
+    if (sl) { const tg = document.createElement('span'); tg.className = 'opt-tag'; tg.textContent = `${sl.name} ${sl.members.indexOf(p.uuid) + 1}/${sl.members.length}`; tg.title = p.userData.optOff ? 'An option that isn\'t chosen' : 'The chosen option'; r.append(tg); }
+    r.append(eye);
+    r.addEventListener('click', e => {
+      if (e.ctrlKey || e.metaKey) return select(p, 'toggle');
+      if (e.shiftKey && selected) {             // a range, in outliner order
+        const order = [...box.querySelectorAll('.orow')].map(x => x._part), a = order.indexOf(selected), z = order.indexOf(p);
+        if (a >= 0 && z >= 0) { const range = order.slice(Math.min(a, z), Math.max(a, z) + 1); selectMany(range); select(p, 'add'); return; }
+      }
+      if (boxed(p)) openBox();                  // it's still in the box: unwrap it first
+      select(p);
+    });
+    r._part = p;
+    box.append(r);
+    kids(p).forEach(k => row(k, depth + 1));
+  };
+  roots.forEach(p => row(p, 0));
+  for (const r of refs) {
+    const el = document.createElement('div'); el.className = 'orow ref-row' + (benchSel?.kind === 'ref' && benchSel.k === r.id ? ' active' : '') + (r.visible === false ? ' hidden-part' : '');
+    el.setAttribute('aria-selected', benchSel?.kind === 'ref' && benchSel.k === r.id ? 'true' : 'false');
+    const ic = document.createElement('span'); ic.className = 'link'; ic.textContent = '▣'; ic.title = 'Reference image' + (r.locked ? ' (locked)' : '');
+    const nm = document.createElement('span'); nm.className = 'name'; nm.textContent = r.name;
+    el.append(ic, nm); el.addEventListener('click', () => selectBench('ref', r.id)); box.append(el);
+  }
+}
+function renderPartPanel() {
+  const el = $('part-panel'); el.innerHTML = '';
+  if ($('dock-ws')) try { refreshMenus(); syncWsOps(); } catch (e) {}
+  if (benchSel) return renderBenchPanel(el);
+  if (connSel) { if (connInfo(connSel)) return renderConnPanel(el); connSel = null; }
+  if (!selected) { el.innerHTML = '<p class="note">Select a part to see its size and attachments. Ctrl-click or Ctrl-drag to select several.</p>'; return; }
+  if (selection.length > 1) return renderMultiPanel(el);
+  const p = selected, size = exactBox(p).getSize(V()), par = parentPart(p), j = jointOf(p);
+  const name = document.createElement('input'); name.className = 'name-input'; name.id = 'part-name'; name.value = p.name; name.setAttribute('aria-label', 'Part name');
+  name.addEventListener('change', () => { pushUndo(); p.name = name.value.trim() || p.name; renderOutliner(); markDirty(); });
+  const dl = document.createElement('dl'); dl.className = 'props';
+  const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
+  add('Size', `${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} mm`);
+  add('Triangles', p.userData.part.tris.toLocaleString());
+  add('Attached to', par ? `${par.name} (${TYPE_LABEL[linkTypeOf(p)]})` : '—');
+  add('Carries', subtreeParts(p).length - 1 + ' parts');
+  if (p.userData.part.paint || p.userData.part.fill) add('Paint', [p.userData.part.fill ? 'filled ' + p.userData.part.fill : '', p.userData.part.paint ? 'brushed' : ''].filter(Boolean).join(', '));
+  { const sl = slotOf(p); if (sl) add('Option', `${sl.name}: ${sl.members.indexOf(p.uuid) + 1} of ${sl.members.length}${p.userData.optOff ? ' (not chosen)' : ' (chosen)'}`); }
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, dis) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.disabled = !!dis; x.addEventListener('click', fn); row.append(x); };
+  b('Reset pose', () => { pushUndo(); j.quaternion.copy(j.userData.joint.rest); j.position.copy(j.userData.joint.restPos); j.updateMatrixWorld(true); if (links.length) solveLinks(j); afterHierarchyChange(); }, !j);
+  b('Detach', () => { pushUndo(); detach(p); afterHierarchyChange(); }, !par);
+  if (par) {     // turn the link round: the parent hangs off this part instead
+    const swap = !parentPart(par);
+    b(swap ? `Swap with ${par.name}` : 'Make base', () => {
+      const old = par, base = rootOf(p); if (makeBase(p, true)) toast(swap ? `Swapped: ${old.name} now hangs off ${p.name}.` : `${p.name} is now the base. The links up to ${base.name} turned round.`, 'ok');
+    }, !!rerootCheck(p));
+    row.lastChild.title = rerootCheck(p) || (swap ? `Make ${p.name} the parent and ${par.name} its child. Nothing moves.` : `Make ${p.name} the base: every link between it and the current base turns round. Nothing moves.`);
+  }
+  // (the operations, crack, burst, split and so on, are in the workspace panel above and the menus: not repeated here)
+  if (p.userData.part.ooze) { b('Change ooze…', () => startOoze(p)); row.lastChild.title = 'Open it again: carry it on to more spots, or change how it looks'; }
+  if (!p.userData.part.grower) { b('Use as growth', () => makeGrower(p)); row.lastChild.title = 'Make this part a growth: move it where you like and the parts round it are pushed out of its way'; }
+  b('Drop to grid', () => { pushUndo(); applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); });
+  b('Square up', () => openOrient(p, { kind: 'auto' }));
+  if (p.userData.part.paint || p.userData.part.fill) b('Clear paint', () => { clearPaint([p]); toast(`Cleared the paint on ${p.name}.`); });
+  b('Delete', () => deleteSelected());
+  wsFilterButtons(row); el.append(name, dl, row);
+  axesRows(p, el);
+  shapeRows(p, el);
+  growerRows(p, el);
+  modifierRows(p, el);
+  connectionRows(p, el);
+  magnetRows(p, el);
+}
+/** The selected connection: what it joins, how, its offsets, and its magnets. */
+function renderConnPanel(el) {
+  const ci = connInfo(connSel), c = connSel;
+  const head = document.createElement('div'); head.className = 'multi-head'; head.textContent = ci.kind === 'joint' ? `Connection: ${TYPE_LABEL[ci.type]}` : ci.type === 'rail' ? 'Connection: rail' : 'Connection: extra pin';
+  const sm = document.createElement('small'); sm.textContent = ci.kind === 'joint' ? `${ci.a.name} hangs off ${ci.b.name} here. Move (G) drags the point, Rotate (R) turns its axes; the parts stay put.`
+    : `${ci.a.name} is ${ci.type === 'rail' ? 'on a rail on' : 'pinned to'} ${ci.b.name} here. Move (G) drags the point on ${ci.b.name}${ci.type === 'rail' ? ', Rotate (R) turns the rail' : ''}.`;
+  head.append(sm); el.append(head);
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, title) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; if (title) x.title = title; x.addEventListener('click', fn); row.append(x); return x; };
+  b(`Select ${ci.a.name}`, () => { connSel = null; select(ci.a); renderPartPanel(); });
+  b(`Select ${ci.b.name}`, () => { connSel = null; select(ci.b); renderPartPanel(); });
+  if (ci.kind === 'link') b('Remove', () => { pushUndo(); links = links.filter(l => l.id !== c.id); magnets.forEach(mg => { if (sameConn(mg.conn, c)) delete mg.conn; }); connSel = null; afterHierarchyChange(); renderPartPanel(); toast('Removed that connection.'); });
+  else b('Detach', () => { pushUndo(); const p = ci.a; connSel = null; detach(p); afterHierarchyChange(); select(p); toast(`${p.name} is loose now.`); }, 'Take the part off: no joint, no parent');
+  el.append(row);
+  // type, axis, limits and extra links: the same rows as the part's own
+  if (ci.kind === 'joint') connectionRows(ci.a, el);
+  else connectionRows(ci.a, el, { only: c.id });
+  // offsets you can come back to
+  const off = connOffsets(ci), sec = document.createElement('div'); sec.className = 'conn conn-off';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = ci.kind === 'joint' ? "Offsets (mm, along the joint's own axes)" : "Offsets (mm, along each part's own axes)"; sec.append(h);
+  const stepSel = document.createElement('select'); stepSel.className = 'num osel'; stepSel.setAttribute('aria-label', 'Step');
+  for (const v of ['0.01', '0.05', '0.1', '0.5', '1']) { const o = document.createElement('option'); o.value = v; o.textContent = `${v} mm steps`; stepSel.append(o); } stepSel.value = connStep;
+  stepSel.addEventListener('change', () => { connStep = stepSel.value; });
+  const line = (label, which, vals, tip) => {
+    const f = document.createElement('div'); f.className = 'conn-f off-row'; const l = document.createElement('label'); l.textContent = label; l.title = tip; f.append(l);
+    ['X', 'Y', 'Z'].forEach((ax, i) => {
+      const wrap = document.createElement('span'); wrap.className = 'off-ax';
+      const mk = (t, sg) => { const x = document.createElement('button'); x.type = 'button'; x.className = 'mini'; x.textContent = t; x.setAttribute('aria-label', `${label} ${ax} ${sg > 0 ? 'up' : 'down'} a step`);
+        x.addEventListener('click', () => { const d = [0, 0, 0]; d[i] = sg * +connStep; pushUndo(); shiftConn(connInfo(c), which, d); connChanged(c); }); return x; };
+      const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = connStep; n.value = (+vals[i]).toFixed(2); n.setAttribute('aria-label', `${label} ${ax} in mm`); n.title = `${ax}: ${tip}`;
+      n.addEventListener('change', () => { const d = [0, 0, 0]; d[i] = (+n.value || 0) - vals[i]; if (!d[i]) return; pushUndo(); shiftConn(connInfo(c), which, d); connChanged(c); });
+      const t = document.createElement('span'); t.className = 'ax ' + ax.toLowerCase(); t.textContent = ax;
+      wrap.append(t, mk('−', -1), n, mk('+', 1)); f.append(wrap);
+    });
+    sec.append(f);
+  };
+  if (ci.kind === 'joint') {
+    line('Point', 'point', off.point, `moves where ${ci.a.name} turns (or slides) on ${ci.b.name}, along the joint's axes; nothing else moves`);
+    line(`${ci.a.name} from it`, 'part', off.part, `moves ${ci.a.name} away from the point, along the joint's axes (a gap, or a ball sitting deeper)`);
+  } else {
+    line(`On ${ci.b.name}`, 'point', off.point, `moves the end on ${ci.b.name}, along ${ci.b.name}'s axes`);
+    line(`On ${ci.a.name}`, 'part', off.part, `moves the end on ${ci.a.name}, along ${ci.a.name}'s axes`);
+  }
+  const zr = document.createElement('div'); zr.className = 'btnrow'; zr.append(stepSel);
+  const zero = document.createElement('button'); zero.type = 'button'; zero.className = 'btn'; zero.textContent = 'Clear offsets'; zero.title = 'Put the point and the part back where the connection was made';
+  zero.addEventListener('click', () => { const o = connOffsets(connInfo(c)); if (!o.point.some(Boolean) && !o.part.some(Boolean)) return; pushUndo(); shiftConn(connInfo(c), 'point', o.point.map(v => -v)); shiftConn(connInfo(c), 'part', o.part.map(v => -v)); connChanged(c); toast('Offsets cleared.'); });
+  zr.append(zero); sec.append(zr); el.append(sec);
+  // magnets at this connection
+  const ms = magnets.filter(mg => sameConn(mg.conn, c)), mbox = document.createElement('div'); mbox.className = 'conn';
+  const mh = document.createElement('div'); mh.className = 'conn-h'; mh.textContent = ms.length ? `Magnets here (${ms.length})` : 'Magnets'; mbox.append(mh);
+  for (const mg of ms) {
+    const r2 = document.createElement('div'); r2.className = 'conn-f off-row'; const t = document.createElement('label'); t.textContent = `${magLabel(mg)}, shifted`; r2.append(t);
+    ['across', 'and'].forEach((lab, i) => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = '0.1'; n.value = (+(mg.shift?.[i] || 0)).toFixed(2); n.setAttribute('aria-label', `Magnet shift ${i ? 'Y' : 'X'} in mm`); n.title = 'Shift the pair across the connection, mm';
+      n.addEventListener('change', () => { pushUndo(); mg.shift = mg.shift || [0, 0]; mg.shift[i] = +n.value || 0; placeConnMagnets(c); markDirty(); }); r2.append(n); });
+    const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'mini'; rm.textContent = '✕'; rm.title = 'Remove this pair of holes';
+    rm.addEventListener('click', () => { pushUndo(); magnets = magnets.filter(x => x !== mg); markDirty(); rebuildMagnets(); renderPartPanel(); });
+    const sz = document.createElement('button'); sz.type = 'button'; sz.className = 'mini'; sz.textContent = '⟳'; sz.title = "Give this pair the size and fit set in the Magnet tool's bar";
+    sz.addEventListener('click', () => { pushUndo(); Object.assign(mg, magSize()); placeConnMagnets(c); markDirty(); renderPartPanel(); });
+    r2.append(sz, rm); mbox.append(r2);
+  }
+  const add = document.createElement('div'); add.className = 'btnrow';
+  const ab = document.createElement('button'); ab.type = 'button'; ab.className = 'btn'; ab.textContent = `Add magnet here (${magLabel(magSize())})`;
+  ab.title = `A pair of holes, one in ${ci.a.name} and one in ${ci.b.name}, where they meet along this connection. Size and fit come from the Magnet tool's bar. They move with the connection if you change it later.`;
+  ab.addEventListener('click', () => addConnMagnet(c)); add.append(ab); mbox.append(add); el.append(mbox);
+}
+let connStep = '0.1';
+/** How the selected part is connected: its link type to its parent, and any extra connections (pistons, levers). */
+function connectionRows(p, el, { only = null } = {}) {
+  const par = only ? null : parentPart(p), sec = document.createElement('div'); sec.className = 'conn';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = par ? `Connection to ${par.name}` : only ? 'This connection' : 'Connections'; sec.append(h);
+  if (par && jointOf(p) && !connSel) { const pk = document.createElement('button'); pk.type = 'button'; pk.className = 'mini conn-pick'; pk.textContent = '⌖ Select'; pk.title = 'Select this connection: drag its point, set offsets, add magnets';
+    pk.addEventListener('click', () => selectConn({ kind: 'joint', id: jointOf(p).uuid })); h.append(' ', pk); }
+  const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); sec.append(f); return f; };
+  const num = (v, ph, step, onCh, aria) => { const i = document.createElement('input'); i.type = 'number'; i.className = 'num'; i.step = step; i.placeholder = ph; i.value = v == null ? '' : +(+v).toFixed(2); i.setAttribute('aria-label', aria);
+    i.addEventListener('change', () => onCh(i.value === '' ? null : +i.value)); return i; };
+  const sel = (opts, v, onCh, aria) => { const s2 = document.createElement('select'); s2.className = 'num osel'; s2.setAttribute('aria-label', aria);
+    for (const [k, t] of opts) { const o = document.createElement('option'); o.value = k; o.textContent = t; s2.append(o); } s2.value = v; s2.addEventListener('change', () => onCh(s2.value)); return s2; };
+  const change = (fn, msg) => { pushUndo(); lastOp = null; const err = fn(); scene.updateMatrixWorld(true); if (links.length) solveLinks(jointOf(p)); afterHierarchyChange(); if (err) toast(err, 'bad'); else if (msg) toast(msg, 'ok'); };
+  if (par) {
+    const type = linkTypeOf(p), seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${p.name} connects to ${par.name}`);
+    for (const [t, tip] of [['pinned', 'Turns any way about its point, like a ball or a pin in a socket'], ['hinge', 'Turns about one axis only, like a knee'], ['roller', 'Slides along one axis and turns any way as it goes, like a ball riding in a channel'], ['fixed', "Doesn't move"]]) {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = TYPE_LABEL[t]; b.title = tip; b.setAttribute('aria-pressed', type === t ? 'true' : 'false');
+      b.addEventListener('click', () => { if (type !== t) change(() => setLinkType(p, t), `${p.name} is now ${TYPE_LABEL[t].toLowerCase()} to ${par.name}.`); });
+      seg.append(b);
+    }
+    sec.append(seg);
+    const j = jointOf(p), jd = j?.userData.joint;
+    if (jd && (jd.type === 'hinge' || jd.type === 'roller')) {
+      const isH = jd.type === 'hinge', unit = isH ? '°' : 'mm';
+      field(isH ? 'Turns about' : 'Slides along', sel([...(isH ? [['joint', 'Joint axis']] : []), ['x', `${p.name}'s X`], ['y', `${p.name}'s Y`], ['z', `${p.name}'s Z`],
+          ...(jd.axis === 'custom' ? [['custom', jd.axisName || 'Picked faces']] : []), ['faces', 'Pick faces…']], jd.axis || (isH ? 'joint' : 'z'),
+        v => {
+          if (v !== 'faces') { change(() => setLinkType(p, jd.type, v)); return; }
+          startDirPick(isH ? `Pick faces for ${p.name}'s hinge axis` : `Pick faces for ${p.name} to slide along`, d => change(() => {
+            const jj = jointOf(p); reframeJoint(jj, d.dir); jj.userData.joint.axis = 'custom'; jj.userData.joint.axisName = d.name[0].toUpperCase() + d.name.slice(1); jj.userData.joint.min = jj.userData.joint.max = null;
+          }, `${p.name} now ${isH ? 'turns about' : 'slides along'} ${d.name}.`), { onCancel: renderPartPanel });
+        }, isH ? 'Hinge axis' : 'Roller axis'));
+      const val = num(jointValue(j), '0', isH ? 1 : 0.1, v => { pushUndo(); lastOp = null; const prev = linkedState(j); setJointValue(j, v || 0); const r = poseWithLinks(j, prev); afterHierarchyChange();
+        if (!r.ok) toast(`The linkage stops it at ${jointValue(j).toFixed(isH ? 1 : 2)}${isH ? '°' : ' mm'}: a piston or rail won't reach any further.`, 'bad'); }, isH ? 'Hinge angle in degrees' : 'Roller travel in mm'); val.id = 'conn-value';
+      field(isH ? `Angle ${unit}` : `Travel ${unit}`, val);
+      field(`Limits ${unit}`, num(jd.min, 'none', isH ? 1 : 0.1, v => change(() => { jd.min = v; constrainJoint(j); }), 'Lower limit'), document.createTextNode('to'),
+        num(jd.max, 'none', isH ? 1 : 0.1, v => change(() => { jd.max = v; constrainJoint(j); }), 'Upper limit'));
+    }
+  }
+  // extra connections that close loops: pistons, levers
+  const mine = links.filter(l => (l.a === p.uuid || l.b === p.uuid) && (!only || l.id === only));
+  for (const l of mine) {
+    const other = partByUuid(l.a === p.uuid ? l.b : l.a); if (!other) continue;
+    const railOn = partByUuid(l.b), f = document.createElement('div'); f.className = 'conn-link';
+    const t = document.createElement('span');
+    t.textContent = l.kind !== 'rail' ? `Also pinned to ${other.name}` : railOn === p ? `${other.name} rides a rail on it (${railLabel(l)})` : `Rides a rail on ${railOn.name} (${railLabel(l)})`;
+    // seen from this part, a rail is on the other part: the rail side is b
+    const custom = l.kind === 'rail' && Array.isArray(l.axis);
+    const kind = sel([['pin', 'Pin'], ['rail-x', `Rail along ${other.name}'s X`], ['rail-y', `Rail along ${other.name}'s Y`], ['rail-z', `Rail along ${other.name}'s Z`],
+        ...(custom && railOn === other ? [['rail-custom', `Rail along ${l.axisName || 'the picked faces'}`]] : []), ['rail-faces', 'Rail along picked faces…']],
+      l.kind === 'rail' && railOn === other ? (custom ? 'rail-custom' : 'rail-' + l.axis) : l.kind === 'rail' ? '' : 'pin', v => {
+      if (v === 'rail-custom') return;
+      if (v === 'rail-faces') {
+        startDirPick('Pick faces for the rail', d => change(() => {
+          const A = partByUuid(l.a), B = partByUuid(l.b); A.updateMatrixWorld(true); B.updateMatrixWorld(true);
+          const at = V(...l.pa).applyMatrix4(A.matrixWorld);
+          if (l.b === p.uuid) Object.assign(l, { a: B.uuid, b: A.uuid });            // the rail goes on the other part
+          const a2 = partByUuid(l.a), b2 = partByUuid(l.b);
+          l.pa = at.clone().applyMatrix4(a2.matrixWorld.clone().invert()).toArray(); l.pb = at.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray();
+          l.kind = 'rail'; l.axis = d.dir.clone().transformDirection(b2.matrixWorld.clone().invert()).normalize().toArray(); l.axisName = d.name; l.min = l.max = null;
+        }, `Now rides a rail along ${d.name}.`), { onCancel: renderPartPanel });
+        return;
+      }
+      change(() => {
+        const A = partByUuid(l.a), B = partByUuid(l.b); A.updateMatrixWorld(true); B.updateMatrixWorld(true);
+        const at = V(...l.pa).applyMatrix4(A.matrixWorld);                  // where the moving end is now: the pin or the rail starts there
+        if (v !== 'pin' && l.b === p.uuid) { Object.assign(l, { a: B.uuid, b: A.uuid }); }
+        const a2 = partByUuid(l.a), b2 = partByUuid(l.b);
+        l.pa = at.clone().applyMatrix4(a2.matrixWorld.clone().invert()).toArray(); l.pb = at.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray();
+        if (v === 'pin') l.kind = 'pin'; else { l.kind = 'rail'; l.axis = v.slice(5); l.axisName = ''; l.min = l.max = null; } }); }, 'Connection kind');
+    if (l.kind === 'rail' && railOn === p) { const o = document.createElement('option'); o.value = ''; o.textContent = `Rail on ${p.name}`; o.disabled = true; kind.prepend(o); kind.value = ''; }
+    const del = document.createElement('button'); del.type = 'button'; del.className = 'mini'; del.textContent = '✕'; del.title = 'Remove this connection';
+    del.addEventListener('click', () => change(() => { links = links.filter(x => x !== l); }, 'Removed that connection.'));
+    const pick = document.createElement('button'); pick.type = 'button'; pick.className = 'mini'; pick.textContent = '⌖'; pick.title = 'Select this connection: drag its point, set offsets, add magnets';
+    pick.addEventListener('click', () => selectConn({ kind: 'link', id: l.id }));
+    f.append(t, kind, ...(only ? [] : [pick]), del); sec.append(f);
+    { const lab = document.createElement('label'); lab.className = 'check conn-face'; const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!l.face;
+      cb.title = `Keep ${partByUuid(l.a)?.name || 'it'} facing the same way relative to ${partByUuid(l.b)?.name || 'the part it\'s linked to'} while you pose, instead of spinning on its own axis`;
+      cb.addEventListener('change', () => change(() => { if (cb.checked) setFacing(l); else delete l.face; }, cb.checked ? 'It keeps facing this way as you pose.' : 'It can spin on its own axis as you pose.'));
+      lab.append(cb, ' Keep facing this way'); sec.append(lab); }
+    if (l.kind === 'rail') field('Rail ends mm', num(l.min, 'none', 0.1, v => change(() => { l.min = v; }), 'Rail start'), document.createTextNode('to'), num(l.max, 'none', 0.1, v => change(() => { l.max = v; }), 'Rail end'));
+  }
+  const others = liveParts().filter(o => o !== p && !mine.some(l => l.a === o.uuid || l.b === o.uuid) && o !== par);
+  if (others.length && !only) {
+    const who = sel([['', 'Connect also to…'], ...others.map(o => [o.uuid, o.name])], '', () => {}, 'Part to connect to');
+    const kind = sel([['pin', 'with a pin'], ['rail-x', 'on a rail (its X)'], ['rail-y', 'on a rail (its Y)'], ['rail-z', 'on a rail (its Z)']], 'pin', () => {}, 'Connection kind');
+    const go = document.createElement('button'); go.type = 'button'; go.className = 'btn'; go.textContent = 'Connect';
+    go.title = 'For pistons and linkages: keeps its own parent and also stays connected to this part where they meet. Posing then moves both to keep it together.';
+    go.addEventListener('click', () => { const o = partByUuid(who.value); if (!o) { toast('Pick the part to connect to first.', 'bad'); return; }
+      toast(`Finding where ${p.name} meets ${o.name}…`);
+      setTimeout(() => change(() => { const k = kind.value; addLink(p, o, k === 'pin' ? 'pin' : 'rail', k === 'pin' ? 'z' : k.slice(5)); },
+        `${p.name} is now also ${kind.value === 'pin' ? 'pinned to' : 'on a rail on'} ${o.name}. Pose the joints around it and it moves to stay connected.`), 30); });
+    const f = document.createElement('div'); f.className = 'conn-add'; f.append(who, kind, go); sec.append(f);
+  }
+  el.append(sec);
+}
+/** While posing: keep the angle or travel box showing where the joint is. */
+function posePanelLive() { const i = $('conn-value'), j = selected && jointOf(selected); if (i && j && document.activeElement !== i) i.value = +jointValue(j).toFixed(2); }
+function renderMultiPanel(el) {
+  const list = selection, roots = selectionRoots(), box = new THREE.Box3(); list.forEach(m => box.union(exactBox(m)));
+  const size = box.getSize(V()), tris = list.reduce((a, m) => a + m.userData.part.tris, 0);
+  const head = document.createElement('div'); head.className = 'multi-head'; head.textContent = `${list.length} parts selected`;
+  const sm = document.createElement('small'); sm.textContent = `Active (last picked): ${selected.name}. Move and Rotate turn them together.`; head.append(sm);
+  const dl = document.createElement('dl'); dl.className = 'props';
+  const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
+  add('Together', `${size.x.toFixed(2)} × ${size.y.toFixed(2)} × ${size.z.toFixed(2)} mm`);
+  add('Triangles', tris.toLocaleString());
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, dis, title) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.disabled = !!dis; if (title) x.title = title; x.addEventListener('click', fn); row.append(x); };
+  const others = list.filter(m => m !== selected);
+  if (growthSpots(list).length >= 2) { b('Connect with ooze', () => connectWithOoze(list)); row.lastChild.title = 'String ooze between the growths and bursts you picked, nearest to nearest'; }
+  b(`Attach to ${selected.name}`, () => {
+    pushUndo(); let n = 0;
+    for (const m of others) if (!isDescendant(selected, m) && parentPart(m) !== selected) { attach(m, selected, 'plain'); n++; }
+    afterHierarchyChange(); toast(n ? `Attached ${n} part${n > 1 ? 's' : ''} to ${selected.name}.` : 'Nothing to attach.', n ? 'ok' : '');
+  }, !others.length, 'The others follow the active part (fixed, no joint)');
+  b('Detach', () => { pushUndo(); list.filter(m => parentPart(m)).forEach(m => detach(m)); afterHierarchyChange(); }, !list.some(m => parentPart(m)));
+  b('Drop to grid', () => { pushUndo(); const dz = -lowestZ(list); roots.forEach(m => applyWorld(m, Tr(V(0, 0, dz)))); afterHierarchyChange(); }, false, 'Lowers them together until the lowest touches the grid');
+  b('Square up together', () => openOrient(selected, { kind: 'auto' }));
+  b('Mirror…', () => openMarr('mirror'), false, 'Mirror them, or make mirrored copies (Ctrl+M)'); b('Array…', () => openMarr('linear'), false, 'Copies along a line or round an axis'); b('Scatter…', () => startScatter(), false, 'Scatter copies of these, mixed at random, over a face of another part');
+  const allShown = list.every(m => m.visible);
+  b(allShown ? 'Hide' : 'Show', () => { list.forEach(m => { m.visible = !allShown; }); renderOutliner(); renderPartPanel(); markDirty(); });
+  b('Delete', () => deleteSelected());
+  el.append(head, dl, row);
+}
+function deleteSelected() {
+  const list = selection.length ? [...selection] : selected ? [selected] : [];
+  if (!list.length) return;
+  pushUndo(); lastOp = null;
+  select(null);
+  for (const p of list) {
+    // children that aren't being deleted keep their place: hand them to the world
+    liveParts().filter(c => parentPart(c) === p && !list.includes(c)).forEach(c => detach(c));
+    detach(p); world.remove(p);
+  }
+  afterHierarchyChange();
+  if (list.length > 1) toast(`Deleted ${list.length} parts.`);
+}
+function afterHierarchyChange() {
+  scene.updateMatrixWorld(true);
+  markDirty();
+  if (typeof seamFx !== 'undefined' && seamFx.children.length) clearSeamPreview();
+  if (typeof pocketFx !== 'undefined' && pocketFx.children.length) clearPocketPreview();      // the parts moved: the pockets may have too
+  if (typeof renderFolderStatus === 'function') renderFolderStatus();
+  selection = selection.filter(m => m.parent); tidyLinks();
+  if (selected && !selected.parent) selected = selection[selection.length - 1] || null;
+  paintSelection();
+  renderOutliner(); renderPartPanel(); renderOptions(); rebuildSprues(); rebuildMagnets(); showAdjust(); updateButtons(); updateStats(); syncGizmo();
+  if (sec.on) scheduleFit();
+  if (typeof refreshGrowers === 'function') refreshGrowers();
+}
+// ---------------------------------------------------------------------------
+// Rearranging by drag and drop: in the parts list and in the link in place review
+// ---------------------------------------------------------------------------
+/**
+ * Rows (class dnd-row, with a _key) can be dragged onto each other. Dropping on a row's name attaches the
+ * dragged part to it; on its right end, makes it an option of it; on empty space, sets it loose.
+ * can(src, dst, zone) says what's allowed; drop(src, dst, zone) does it; hint(src, dst, zone) describes it.
+ */
+function treeDnD(box, { can, drop, hint }) {
+  let src = null;
+  const clear = () => { box.querySelectorAll('[data-drop]').forEach(r => { delete r.dataset.drop; delete r.dataset.hint; }); box.classList.remove('drop-loose'); delete box.dataset.hint; };
+  const where = e => { const row = e.target.closest('.dnd-row'); if (!row || !box.contains(row)) return { row: null, dst: null, zone: 'loose' };
+    const r = row.getBoundingClientRect(); return { row, dst: row._key, zone: e.clientX > r.left + r.width * 0.62 ? 'option' : 'attach' }; };
+  box.addEventListener('dragstart', e => { const row = e.target.closest?.('.dnd-row'); if (!row || e.target.closest('select, button, input')) return;
+    src = row._key; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('application/x-kitbash-part', '1'); row.classList.add('dragging');
+    box.dataset.loose = can(src, null, 'loose') ? 'Drop here to set it loose' : ''; box.classList.add('dnd-on'); });
+  box.addEventListener('dragend', () => { src = null; clear(); box.classList.remove('dnd-on'); box.querySelectorAll('.dragging').forEach(r => r.classList.remove('dragging')); });
+  box.addEventListener('dragover', e => {
+    if (src == null) return; const { row, dst, zone } = where(e); clear();
+    if (!can(src, dst, zone)) { e.dataTransfer.dropEffect = 'none'; return; }
+    e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+    if (row) { row.dataset.drop = zone; row.dataset.hint = hint(src, dst, zone); } else { box.classList.add('drop-loose'); box.dataset.hint = hint(src, dst, zone); }
+  });
+  box.addEventListener('dragleave', e => { if (!box.contains(e.relatedTarget)) clear(); });
+  box.addEventListener('drop', e => { if (src == null) return; e.preventDefault(); e.stopPropagation(); const { dst, zone } = where(e), s2 = src; src = null; clear(); if (can(s2, dst, zone)) drop(s2, dst, zone); });
+}
+/** Attach `part` to `to`: with a joint where they touch, or fixed if they don't. Its options come along. */
+function attachSmart(part, to) {
+  toast(`Checking where ${part.name} touches ${to.name}…`);
+  setTimeout(() => {
+    let c = null; try { c = contactBetween(contactContext([to, part]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) { console.warn(e); }
+    pushUndo(); lastOp = null;
+    let e = null; if (c) e = planRig([to, part], [c], 0).edges[0];
+    const how = e ? e.how : 'plain', w = e ? attach(part, to, how, e.joint, e.axis) : attach(part, to, 'plain');
+    const sl = slotOf(part); if (sl && !w) shareSlotJoint(sl, part);
+    afterHierarchyChange(); select(part);
+    toast(w || (e ? `Attached ${part.name} to ${to.name}${how === 'joint' ? ` with a ${KIND_LABEL[e.kind] || 'joint'} where they touch` : ', fixed'}.` : `Attached ${part.name} to ${to.name}, fixed: they don't touch, so there's no joint.`) + (sl && !w ? ` Its other options came too.` : ''), w ? 'bad' : 'ok');
+  }, 30);
+}
+/** Make `part` an alternative for `to` in the same spot: they become alternates for one spot and hang where `to` hangs. */
+function makeOptionOf(part, to) {
+  pushUndo(); lastOp = null;
+  for (const o of options.slots) o.members = o.members.filter(id => id !== part.uuid);
+  let sl = slotOf(to);
+  if (!sl) { const cn = commonName([to.name, part.name]); sl = { id: uid(), name: /^Spot \d+$/.test(cn) ? `${to.name} alternates` : cn, members: [to.uuid], active: to.uuid }; options.slots.push(sl); }
+  sl.members.push(part.uuid);
+  if (parentPart(to)) shareSlotJoint(sl, to); else if (parentPart(part)) detach(part);
+  applyOptions(); afterHierarchyChange(); select(to);
+  toast(`${part.name} is now an alternate for ${to.name} in "${sl.name}" (${sl.members.length} alternates). ${partById(sl.active)?.name} shows; switch in the Alternates tab or with the eye in the list.`, 'ok');
+}
+function setLoose(part) {
+  pushUndo(); lastOp = null;
+  const sl = slotOf(part);
+  if (sl) { sl.members = sl.members.filter(id => id !== part.uuid); part.userData.optOff = false; part.visible = true; }
+  if (parentPart(part)) detach(part);
+  applyOptions(); afterHierarchyChange(); select(part);
+  toast(`${part.name} is on its own now${sl ? `, no longer an alternate in "${sl.name}"` : ''}. Nothing moved.`);
+}
+function bindTreeDnD() {
+  treeDnD($('outliner'), {
+    can: (p, q, zone) => zone === 'loose' ? !!(parentPart(p) || slotOf(p))
+      : q && q !== p && !subtreeParts(p).includes(q) && (zone === 'attach' ? parentPart(p) !== q : !(slotOf(p) && slotOf(p) === slotOf(q))),
+    hint: (p, q, zone) => zone === 'loose' ? `Set ${p.name} loose` : zone === 'attach' ? `Attach to ${q.name}` : `Option of ${q.name}`,
+    drop: (p, q, zone) => zone === 'loose' ? setLoose(p) : zone === 'attach' ? attachSmart(p, q) : makeOptionOf(p, q),
+  });
+  treeDnD($('ar-list'), {
+    can: arCan,
+    hint: (k, j, zone) => zone === 'loose' ? `Leave ${ar.meshes[k].name} loose` : zone === 'attach' ? `Attach to ${ar.meshes[j].name}` : `Option of ${ar.meshes[j].name}`,
+    drop: arSet,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Options: interchangeable parts for one spot (heads, weapons…), sets of choices, export per set
+// ---------------------------------------------------------------------------
+let options = { slots: [], sets: [] };
+const partById = id => parts.find(p => p.uuid === id && p.parent) || null;
+const uid = () => THREE.MathUtils.generateUUID().slice(0, 8);
+function slotOf(part) { return options.slots.find(sl => sl.members.includes(part.uuid)) || null; }
+function slotMembers(sl) { return sl.members.map(partById).filter(Boolean); }
+function tidyOptions() {                                      // drop deleted parts and empty slots
+  for (const sl of options.slots) { sl.members = sl.members.filter(id => partById(id)); if (!sl.members.includes(sl.active)) sl.active = sl.members[0] || null; }
+  options.slots = options.slots.filter(sl => sl.members.length);
+}
+/** Show only the chosen part of each slot (the others are hidden, and their joint stays shared). */
+function applyOptions() {
+  tidyOptions();
+  for (const sl of options.slots) for (const m of slotMembers(sl)) {
+    const on = m.uuid === sl.active;
+    if (!on) { m.userData.optOff = true; m.visible = false; }
+    else if (m.userData.optOff) { m.userData.optOff = false; m.visible = true; }
+  }
+  for (const m of liveParts()) if (m.userData.optOff && !slotOf(m)) { m.userData.optOff = false; m.visible = true; }
+}
+/** Hang every option of a slot off the same joint (or the same parent) as the one that's attached. */
+function shareSlotJoint(sl, prefer) {
+  const ms = slotMembers(sl); if (ms.length < 2) return 0;
+  const anchor = (prefer && parentPart(prefer) && ms.includes(prefer)) ? prefer : ms.find(m => jointOf(m)) || ms.find(m => parentPart(m));
+  if (!anchor) return 0;
+  const host = jointOf(anchor) || anchor.parent; let n = 0;
+  for (const m of ms) {
+    if (m === anchor || m.parent === host) continue;
+    if (isDescendant(host, m)) continue;                       // never hang a part off its own child
+    const old = jointOf(m); host.attach(m);
+    if (old && !old.children.some(isPart) && old.parent) old.parent.remove(old);
+    n++;
+  }
+  return n;
+}
+function commonName(names) {
+  if (!names.length) return 'Option';
+  let pre = names[0]; for (const n of names) while (pre && !n.startsWith(pre)) pre = pre.slice(0, -1);
+  pre = pre.replace(/[\s_\-.(]+$/, '').trim();
+  return pre.length >= 3 ? pre : `Spot ${options.slots.length + 1}`;
+}
+function makeSlot() {
+  const list = selection.length ? [...selection] : selected ? [selected] : [];
+  if (!list.length) { toast('Select the parts that can swap for each other first (Ctrl-click to pick several).', 'bad'); return; }
+  pushUndo();
+  // a part can only be in one slot: move it
+  for (const sl of options.slots) sl.members = sl.members.filter(id => !list.some(m => m.uuid === id));
+  const sl = { id: uid(), name: commonName(list.map(m => m.name)), members: list.map(m => m.uuid), active: (selected && list.includes(selected) ? selected : list[0]).uuid };
+  options.slots.push(sl);
+  const n = shareSlotJoint(sl);
+  applyOptions(); afterHierarchyChange();
+  setTimeout(() => { const el = document.querySelector('#opt-slots .opt-slot:last-child input'); if (el) { el.focus(); el.select(); } }, 0);   // name it straight away
+  toast(`Made "${sl.name}": ${list.length} alternate part${list.length > 1 ? 's' : ''} for one spot.` + (n ? ` ${n} now share${n === 1 ? 's' : ''} the same joint.` : !list.some(m => parentPart(m)) ? ' Snap one of them where it goes and the others will hang off the same joint.' : ''), 'ok');
+}
+function addToSlot(sl) {
+  const list = (selection.length ? selection : selected ? [selected] : []).filter(m => !sl.members.includes(m.uuid));
+  if (!list.length) { toast('Select the parts to add to these alternates first.', 'bad'); return; }
+  pushUndo();
+  for (const o of options.slots) o.members = o.members.filter(id => !list.some(m => m.uuid === id));
+  sl.members.push(...list.map(m => m.uuid));
+  const n = shareSlotJoint(sl);
+  applyOptions(); afterHierarchyChange();
+  toast(`Added ${list.length} to "${sl.name}".` + (n ? ' They share its joint.' : ''), 'ok');
+}
+function chooseOption(sl, id) { if (sl.active === id) return; sl.active = id; applyOptions(); afterHierarchyChange(); }
+const currentPick = () => Object.fromEntries(options.slots.map(sl => [sl.id, sl.active]));
+function applyPick(pick) { for (const sl of options.slots) if (pick[sl.id] && sl.members.includes(pick[sl.id])) sl.active = pick[sl.id]; applyOptions(); }
+const pickLabel = pick => options.slots.map(sl => partById(pick[sl.id] || sl.active)?.name).filter(Boolean).join(' · ');
+const samePick = (a, b) => options.slots.every(sl => (a[sl.id] || sl.active) === (b[sl.id] || sl.active));
+
+function renderOptions() {
+  tidyOptions();
+  const box = $('opt-slots'); box.innerHTML = '';
+  const nS = options.slots.length;
+  $('opt-count').textContent = nS ? `${nS}${options.sets.length ? ` · ${options.sets.length} build${options.sets.length > 1 ? 's' : ''}` : ''}` : '';
+  const selN = selection.length || (selected ? 1 : 0);
+  $('opt-new').disabled = !selN;
+  $('opt-new').textContent = selN > 1 ? `Make the ${selN} selected alternates` : 'Make alternates from selection';
+  for (const sl of options.slots) {
+    const el = document.createElement('div'); el.className = 'opt-slot';
+    const head = document.createElement('div'); head.className = 'opt-slot-head';
+    const nm = document.createElement('input'); nm.value = sl.name; nm.setAttribute('aria-label', 'Name of this spot');
+    nm.addEventListener('change', () => { sl.name = nm.value.trim() || sl.name; renderOptions(); markDirty(); });
+    const add = document.createElement('button'); add.className = 'mini'; add.type = 'button'; add.textContent = '+ add selected'; add.title = 'Add the selected parts as more alternates here';
+    add.addEventListener('click', () => addToSlot(sl));
+    const del = document.createElement('button'); del.className = 'mini'; del.type = 'button'; del.textContent = '✕'; del.title = 'Stop these being alternates (the parts stay, all shown)';
+    del.addEventListener('click', () => { pushUndo(); options.slots = options.slots.filter(o => o !== sl); slotMembers(sl).forEach(m => { m.userData.optOff = false; m.visible = true; }); applyOptions(); afterHierarchyChange(); });
+    head.append(nm, add, del);
+    const chips = document.createElement('div'); chips.className = 'opt-chips'; chips.setAttribute('role', 'radiogroup'); chips.setAttribute('aria-label', sl.name);
+    for (const m of slotMembers(sl)) {
+      const c = document.createElement('div'); c.className = 'opt-chip'; c.setAttribute('role', 'radio'); c.tabIndex = 0;
+      c.setAttribute('aria-pressed', m.uuid === sl.active ? 'true' : 'false'); c.setAttribute('aria-checked', m.uuid === sl.active ? 'true' : 'false');
+      const t = document.createElement('span'); t.textContent = m.name; c.title = `Show ${m.name}`;
+      const x = document.createElement('button'); x.className = 'x'; x.type = 'button'; x.textContent = '×'; x.title = `${m.name} stops being an alternate here`;
+      x.addEventListener('click', e => { e.stopPropagation(); pushUndo(); sl.members = sl.members.filter(id => id !== m.uuid); m.userData.optOff = false; m.visible = true; applyOptions(); afterHierarchyChange(); });
+      c.addEventListener('click', () => chooseOption(sl, m.uuid));
+      c.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); chooseOption(sl, m.uuid); } });
+      c.append(t, x); chips.append(c);
+    }
+    const ms = slotMembers(sl), hosts = new Set(ms.map(m => jointOf(m) || (parentPart(m) ? m.parent : null)));
+    const meta = document.createElement('div'); meta.className = 'opt-meta';
+    const par = ms.map(parentPart).find(Boolean);
+    meta.textContent = !par ? 'Not attached yet. Snap one where it goes; the rest follow onto the same joint.'
+      : hosts.size === 1 && !hosts.has(null) ? `All ${ms.length} on ${jointOf(ms[0]) ? 'one joint' : 'the same spot'} of ${par.name}.`
+      : `Some alternates aren't on the shared joint of ${par.name}. Snap them, or remove and re-add them.`;
+    el.append(head, chips, meta); box.append(el);
+  }
+  $('opt-sets-f').hidden = !nS;
+  const sb = $('opt-sets'); sb.innerHTML = '';
+  const cur = currentPick();
+  for (const st of options.sets) {
+    const r = document.createElement('div'); r.className = 'opt-set' + (samePick(st.pick, cur) ? ' current' : '');
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = st.export !== false; cb.setAttribute('aria-label', `Export ${st.name}`);
+    cb.addEventListener('change', () => { st.export = cb.checked; renderOptions(); markDirty(); });
+    const sn = document.createElement('div'); sn.className = 'sn';
+    const b = document.createElement('b'); b.textContent = st.name; b.title = 'Double-click to rename';
+    b.addEventListener('dblclick', () => { const v = prompt('Build name', st.name); if (v && v.trim()) { st.name = v.trim(); renderOptions(); markDirty(); } });
+    const sm = document.createElement('small'); sm.textContent = pickLabel(st.pick); sn.append(b, sm);
+    const show = document.createElement('button'); show.className = 'btn'; show.type = 'button'; show.textContent = 'Show';
+    show.addEventListener('click', () => { applyPick(st.pick); afterHierarchyChange(); toast(`Showing ${st.name}.`); });
+    const del = document.createElement('button'); del.className = 'mini'; del.type = 'button'; del.textContent = '✕'; del.title = 'Delete this build';
+    del.addEventListener('click', () => { options.sets = options.sets.filter(o => o !== st); renderOptions(); markDirty(); });
+    r.append(cb, sn, show, del); sb.append(r);
+  }
+  const ticked = options.sets.filter(st => st.export !== false).length;
+  $('opt-exp-sets').disabled = !ticked;
+  $('opt-exp-sets').textContent = ticked ? `Export ${ticked} ticked build${ticked > 1 ? 's' : ''}` : 'Export ticked builds';
+  const combos = options.slots.reduce((a, sl) => a * Math.max(1, sl.members.length), 1);
+  $('opt-exp-all').textContent = `Every combination (${combos})`; $('opt-exp-all').disabled = combos > 64;
+  $('opt-exp-all').title = combos > 64 ? 'More than 64 combinations: save the builds you want instead' : 'One STL for every mix of alternates';
+}
+/** Export one STL per pick. Puts the current choice back afterwards. */
+async function exportPicks(list) {
+  if (!list.length) return;
+  const keep = currentPick(), files = [], notes = [];
+  try {
+    for (const [k, { name, pick }] of list.entries()) {
+      toast(`Building ${k + 1} of ${list.length}: ${name}…`); await nextFrame();
+      applyPick(pick); const ms = exportMeshes(); if (!ms.length) continue;
+      const { data, note } = await oneSTL(ms); if (note) notes.push(`${name}: ${note}`);
+      let fn = safe(name) + '.stl', i = 2; while (files.some(f => f.name === fn)) fn = `${safe(name)} (${i++}).stl`;
+      files.push({ name: fn, data });
+    }
+  } finally { applyPick(keep); afterHierarchyChange(); }
+  if (notes.length) $('exp-note').textContent = notes.slice(0, 3).join(' ');
+  await deliver(files, `${safe(project.name || 'kit')}-builds.zip`);
+}
+function bindOptions() {
+  $('opt-new').addEventListener('click', () => { showDockTab('tab-opts'); makeSlot(); });
+  $('opt-save-set').addEventListener('click', () => {
+    const pick = currentPick(), same = options.sets.find(st => samePick(st.pick, pick));
+    if (same) { toast(`That's already saved as "${same.name}".`); return; }
+    options.sets.push({ id: uid(), name: `Build ${options.sets.length + 1}`, pick, export: true });
+    renderOptions(); markDirty(); toast(`Saved "Build ${options.sets.length}": ${pickLabel(pick)}. Double-click its name to rename.`, 'ok');
+  });
+  $('opt-exp-sets').addEventListener('click', () => exportPicks(options.sets.filter(st => st.export !== false).map(st => ({ name: st.name, pick: st.pick }))));
+  $('opt-exp-all').addEventListener('click', () => {
+    let combos = [{}];
+    for (const sl of options.slots) combos = combos.flatMap(c => sl.members.map(id => ({ ...c, [sl.id]: id })));
+    exportPicks(combos.map(pick => ({ name: pickLabel(pick), pick })));
+  });
+}
+// ---------------------------------------------------------------------------
+// Sprues: loose parts shown still on the plastic, like a new kit; printable as kits too
+// ---------------------------------------------------------------------------
+let sprues = null;          // { frames: [{ letter, x0, y0, x1, y1, z, runners }], gates: [{ part, frame, a, b, r0, r1 }], poses: { id: matrix }, nums: { id: n }, labels: { id: [x,y,z] } }
+const sprueFx = new THREE.Group(); scene.add(sprueFx);
+const SPRUE_BAR = 2.6, SPRUE_GAP = 6;
+const sprueMat = new THREE.MeshStandardMaterial({ color: '#c9ccce', roughness: 0.5, metalness: 0.0 });
+const labelTex = new Map();
+function labelSprite(text, size) {
+  let tex = labelTex.get(text);
+  if (!tex) {
+    const c = document.createElement('canvas'); c.width = 128; c.height = 64; const g = c.getContext('2d');
+    g.fillStyle = 'rgba(30,34,38,.82)'; g.beginPath(); g.roundRect(4, 4, 120, 56, 14); g.fill();
+    g.fillStyle = '#e8e2d4'; g.font = '600 40px "Barlow Semi Condensed", system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 64, 34);
+    tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; labelTex.set(text, tex);
+  }
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true })); s.scale.set(size * 2, size, 1); s.renderOrder = 996; return s;
+}
+/** A name moulded on a tag: dark lettering lying flat on the tag's top. */
+function tagText(text, w, h = 3.4) {
+  const key = 'flat:' + text; let tex = labelTex.get(key);
+  if (!tex) {
+    const c = document.createElement('canvas'), px = 48; c.height = Math.round(px * 1.4); c.width = Math.round(c.height * w / h);
+    const g = c.getContext('2d'); g.fillStyle = '#4f5559'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    let fs = px; g.font = `600 ${fs}px "Barlow Semi Condensed", system-ui, sans-serif`;
+    while (g.measureText(text).width > c.width * 0.92 && fs > 10) { fs -= 2; g.font = `600 ${fs}px "Barlow Semi Condensed", system-ui, sans-serif`; }
+    g.fillText(text, c.width / 2, c.height / 2 + 2);
+    tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4; labelTex.set(key, tex);
+  }
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  m.renderOrder = 996; return m;
+}
+/** Is this part still where it was put on the sprue (not moved, snapped or hidden since)? */
+function onSprue(m) {
+  const P = sprues?.poses[m.uuid]; if (!P || !m.parent || !isVisibleChain(m)) return false;
+  m.updateMatrixWorld(true); const e = m.matrixWorld.elements;
+  for (let i = 0; i < 16; i++) if (Math.abs(e[i] - P[i]) > 1e-4) return false;
+  return true;
+}
+function indexed(g) { if (!g.index) g.setIndex(Array.from({ length: g.attributes.position.count }, (_, i) => i)); return g; }
+function sprueMeshes(k) {                               // the plastic of one frame, with gates only to pieces still on it
+  const f = sprues.frames[k];
+  const gates = sprues.gates.filter(g => g.frame === k && (() => { const m = partById(g.part); return m && onSprue(m); })());
+  const g = mergeVertices(sprueGeometry(f, gates, SPRUE_BAR), 1e-4); g.computeVertexNormals();     // smooth, like moulded plastic
+  const mesh = new THREE.Mesh(g, sprueMat); mesh.updateMatrixWorld(true); return mesh;
+}
+function rebuildSprues() {
+  while (sprueFx.children.length) { const c = sprueFx.children.pop(); c.traverse(o => { o.geometry?.dispose(); if (o.material && o.material !== sprueMat) o.material.dispose(); }); }
+  $('exp-sprue-f').hidden = !sprues;
+  if (!sprues) { markBench(); return; }
+  const groups = sprues.frames.map((f, k) => {
+    const g = new THREE.Group(); g.name = 'sprue-' + f.letter; g.userData.frame = k; sprueFx.add(g);
+    g.add(sprueMeshes(k));
+    const tag = labelSprite(f.letter, 4.5); tag.position.set(f.x0 + 9, f.y1 + SPRUE_BAR / 2 + 3, f.z + 2); g.add(tag);
+    return g;
+  });
+  const frameOf = {}; for (const gt of sprues.gates) frameOf[gt.part] ??= gt.frame;
+  for (const [id, n] of Object.entries(sprues.nums)) {
+    const m = partById(id); if (!m || !onSprue(m) || !sprues.labels[id] || groups[frameOf[id]] === undefined) continue;
+    const text = sprues.text?.[id] || shortLabel(m.name);
+    const lab = tagText(text, Math.min(tagWidth(text), sprues.frames.flatMap(f => f.tags).find(t => Math.abs(t[0] - sprues.labels[id][0]) < 1e-6 && Math.abs(t[1] - sprues.labels[id][1]) < 1e-6)?.[2] || tagWidth(text))); lab.position.fromArray(sprues.labels[id]); groups[frameOf[id]].add(lab);
+  }
+  applySeal(); markBench();
+}
+/** Lay a part flat: its biggest faces square to the grid, thinnest way up, longest along X. */
+function layFlat(m) {
+  const c = exactBox(m).getCenter(V());
+  applyWorld(m, rotAbout(squareUpQuat(dominantDirections([m])), c));
+  const turn = (axis, ang) => applyWorld(m, rotAbout(new THREE.Quaternion().setFromAxisAngle(axis, ang), exactBox(m).getCenter(V())));
+  let s = exactBox(m).getSize(V());
+  if (s.x < s.z && s.x <= s.y) turn(V(0, 1, 0), Math.PI / 2); else if (s.y < s.z) turn(V(1, 0, 0), Math.PI / 2);
+  s = exactBox(m).getSize(V()); if (s.y > s.x) turn(V(0, 0, 1), Math.PI / 2);
+}
+/**
+ * Put loose parts on sprues: each laid flat in a row on a frame, held by gates from the runners
+ * above and below it, numbered like a kit. Parts already on the sprues are laid out again with them.
+ */
+function layOnSprues(list) {
+  const keep = sprues ? liveParts().filter(m => onSprue(m)) : [];
+  const ms = [...new Set([...keep, ...list])].filter(m => m.parent === world);
+  if (!ms.length) { toast('Only loose parts go on sprues. Detach a part first to put it back on.', 'bad'); return false; }
+  toast('Putting the pieces on sprues…');
+  ms.forEach(layFlat);
+  // keep copies of the same piece together, in name order
+  ms.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const items = ms.map(m => { const s = exactBox(m).getSize(V()); return { id: m.uuid, w: s.x + 2 * SPRUE_GAP, h: s.y + 2 * SPRUE_GAP }; });
+  const frames = packSprues(items, { maxW: 150, maxH: 150 / 1.618 });
+  const others = liveParts().filter(p => !ms.includes(p) && !ms.some(m => isDescendant(p, m)));
+  const fx0 = others.length ? sceneBox(others).max.x + 25 : 0;
+  // frames in a block about as wide as a screen (golden ratio), not one long line
+  const spots = goldenPack(frames.map(f => ({ w: f.w + SPRUE_BAR, h: f.h + SPRUE_BAR + 12 })), 18);
+  const out = { frames: [], gates: [], poses: {}, nums: {}, labels: {}, text: {} };
+  let num = 1; const inv = new THREE.Matrix4(), tg = {};
+  frames.forEach((f, k) => {
+    const mine = f.places.map(p => ({ p, m: ms.find(m => m.uuid === p.id) }));
+    const thick = Math.max(...mine.map(({ m }) => exactBox(m).getSize(V()).z));
+    const z = Math.max(SPRUE_BAR * 0.6, thick / 2), ox = fx0 + spots.pos[k].x, oy = spots.h - spots.pos[k].y - (f.h + SPRUE_BAR + 12) - spots.h / 2;
+    const fr = { letter: String.fromCharCode(65 + (k % 26)) + (k >= 26 ? Math.floor(k / 26) : ''), x0: ox, y0: oy, x1: ox + f.w, y1: oy + f.h, z,
+                 runners: f.rows.slice(1, -1).map(y => oy + y), dividers: [], tags: [] };
+    // a runner between neighbouring pieces in a row, so each sits in its own cell
+    for (let r = 0; r + 1 < f.rows.length; r++) {
+      const row = f.places.filter(p => p.row === r).sort((a, b) => a.x - b.x);
+      row.forEach((p, i) => { if (i) fr.dividers.push({ x: ox + p.x, y0: oy + f.rows[r], y1: oy + f.rows[r + 1] }); });
+      const last = row[row.length - 1]; if (last && last.x + last.w < f.w - 1) fr.dividers.push({ x: ox + last.x + last.w, y0: oy + f.rows[r], y1: oy + f.rows[r + 1] });
+    }
+    out.frames.push(fr);
+    // number pieces left to right, bottom row first
+    mine.sort((a, b) => a.p.row - b.p.row || a.p.x - b.p.x);
+    for (const { p, m } of mine) {
+      const b = exactBox(m), c = b.getCenter(V()), s = b.getSize(V());
+      applyWorld(m, Tr(V(ox + p.x + p.w / 2 - c.x, oy + p.y + p.h / 2 - c.y, z - c.z)));
+      m.updateMatrixWorld(true); inv.copy(m.matrixWorld).invert();
+      // longer pieces are held in more places: one gate per ~14 mm of length on each side, up to 4
+      const cx = ox + p.x + p.w / 2, nG = Math.min(4, Math.max(1, Math.round(s.x / 14))), x0p = cx - s.x / 2;
+      const xs = Array.from({ length: nG }, (_, i) => x0p + s.x * (i + 0.5) / nG);
+      const cand = [];
+      for (const yb of [oy + f.rows[p.row], oy + f.rows[p.row + 1]]) for (const x of xs) {
+        const a = V(x, yb, z), h = m.geometry.boundsTree.closestPointToPoint(a.clone().applyMatrix4(inv), tg); if (!h) continue;
+        const bpt = h.point.clone().applyMatrix4(m.matrixWorld), d = bpt.clone().sub(a), L = d.length(); if (L < 1e-3) continue;
+        cand.push({ part: m.uuid, frame: k, a: a.toArray(), b: bpt.addScaledVector(d, 0.35 / L).toArray(), r0: SPRUE_BAR * 0.46, r1: Math.min(0.7, SPRUE_BAR * 0.26), L, ax: a });
+      }
+      let use = cand.filter(g => g.L <= SPRUE_GAP * 2.5);
+      if (!use.length && cand.length) use = [cand.reduce((x, y) => (y.L < x.L ? y : x))];
+      // two gates landing on the same spot of the piece are one too many
+      use = use.sort((x, y) => x.L - y.L).filter((g, i, all) => !all.slice(0, i).some(h => V(...h.b).distanceTo(V(...g.b)) < 2.5));
+      out.nums[m.uuid] = num++;
+      const cyNow = oy + p.y + p.h / 2, text = shortLabel(m.name), tw = Math.min(tagWidth(text), Math.max(5.2, p.w - 2 * SPRUE_BAR - 1));
+      // the name tag sits on the runner below the piece, inside its cell, in the widest gap between gates
+      const yb = oy + f.rows[p.row], below = use.filter(g => g.ax.y <= cyNow).map(g => g.ax.x).sort((a, b) => a - b);
+      const lo = ox + p.x + SPRUE_BAR, hi = ox + p.x + p.w - SPRUE_BAR, stops = [lo - 1.2, ...below, hi + 1.2];
+      let best = [lo, hi], bw = -1;
+      for (let i = 0; i + 1 < stops.length; i++) { const a = stops[i] + 1.2, b = stops[i + 1] - 1.2; if (b - a > bw) { bw = b - a; best = [a, b]; } }
+      let tw2 = tw;
+      if (bw < tw && bw >= 7) tw2 = bw;               // squeeze the name a little rather than lose a gate
+      const fits = bw >= tw2, tx = fits ? (best[0] + best[1]) / 2 : Math.min(Math.max(cx, lo + tw / 2), hi - tw / 2);
+      if (!fits) {                                  // no room between the gates below: the tag takes that stretch, the gates above hold the piece
+        const keep = use.filter(g => !(g.ax.y <= cyNow && Math.abs(g.ax.x - tx) < tw / 2 + 1.4));
+        if (keep.some(g => g.ax.y > cyNow) || keep.length >= 1) use = keep.length ? keep : use;
+      }
+      out.gates.push(...use.map(({ L, ax, ...g }) => g));
+      const tag = [tx, yb + SPRUE_BAR / 2 + 1.5, fits ? tw2 : tw];
+      fr.tags.push(tag);
+      out.labels[m.uuid] = [tag[0], tag[1], z + SPRUE_BAR * 0.28 + 0.02];
+      out.text[m.uuid] = text;
+      out.poses[m.uuid] = m.matrixWorld.toArray();
+    }
+  });
+  // centre the whole lot when nothing else is on the bench
+  if (!others.length) {
+    const dx = -(Math.min(...out.frames.map(f => f.x0)) + Math.max(...out.frames.map(f => f.x1))) / 2, dy = -(Math.min(...out.frames.map(f => f.y0)) + Math.max(...out.frames.map(f => f.y1))) / 2;
+    const T = Tr(V(dx, dy, 0));
+    for (const f of out.frames) { f.x0 += dx; f.x1 += dx; f.y0 += dy; f.y1 += dy; f.runners = f.runners.map(y => y + dy);
+      f.dividers.forEach(d => { d.x += dx; d.y0 += dy; d.y1 += dy; }); f.tags = f.tags.map(([x, y, w]) => [x + dx, y + dy, w]); }
+    for (const g of out.gates) { g.a = V(...g.a).applyMatrix4(T).toArray(); g.b = V(...g.b).applyMatrix4(T).toArray(); }
+    for (const id in out.labels) out.labels[id] = V(...out.labels[id]).applyMatrix4(T).toArray();
+    for (const m of ms) { applyWorld(m, T); out.poses[m.uuid] = m.matrixWorld.toArray(); }
+  }
+  sprues = out;
+  return true;
+}
+function putOnSprues() {
+  const loose = liveParts().filter(m => m.parent === world && isVisibleChain(m));
+  if (!loose.length) { toast('No loose parts to put on sprues.', 'bad'); return; }
+  pushUndo(); lastOp = null;
+  if (layOnSprues(loose)) { afterHierarchyChange(); fitMat(true); frame(sceneBox()); toast(`${loose.length} piece${loose.length > 1 ? 's' : ''} on ${sprues.frames.length} sprue${sprues.frames.length > 1 ? 's' : ''}. Move or snap a piece to clip it off.`, 'ok'); }
+}
+async function exportSprues(only) {
+  if (!sprues) return; scene.updateMatrixWorld(true);
+  const files = [];
+  sprues.frames.forEach((f, k) => {
+    if (Array.isArray(only) && !only.includes(k)) return;
+    const pieces = Object.keys(sprues.poses).map(partById).filter(m => m && onSprue(m) && sprues.gates.some(g => g.part === m.uuid && g.frame === k));
+    files.push({ name: `Sprue ${f.letter}.stl`, pieces });
+  });
+  const holesOf = [];
+  for (const f of files) { const cut = await cutMagnetHoles(f.pieces, f.pieces); holesOf.push(cut.holes); f.data = writeSTL([sprueMeshes(sprues.frames.findIndex(x => `Sprue ${x.letter}.stl` === f.name)), ...cut.meshes]); delete f.pieces; }
+  const mg = await mergeSTLs(files.map(f => f.data), 'Merging each sprue into one solid', holesOf); files.forEach((f, i) => { f.data = mg.files[i]; });
+  await deliver(files, `${safe(project.name || 'kit')}-sprues.zip`);
+}
+// ---------------------------------------------------------------------------
+// Kit box and instructions: a folder's box art becomes a box on the bench, its PDF a booklet to flip through
+// ---------------------------------------------------------------------------
+let kit = null;              // { name, lines, image, pdf, pdfName, W, D, H, at, bookAt, bookAspect, pieces, sprueCount, noBox, noBook }
+/** Put the box or the booklet away; the other stays on the bench. The kit goes only when both have. */
+function putAway(kind) {
+  if (!kit) return;
+  pushUndo();
+  if (kind === 'box') { if (kit.state === 'sealed') kit.state = 'open'; kit.noBox = true; }      // its contents come out first
+  else kit.noBook = true;
+  const boxLeft = !kit.noBox, bookLeft = !!kit.pdf && !kit.noBook;
+  if (!boxLeft && !bookLeft) kit = null;
+  buildKit(); select(null); markDirty(); renderPartPanel();
+  toast(kind === 'box' ? (bookLeft ? 'Put the box away. The instructions stay on the bench.' : 'Put the box away. Undo brings it back.') : (boxLeft ? 'Put the instructions away. Undo brings them back.' : 'Put the instructions away.'));
+}
+const assets = new Map();    // key -> { type, name, data: ArrayBuffer }
+const kitFx = new THREE.Group(); scene.add(kitFx);
+const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+const book = { doc: null, key: null, pages: new Map(), n: 0, v: 0, busy: false, mode: 'pdf' };
+
+function pickArt(list) {
+  const imgs = list.filter(x => /\.(jpe?g|png|webp|gif)$/i.test(x.file.name));
+  if (!imgs.length) return null;
+  const score = x => (/(box|cover|front|art|kit)/i.test(x.file.name) ? 1e12 : 0) + x.file.size;
+  return imgs.sort((a, b) => score(b) - score(a))[0];
+}
+function pickManual(list) {
+  const pdfs = list.filter(x => /\.pdf$/i.test(x.file.name));
+  if (!pdfs.length) return null;
+  return pdfs.sort((a, b) => (/(instruct|manual|guide|assembl|build)/i.test(b.file.name) - /(instruct|manual|guide|assembl|build)/i.test(a.file.name)) || a.path.localeCompare(b.path))[0];
+}
+async function addAsset(file) {
+  const key = 'asset:' + THREE.MathUtils.generateUUID();
+  assets.set(key, { type: file.type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : 'image/png'), name: file.name, data: await file.arrayBuffer() });
+  return key;
+}
+const assetBlob = key => { const a = assets.get(key); return a ? new Blob([a.data], { type: a.type }) : null; };
+
+/** Make the kit for a folder that came with box art and/or instructions. */
+async function makeKit(name, list, pieces, opts = {}) {
+  const art = pickArt(list), man = pickManual(list);
+  if (!art && !man && !opts.always) return;
+  const image = art ? await addAsset(art.file) : null, pdf = man ? await addAsset(man.file) : null;
+  let aspect = 1.45;
+  if (image) { try { const bm = await createImageBitmap(assetBlob(image)); aspect = bm.width / bm.height; bm.close?.(); } catch (e) {} }
+  const W = 140, D = Math.min(Math.max(W / aspect, 60), 200), H = 30;
+  const dirs = [...new Set(list.filter(x => /\.stl$/i.test(x.file.name)).map(x => x.path.split('/').slice(1, -1).join('/')).filter(Boolean))];
+  const bb = sceneBox(), c = bb.isEmpty() ? V() : bb.getCenter(V());
+  const x = bb.isEmpty() ? -W / 2 - 20 : bb.min.x - 30 - W / 2;
+  kit = { name, dirs, image, pdf, pdfName: man?.file.name || null, artName: art?.file.name || null, W, D, H, at: [x, c.y, H / 2], pieces, bookAspect: 0.707, state: opts.state || 'closed' };
+  kit.bookAt = [x - W / 2 + 34, c.y - D / 2 - 52, 1.3];
+  await buildKit();
+}
+/** What the kit holds, for the box's back: copies counted once ("Leg ×8"). */
+function kitContents() {
+  const counts = new Map();
+  for (const m of liveParts()) { const n = m.name.replace(/\s+\d+-(\d+)$/, ' ×$1'); counts.set(n, (counts.get(n) || 0) + 1); }
+  return [...counts.keys()];
+}
+function boxSide(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = 1024; c.height = Math.max(64, Math.round(1024 * h / w)); const g = c.getContext('2d');
+  draw(g, c.width, c.height);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t;
+}
+function fitFont(g, text, maxW, size, weight = 700, fam = '"Barlow Condensed", system-ui, sans-serif') {
+  let s = size; g.font = `${weight} ${s}px ${fam}`;
+  while (g.measureText(text).width > maxW && s > 10) { s -= 2; g.font = `${weight} ${s}px ${fam}`; }
+  return s;
+}
+/**
+ * Several files coming in: ask how to set them out (a model kit, spread out, or where the files put them).
+ * → 'kit' | 'spread' | 'asis' (or 'auto' if chosen in storage), or null if cancelled.
+ */
+function askLoadMode(count, name, entries = []) {
+  const pref = $('set-loadas').value;
+  if (pref !== 'ask') return Promise.resolve(pref);
+  $('la-sub').textContent = `${count} files${name ? ` from ${name}` : ''}`; $('la-remember').checked = false;
+  const box = $('loadask'); box.hidden = false; box.querySelector('.la-opt').focus();
+  startLoadPreview(entries, document.activeElement?.dataset?.mode || 'kit');
+  const hover = e => { const b = e.target.closest?.('.la-opt'); if (b) setPreviewMode(b.dataset.mode); };
+  box.addEventListener('pointerover', hover); box.addEventListener('focusin', hover);
+  return new Promise(res => {
+    const done = mode => { box.hidden = true; box.removeEventListener('click', onClick); box.removeEventListener('keydown', onKey);
+      box.removeEventListener('pointerover', hover); box.removeEventListener('focusin', hover); stopLoadPreview();
+      if (mode && $('la-remember').checked) { $('set-loadas').value = mode; $('set-loadas').dispatchEvent(new Event('change')); toast('Saved. Change it in Edit › Preferences.'); }
+      res(mode); };
+    const onClick = e => { const b = e.target.closest('.la-opt'); if (b) done(b.dataset.mode); else if (e.target.closest('#la-cancel') || e.target === box) done(null); };
+    const onKey = e => { e.stopPropagation();
+      if (e.key === 'Escape') { e.preventDefault(); done(null); }
+      else if (['1', '2', '3'].includes(e.key) && e.target.type !== 'checkbox') { e.preventDefault(); done(['kit', 'spread', 'asis'][+e.key - 1]); }
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); const os = [...box.querySelectorAll('.la-opt')], i = os.indexOf(document.activeElement); os[(i + (e.key === 'ArrowDown' ? 1 : os.length - 1)) % os.length].focus(); } };
+    box.addEventListener('click', onClick); box.addEventListener('keydown', onKey);
+  });
+}
+/**
+ * The little turntable in the "How should these come in?" popup: the parts as each choice would set them out.
+ * Reads up to a budget of files (first ones first) so a huge folder still opens quickly.
+ */
+const lp = { renderer: null, scene: null, camera: null, root: null, items: [], mode: 'spread', raf: 0, gen: 0, t0: 0, more: 0 };
+function previewRenderer() {
+  if (lp.renderer) return;
+  const cv = $('la-canvas');
+  lp.renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true, alpha: true }); lp.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  lp.scene = new THREE.Scene(); lp.camera = new THREE.PerspectiveCamera(30, 2, 0.1, 5000); lp.camera.up.set(0, 0, 1);
+  lp.scene.add(new THREE.HemisphereLight('#f2efe8', '#2a3036', 1.6)); const d = new THREE.DirectionalLight('#ffffff', 1.8); d.position.set(2, -3, 4); lp.scene.add(d);
+  lp.root = new THREE.Group(); lp.scene.add(lp.root);
+}
+function clearPreviewRoot() { while (lp.root?.children.length) { const c = lp.root.children.pop(); c.traverse(o => { if (o.userData.own) o.geometry?.dispose(); }); } }
+async function startLoadPreview(entries, mode = 'spread') {
+  previewRenderer(); const gen = ++lp.gen; lp.items.forEach(it => it.geom.dispose()); lp.items = []; clearPreviewRoot();
+  lp.mode = mode; $('la-pv-mode').textContent = 'Reading the files…'; $('la-pv-count').textContent = '';
+  const loop = () => { if (gen !== lp.gen) return; lp.raf = requestAnimationFrame(loop); drawPreview(); }; lp.t0 = performance.now(); loop();
+  const loader = new STLLoader(); let bytes = 0, pieces = 0; const counted = [];
+  const list = entries.filter(e => /\.stl$/i.test(e.file?.name || e.name || '.stl'));
+  for (const [k, e] of list.entries()) {
+    if (gen !== lp.gen) return;
+    if (k >= 40 || (bytes + e.size > 60 * 1048576 && k > 0)) { lp.more = list.length - k; break; }
+    try {
+      const g = loader.parse(await e.file.arrayBuffer()); g.computeBoundingBox(); bytes += e.size;
+      const q = $('set-qty').checked ? parseQuantity(e.name) : { base: e.name, count: 1 };
+      const mi = $('set-mirror').checked ? parseMirror(q.base) : { mirror: false };
+      lp.items.push({ geom: g, count: q.count, color: PART_COLORS[k % PART_COLORS.length] }); pieces += q.count; if (q.count > 1) counted.push(`${q.base} ×${q.count}`);
+      if (mi.mirror && g.index) { lp.items.push({ geom: mirroredGeometry(g, $('set-mirror-axis').value), count: q.count, color: PART_COLORS[k % PART_COLORS.length] }); pieces += q.count; counted.push(`${mi.base} + mirrored`); }
+      else if (mi.mirror) { const gm = g.clone(), p = gm.attributes.position, kk = { x: 0, y: 1, z: 2 }[$('set-mirror-axis').value] ?? 0; for (let i = 0; i < p.count; i++) p.setComponent(i, kk, -p.getComponent(i, kk)); gm.computeBoundingBox(); lp.items.push({ geom: gm, count: q.count, color: PART_COLORS[k % PART_COLORS.length] }); pieces += q.count; counted.push(`${mi.base} + mirrored`); }
+    } catch (err) { /* unreadable: the load itself will say so */ }
+    if (k % 4 === 3) { arrangePreview(); await nextFrame(); }
+  }
+  if (gen !== lp.gen) return;
+  const total = list.reduce((a, e) => a + (e.size || 0), 0);
+  $('la-pv-count').textContent = `${list.length} file${list.length === 1 ? '' : 's'} → ${pieces + (lp.more ? '+' : '')} piece${pieces === 1 ? '' : 's'}${counted.length ? ` (${counted.slice(0, 2).join(', ')}${counted.length > 2 ? '…' : ''})` : ''} · ${fmtSize(total)}` + (lp.more ? ` · showing the first ${lp.items.length}` : '');
+  arrangePreview();
+}
+function setPreviewMode(mode) { if (mode === lp.mode) return; lp.mode = mode; arrangePreview(); }
+function arrangePreview() {
+  clearPreviewRoot(); if (!lp.items.length) return;
+  const mode = lp.mode, mats = new Map(), mat = c => mats.get(c) || (mats.set(c, new THREE.MeshStandardMaterial({ color: c, roughness: 0.7, metalness: 0.05 })), mats.get(c));
+  $('la-pv-mode').textContent = { kit: 'Model kit: on sprues, in the box', spread: 'Off the sprue, spread out', asis: 'Where the files put them' }[mode] || '';
+  if (mode === 'asis') { for (const it of lp.items) lp.root.add(new THREE.Mesh(it.geom, mat(it.color))); }
+  else {
+    // every copy, laid in a screen-shaped block; for a kit, laid flat (thinnest side down) on a sprue frame
+    const pieces = []; for (const it of lp.items) for (let c = 0; c < Math.min(it.count, 12); c++) pieces.push(it);
+    const rots = pieces.map(it => { const s = it.geom.boundingBox.getSize(V()); const r = new THREE.Matrix4();
+      if (mode === 'kit') { if (s.x <= s.y && s.x <= s.z) r.makeRotationY(Math.PI / 2); else if (s.y <= s.z) r.makeRotationX(Math.PI / 2); } return r; });
+    const boxes = pieces.map((it, i) => it.geom.boundingBox.clone().applyMatrix4(rots[i]));
+    const big = Math.max(...boxes.map(b => b.getSize(V()).length())), gap = Math.max(big * 0.08, 1);
+    const { pos, w, h } = goldenPack(boxes.map(b => ({ w: b.max.x - b.min.x, h: b.max.y - b.min.y })), gap);
+    pieces.forEach((it, i) => { const b = boxes[i], m = new THREE.Mesh(it.geom, mat(mode === 'kit' ? sprueColor() : it.color));
+      m.matrixAutoUpdate = false; m.matrix.copy(Tr(V(pos[i].x - b.min.x - w / 2, h / 2 - pos[i].y - b.max.y, -b.min.z))).multiply(rots[i]); lp.root.add(m); });
+    if (mode === 'kit') {           // the frame: an outer rail and a runner between rows
+      const bar = Math.max(big * 0.035, 0.8), plastic = mat(sprueColor()), rail = (x, y, sx, sy) => { const m = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, bar), plastic); m.userData.own = true; m.position.set(x, y, bar / 2); lp.root.add(m); };
+      rail(0, h / 2 + gap / 2, w + gap, bar); rail(0, -h / 2 - gap / 2, w + gap, bar); rail(-w / 2 - gap / 2, 0, bar, h + gap); rail(w / 2 + gap / 2, 0, bar, h + gap); rail(0, 0, w + gap, bar * 0.7);
+    }
+  }
+  // frame it from a three-quarter view
+  const bb = new THREE.Box3().setFromObject(lp.root), c = bb.getCenter(V()), r = Math.max(bb.getSize(V()).length() / 2, 1);
+  lp.root.position.set(-c.x, -c.y, -c.z); lp.root.userData.r = r;
+}
+function drawPreview() {
+  const cv = $('la-canvas'), W = cv.clientWidth, H = cv.clientHeight; if (!W || !H) return;
+  if (cv.width !== Math.round(W * lp.renderer.getPixelRatio()) || cv.height !== Math.round(H * lp.renderer.getPixelRatio())) lp.renderer.setSize(W, H, false);
+  const r = lp.root.userData.r || 10, a = (performance.now() - lp.t0) / 1000 * 0.35 + 0.6, still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  lp.camera.aspect = W / H; lp.camera.near = r / 50; lp.camera.far = r * 50; lp.camera.updateProjectionMatrix();
+  const d = r / Math.sin(THREE.MathUtils.degToRad(15)) * 1.05, ang = still ? 0.6 : a;
+  lp.camera.position.set(Math.sin(ang) * d * 0.75, -Math.cos(ang) * d * 0.75, d * 0.6); lp.camera.lookAt(0, 0, 0);
+  lp.renderer.render(lp.scene, lp.camera);
+}
+function stopLoadPreview() { lp.gen++; cancelAnimationFrame(lp.raf); clearPreviewRoot(); lp.items.forEach(it => it.geom.dispose()); lp.items = []; lp.more = 0; }
+
+/** A popup that covers the bench while a kit gets ready, with a progress bar. */
+const loading = {
+  depth: 0,
+  show(title) { this.depth++; $('ls-title').textContent = title; $('ls-text').textContent = 'Getting started…'; this.set(0); $('ls-stop').hidden = true; this.stop = null; $('loadscreen').hidden = false; },
+  onStop(fn) { this.stop = fn; $('ls-stop').hidden = !fn; },
+  set(frac, text) { const p = Math.round(Math.max(0, Math.min(1, frac)) * 100); $('ls-fill').style.width = p + '%'; $('loadscreen').querySelector('.ls-bar').setAttribute('aria-valuenow', String(p)); if (text) $('ls-text').textContent = text; },
+  hide() { this.depth = Math.max(0, this.depth - 1); if (!this.depth) { $('loadscreen').hidden = true; $('ls-stop').hidden = true; this.stop = null; } },
+  get on() { return !$('loadscreen').hidden; },
+};
+$('ls-stop').addEventListener('click', () => { $('ls-text').textContent = 'Stopping…'; loading.stop?.(); });
+/** Sealed: the sprues, their pieces and the booklet are inside the box, out of sight and out of reach. */
+function boxed(m) { return kit?.state === 'sealed' && !!sprues && !!sprues.poses[m.uuid] && onSprue(m); }
+function applySeal() {
+  if (kit?.state === 'sealed' && !sprues) { kit.state = 'closed'; buildKit(); return; }      // nothing left inside to unwrap
+  const sealed = kit?.state === 'sealed', L = sealed ? 1 : 0;
+  sprueFx.traverse(o => o.layers.set(L));
+  kitFx.getObjectByName('kit-book')?.traverse(o => o.layers.set(L));
+  for (const m of liveParts()) m.layers.set(sealed && boxed(m) ? 1 : 0);
+  if (applySeal.was !== sealed) { applySeal.was = sealed; renderOutliner(); }
+}
+const ease = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+function tween(ms, fn) {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) ms = 0;
+  return new Promise(res => { const t0 = performance.now(); const tick = () => { const t = ms ? Math.min(1, (performance.now() - t0) / ms) : 1; fn(ease(t), t); if (t < 1) requestAnimationFrame(tick); else res(); }; tick(); });
+}
+/** Unbox: the film comes off, the lid lifts and rests beside the tray, the sprues and booklet come out onto the bench. */
+async function openBox() {
+  if (kit?.state !== 'sealed' || kit.opening) return;
+  kit.opening = true;
+  const grp = kitFx.getObjectByName('kit-box'), wrap = grp?.getObjectByName('kit-wrap'), lid = grp?.getObjectByName('kit-lid');
+  if (!grp) {                                  // the box hasn't been built yet (unboxed straight after loading): open it without the show
+    kit.state = 'open'; kit.opening = false; applySeal(); markDirty(); await buildKit(); renderPartPanel();
+    toast(`Unboxed ${kit.name}.`, 'ok'); return;
+  }
+  try {
+    if (wrap) await tween(450, e => { wrap.scale.setScalar(1 + 0.08 * e); wrap.material.opacity = 1 - e; });
+    if (wrap) { grp.remove(wrap); wrap.geometry.dispose(); wrap.material.map?.dispose(); wrap.material.dispose(); }
+    if (lid) { const to = lidSpot(true), lift = kit.H + 18;
+      await tween(800, (e, t) => { lid.position.set(to.x * e, to.y * e, Math.sin(Math.PI * Math.min(1, t * 1.15)) * lift); }); lid.position.copy(to); }
+    kit.state = 'open'; applySeal(); markDirty();
+    // out they come: each sprue (with its pieces) and the booklet rises from the tray to its place on the bench
+    grp.updateMatrixWorld(true); const from = new THREE.Box3().setFromObject(grp.getObjectByName('kit-tray')).getCenter(V()); from.z += kit.H * 0.4;
+    const items = [];
+    sprueFx.children.forEach(g => { const k = g.userData.frame; items.push({ objs: [g, ...piecesOn(k)], box: new THREE.Box3().setFromObject(g) }); });
+    const bk = kitFx.getObjectByName('kit-book'); if (bk) items.push({ objs: [bk], box: new THREE.Box3().setFromObject(bk) });
+    for (const it of items) { it.c = it.box.getCenter(V()); it.orig = it.objs.map(o => ({ o, p: o.position.clone(), s: o.scale.clone() })); }
+    const place = (it, e) => { const s = 0.15 + 0.85 * e, off = from.clone().sub(it.c).multiplyScalar(1 - e); off.z += Math.sin(Math.PI * e) * kit.H * 0.8;
+      for (const { o, p, s: s0 } of it.orig) { o.position.copy(p).sub(it.c).multiplyScalar(s).add(it.c).add(off); o.scale.copy(s0).multiplyScalar(s); } };
+    items.forEach(it => place(it, 0));
+    await Promise.all(items.map((it, i) => new Promise(r => setTimeout(r, i * 140)).then(() => tween(900, e => place(it, e)))));
+    for (const it of items) for (const { o, p, s: s0 } of it.orig) { o.position.copy(p); o.scale.copy(s0); o.updateMatrixWorld(true); }
+    applySeal(); markBench(); fitMat(true); frame(benchBox());
+    toast(`Unboxed ${kit.name}: ${sprues ? `${sprues.frames.length} sprue${sprues.frames.length > 1 ? 's' : ''}` : 'the pieces'}${kit.pdf ? ' and the instructions' : ''}.`, 'ok');
+  } finally { if (kit) kit.opening = false; renderPartPanel(); }
+}
+function closeLid() { if (!kit || kit.state !== 'open') return; pushUndo(); kit.state = 'closed'; buildKit(); markDirty(); renderPartPanel(); }
+/** The lid lifts off its spot beside the tray and goes back on, the box now empty. */
+async function lidBackOn() {
+  if (!kit || kit.state !== 'open') return;
+  const lid = kitFx.getObjectByName('kit-box')?.getObjectByName('kit-lid');
+  if (lid) { const from = lid.position.clone(), lift = kit.H + 18;
+    await tween(750, (e, t) => { lid.position.set(from.x * (1 - e), from.y * (1 - e), Math.sin(Math.PI * Math.min(1, t * 1.1)) * lift); }); lid.position.set(0, 0, 0); }
+  kit.state = 'closed'; await buildKit(); markBench(); markDirty(); renderPartPanel();
+}
+/** A kit that's just come in: show the box, open it, set the sprues out, and put the lid back on the empty box. */
+async function unboxNow() {
+  if (kit?.state !== 'sealed') { matHold = 0; fitMat(true); return; }
+  matHold++;
+  try {
+    select(null); frameBox(); await new Promise(r => setTimeout(r, 450));
+    await openBox(); await new Promise(r => setTimeout(r, 250));
+    await lidBackOn();
+  } finally { matHold = 0; fitMat(true); frame(benchBox()); }
+}
+
+let kitGen = 0;
+/** Where the lid sits in the box's own frame: on the tray, or resting beside it once opened. */
+function lidSpot(open) { return open && kit ? V(-(kit.W + 14), 0, 0) : V(); }
+let wrapEnv = null;
+function wrapTexture() {               // creases, heat-seal lines and glints of the film, as a see-through map
+  const c = document.createElement('canvas'); c.width = c.height = 512; const g = c.getContext('2d');
+  g.fillStyle = 'rgba(255,255,255,0.07)'; g.fillRect(0, 0, 512, 512);
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const sheen = g.createLinearGradient(0, 0, 512, 512);              // a broad diagonal sheen across the film
+  sheen.addColorStop(0, 'rgba(255,255,255,0)'); sheen.addColorStop(0.42, 'rgba(255,255,255,0.10)'); sheen.addColorStop(0.5, 'rgba(255,255,255,0.2)'); sheen.addColorStop(0.58, 'rgba(255,255,255,0.10)'); sheen.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = sheen; g.fillRect(0, 0, 512, 512);
+  g.lineCap = 'round';
+  for (let i = 0; i < 34; i++) {            // soft wavy creases, brighter on one edge
+    const x = rnd() * 512, y = rnd() * 512, a = (rnd() - 0.5) * 1.2 + (i % 3 ? 0 : Math.PI / 2), l = 40 + rnd() * 140;
+    const bx = Math.cos(a), by = Math.sin(a), nx = -by, ny = bx, bend = (rnd() - 0.5) * l * 0.6;
+    const path = () => { g.beginPath(); g.moveTo(x, y); g.bezierCurveTo(x + bx * l * 0.33 + nx * bend, y + by * l * 0.33 + ny * bend, x + bx * l * 0.66 - nx * bend * 0.6, y + by * l * 0.66 - ny * bend * 0.6, x + bx * l, y + by * l); };
+    g.strokeStyle = `rgba(255,255,255,${0.04 + rnd() * 0.06})`; g.lineWidth = 6 + rnd() * 8; path(); g.stroke();
+    g.strokeStyle = `rgba(255,255,255,${0.10 + rnd() * 0.14})`; g.lineWidth = 0.8 + rnd() * 1.2; path(); g.stroke();
+  }
+  for (let i = 0; i < 6; i++) {             // bright glints
+    const x = rnd() * 512, y = rnd() * 512, gr = g.createRadialGradient(x, y, 0, x, y, 30 + rnd() * 50);
+    gr.addColorStop(0, 'rgba(255,255,255,0.32)'); gr.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = gr; g.fillRect(0, 0, 512, 512);
+  }
+  g.strokeStyle = 'rgba(255,255,255,0.35)'; g.lineWidth = 3;               // heat-seal seam along the edge
+  g.beginPath(); g.moveTo(0, 6); g.lineTo(512, 6); g.stroke();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping; return t;
+}
+/** Glossy film tight round the box. */
+function shrinkWrap(W, D, H) {
+  if (!wrapEnv) { const pm = new THREE.PMREMGenerator(renderer); wrapEnv = pm.fromScene(new RoomEnvironment(), 0.04).texture; pm.dispose(); }
+  const tex = wrapTexture(); tex.repeat.set(1, 1);
+  const m = new THREE.Mesh(new RoundedBoxGeometry(W + 1.4, D + 1.4, H + 1.2, 3, 1.6),
+    new THREE.MeshPhysicalMaterial({ color: '#ffffff', map: tex, transparent: true, depthWrite: false, roughness: 0.06, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.04,
+      envMap: wrapEnv, envMapIntensity: 0.9, specularIntensity: 1 }));
+  m.name = 'kit-wrap'; m.renderOrder = 5; return m;
+}
+function clearKitFx() { while (kitFx.children.length) { const o = kitFx.children.pop(); o.traverse(c => { c.geometry?.dispose(); [].concat(c.material || []).forEach(m => { m.map?.dispose(); m.dispose(); }); }); } }
+async function buildKit() {
+  const gen = ++kitGen;          // a newer rebuild started while this one waited → leave it to that one
+  if (kit) delete kit.opening;
+  clearKitFx();
+  if (!kit) { applySeal(); return; }
+  const { W, D, H } = kit;
+  // colours from the art: the box's sides use its darker average tone
+  let artTex = null, tone = '#2b3138';
+  if (kit.image) {
+    try {
+      const bm = await createImageBitmap(assetBlob(kit.image)), c = document.createElement('canvas');
+      const s = Math.min(1, 2048 / Math.max(bm.width, bm.height)); c.width = Math.round(bm.width * s); c.height = Math.round(bm.height * s);
+      const g = c.getContext('2d'); g.drawImage(bm, 0, 0, c.width, c.height);
+      const px = g.getImageData(0, 0, c.width, c.height).data; let r = 0, gg = 0, b = 0, n = 0;
+      for (let i = 0; i < px.length; i += 4 * 97) { r += px[i]; gg += px[i+1]; b += px[i+2]; n++; }
+      tone = `rgb(${Math.round(r / n * 0.45)},${Math.round(gg / n * 0.45)},${Math.round(b / n * 0.45)})`;
+      artTex = new THREE.CanvasTexture(c); artTex.colorSpace = THREE.SRGBColorSpace; artTex.anisotropy = 8;
+    } catch (e) { artTex = null; }
+  }
+  if (gen !== kitGen) { artTex?.dispose(); return; }
+  clearKitFx();
+  const pieces = liveParts().length, sp = sprues?.frames.length || 0;
+  const sub = `${pieces} piece${pieces === 1 ? '' : 's'}${sp ? ` · ${sp} sprue${sp === 1 ? '' : 's'}` : ''}${kit.pdf ? ' · instructions inside' : ''}`;
+  const stripe = (g, w, h) => { g.fillStyle = tone; g.fillRect(0, 0, w, h); g.fillStyle = 'rgba(214,162,74,.9)'; g.fillRect(0, h - h * 0.12, w, h * 0.06); };
+  const front = boxSide(W, H, (g, w, h) => { stripe(g, w, h);
+    g.fillStyle = '#f2ecdf'; g.textBaseline = 'middle';
+    const fs = fitFont(g, kit.name, w * 0.9, h * 0.42); g.fillText(kit.name, w * 0.05, h * 0.36);
+    g.font = `500 ${Math.round(Math.min(fs * 0.45, h * 0.17))}px "Barlow Semi Condensed", system-ui, sans-serif`; g.fillStyle = '#d9cfbd'; g.fillText(sub, w * 0.05, h * 0.68); });
+  const back = boxSide(W, H, (g, w, h) => { stripe(g, w, h);
+    g.fillStyle = '#f2ecdf'; g.textBaseline = 'top';
+    g.font = `700 ${Math.round(h * 0.16)}px "Barlow Condensed", system-ui, sans-serif`; g.fillText('CONTENTS', w * 0.04, h * 0.07);
+    const items = kitContents(), cols = Math.min(4, Math.max(1, Math.ceil(items.length / 4))), rows = Math.ceil(items.length / cols) || 1;
+    const lh = Math.min(h * 0.13, (h * 0.62) / rows); g.font = `500 ${Math.round(lh * 0.82)}px "Barlow Semi Condensed", system-ui, sans-serif`; g.fillStyle = '#d9cfbd';
+    items.forEach((t, i) => { const cx = w * 0.04 + Math.floor(i / rows) * (w * 0.92 / cols), cy = h * 0.27 + (i % rows) * lh; fitFont(g, t, w * 0.92 / cols - 12, Math.round(lh * 0.82), 500, '"Barlow Semi Condensed", system-ui, sans-serif'); g.fillText(t, cx, cy); });
+    if (kit.dirs.length) { g.font = `500 ${Math.round(h * 0.08)}px "IBM Plex Mono", monospace`; g.fillStyle = 'rgba(242,236,223,.6)'; g.fillText(kit.dirs.join('  ·  ').slice(0, 120), w * 0.04, h * 0.9 - h * 0.12); } });
+  const end = boxSide(D, H, (g, w, h) => { stripe(g, w, h);
+    g.fillStyle = '#f2ecdf'; g.textBaseline = 'middle'; fitFont(g, kit.name, w * 0.9, h * 0.4); g.fillText(kit.name, w * 0.05, h * 0.38);
+    g.font = `500 ${Math.round(h * 0.15)}px "Barlow Semi Condensed", system-ui, sans-serif`; g.fillStyle = '#d9cfbd'; g.fillText(`${pieces} pieces`, w * 0.05, h * 0.68); });
+  // a lid over a tray: closed it looks like the printed box; opened, the lid rests beside the tray
+  const grp = new THREE.Group(); grp.name = 'kit-box'; grp.position.fromArray(kit.at); grp.rotation.z = kit.rot || 0; grp.visible = !kit.noBox;
+  const T = 1.2, inner = new THREE.MeshStandardMaterial({ color: '#d8d2c6', roughness: 0.95 });
+  const lid = new THREE.Group(); lid.name = 'kit-lid'; grp.add(lid);
+  const slab = (w, d, h, x, y, z, mat) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, d, h), mat); m.position.set(x, y, z); return m; };
+  const outer = new THREE.MeshStandardMaterial({ color: tone, roughness: 0.8 });
+  lid.add(slab(W, D, T, 0, 0, H / 2 - T / 2, [outer, outer, outer, outer, outer, inner]));
+  for (const [w, d, x, y] of [[W, T, 0, -D / 2 + T / 2], [W, T, 0, D / 2 - T / 2], [T, D, -W / 2 + T / 2, 0], [T, D, W / 2 - T / 2, 0]]) lid.add(slab(w, d, H, x, y, 0, inner));
+  const face = (tex, w, h, setup) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.6 })); setup(m); lid.add(m); return m; };
+  face(artTex || boxSide(W, D, (g, w, h) => { stripe(g, w, h); g.fillStyle = '#f2ecdf'; g.textBaseline = 'middle'; fitFont(g, kit.name, w * 0.85, h * 0.18); g.fillText(kit.name, w * 0.07, h * 0.5); }),
+    W, D, m => { m.position.z = H / 2 + 0.05; });
+  face(front, W, H, m => { m.rotateX(Math.PI / 2); m.position.y = -D / 2 - 0.05; });
+  face(back, W, H, m => { m.rotateZ(Math.PI); m.rotateX(Math.PI / 2); m.position.y = D / 2 + 0.05; });
+  face(end, D, H, m => { m.rotateZ(Math.PI / 2); m.rotateX(Math.PI / 2); m.position.x = W / 2 + 0.05; });
+  face(end, D, H, m => { m.rotateZ(-Math.PI / 2); m.rotateX(Math.PI / 2); m.position.x = -W / 2 - 0.05; });
+  const tray = new THREE.Group(); tray.name = 'kit-tray'; grp.add(tray);
+  const tw = W - 2 * T - 0.4, td = D - 2 * T - 0.4, th = H - 1.5, card = new THREE.MeshStandardMaterial({ color: '#bdb6a9', roughness: 0.95 });
+  tray.add(slab(tw, td, T, 0, 0, -H / 2 + T / 2, [card, card, card, card, inner, card]));
+  for (const [w, d, x, y] of [[tw, T, 0, -td / 2 + T / 2], [tw, T, 0, td / 2 - T / 2], [T, td, -tw / 2 + T / 2, 0], [T, td, tw / 2 - T / 2, 0]]) tray.add(slab(w, d, th, x, y, -H / 2 + th / 2, [card, card, card, card, card, card]));
+  lid.position.copy(lidSpot(kit.state === 'open'));
+  grp.userData.kit = 'box'; grp.traverse(o => { o.userData.kit = 'box'; }); if (!kit.noBox) kitFx.add(grp);
+  if (kit.pdf && !kit.noBook) {
+    const bd = 74, bw = bd * kit.bookAspect, bt = 2.6, bk = new THREE.Group(); bk.name = 'kit-book'; bk.position.fromArray(kit.bookAt); bk.rotation.z = kit.bookRot ?? 0.12;
+    const pages = new THREE.Mesh(new THREE.BoxGeometry(bw, bd, bt), [0, 1, 2, 3, 4, 5].map(i => new THREE.MeshStandardMaterial({ color: i === 1 ? '#3a3f45' : '#efeae0', roughness: 0.9 })));
+    const cover = new THREE.Mesh(new THREE.PlaneGeometry(bw, bd), new THREE.MeshStandardMaterial({ color: '#efeae0', roughness: 0.7 })); cover.position.z = bt / 2 + 0.05;
+    const pg = kit.page || 1;
+    if (pg > 1) {
+      // lying open at the spread you left it on: two pages side by side, a little sag at the spine
+      const [l, r] = [2 * Math.floor(pg / 2), 2 * Math.floor(pg / 2) + 1];
+      // each page hinges at the spine and lifts toward its outer edge, so no part of it ever dips into the block below
+      const top = -bt / 2 + 1.2, sag = 0.03, pageMat = () => new THREE.MeshStandardMaterial({ color: '#efeae0', roughness: 0.7, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+      pages.geometry.dispose(); pages.geometry = new THREE.BoxGeometry(bw * 2, bd, 1.2); pages.position.z = top - 0.6;
+      cover.geometry.dispose(); cover.geometry = new THREE.PlaneGeometry(bw, bd).translate(-bw / 2, 0, 0); cover.material.dispose(); cover.material = pageMat();
+      cover.position.set(0, 0, top + 0.12); cover.rotation.y = sag;
+      const right = new THREE.Mesh(new THREE.PlaneGeometry(bw, bd).translate(bw / 2, 0, 0), pageMat()); right.position.set(0, 0, top + 0.12); right.rotation.y = -sag;
+      bk.add(pages, cover, right); bk.traverse(o => { o.userData.kit = 'book'; }); kitFx.add(bk);
+      pageTexture(cover.material, l); pageTexture(right.material, r);
+    } else {
+      bk.add(pages, cover); bk.traverse(o => { o.userData.kit = 'book'; }); kitFx.add(bk);
+      bookCover(cover.material);
+    }
+  }
+  applySeal(); markBench();
+}
+async function loadPdfJs() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  await new Promise((res, rej) => { const s = document.createElement('script'); s.src = PDFJS + 'pdf.min.js'; s.onload = res; s.onerror = () => rej(new Error("the PDF reader didn't load")); document.head.append(s); });
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js';
+  return window.pdfjsLib;
+}
+async function pdfDoc() {
+  if (book.doc && book.key === kit?.pdf) return book.doc;
+  const lib = await loadPdfJs(), a = assets.get(kit.pdf);
+  book.doc = await lib.getDocument({ data: new Uint8Array(a.data.slice(0)), isEvalSupported: false }).promise;
+  book.key = kit.pdf; book.pages.clear(); book.n = book.doc.numPages; return book.doc;
+}
+/** Page n (1-based) as an image URL at about `px` pixels tall. */
+async function pageImage(n, px = 1400) {
+  const key = n + '@' + px; if (book.pages.has(key)) return book.pages.get(key);
+  const doc = await pdfDoc(), page = await doc.getPage(n), v0 = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: px / v0.height }), c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: g, viewport: vp }).promise;
+  const url = c.toDataURL('image/jpeg', 0.9); book.pages.set(key, url); return url;
+}
+async function pageTexture(mat, n) {
+  try {
+    const doc = await pdfDoc(); if (!n || n > doc.numPages) { mat.color.set('#f6f3ec'); return; }
+    const img = new Image(); img.src = await pageImage(n, 700); await img.decode();
+    const t = new THREE.Texture(img); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; t.needsUpdate = true; mat.map = t; mat.color.set('#ffffff'); mat.needsUpdate = true;
+  } catch (e) { console.warn(e); }
+}
+async function bookCover(mat) {
+  try {
+    const doc = await pdfDoc(), p1 = await doc.getPage(1), v = p1.getViewport({ scale: 1 }), asp = v.width / v.height;
+    if (Math.abs(asp - kit.bookAspect) > 0.02) { kit.bookAspect = asp; return buildKit(); }      // reshape the booklet to the PDF's pages
+    const img = new Image(); img.src = await pageImage(1, 700); await img.decode();
+    const t = new THREE.Texture(img); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; t.needsUpdate = true; mat.map = t; mat.color.set('#ffffff'); mat.needsUpdate = true;
+  } catch (e) { console.warn(e); }
+}
+function kitHit(ev) {
+  if (!kitFx.children.length) return null;
+  const r = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1), camera);
+  const h = rc.intersectObjects(kitFx.children, true)[0], parts = raycast(ev);
+  if (!h || (parts && parts.distance < h.distance)) return null;
+  return h.object.userData.kit || null;
+}
+function benchBox() { const b = sceneBox(); for (const fx of [kitFx, sprueFx]) { fx.updateMatrixWorld(true); if (fx.children.length) b.union(new THREE.Box3().setFromObject(fx)); } return b; }
+
+// the flip-through viewer
+function spreadOf(v) { return v === 0 ? [null, 1] : [2 * v, 2 * v + 1 <= book.n ? 2 * v + 1 : null]; }
+const narrowBook = () => window.innerWidth < 760;
+async function setPage(el, n) {
+  el.innerHTML = ''; el.classList.toggle('blank', !n); if (!n) return;
+  const im = new Image(); im.alt = `Page ${n}`; im.src = await pageImage(n); await im.decode().catch(() => {});
+  const wrap = document.createElement('div'); wrap.className = 'pgw';
+  wrap.append(im); el.append(wrap);
+}
+async function showSpread() {
+  const [l, r] = narrowBook() ? [null, book.v + 1] : spreadOf(book.v);
+  $('book-spread').classList.toggle('single', narrowBook());
+  await Promise.all([setPage($('pg-l'), l), setPage($('pg-r'), r)]);
+  const last = narrowBook() ? book.n - 1 : Math.floor(book.n / 2);
+  $('book-prev').disabled = book.v <= 0; $('book-next').disabled = book.v >= last;
+  $('book-page').textContent = narrowBook() ? `Page ${book.v + 1} of ${book.n}` : (l && r ? `Pages ${l}–${r} of ${book.n}` : `Page ${l || r} of ${book.n}`);
+  // render the pages either side ahead of time, so turning is instant
+  for (const k of [book.v - 1, book.v + 1]) if (k >= 0) (narrowBook() ? [k + 1] : spreadOf(k)).forEach(n => n && n <= book.n && pageImage(n).catch(() => {}));
+}
+async function turn(dir) {
+  if (book.busy || book.mode !== 'pdf') return;
+  const last = narrowBook() ? book.n - 1 : Math.floor(book.n / 2), nv = book.v + dir;
+  if (nv < 0 || nv > last) return;
+  book.busy = true;
+  try {
+    if (narrowBook() || window.matchMedia('(prefers-reduced-motion: reduce)').matches) { book.v = nv; await showSpread(); return; }
+    // a leaf turns over the spine: the page you're leaving on its front, the page you're going to on its back
+    const [l0, r0] = spreadOf(book.v), [l1, r1] = spreadOf(nv), leaf = $('leaf');
+    const front = leaf.querySelector('.front'), back = leaf.querySelector('.back');
+    await Promise.all([setPage(front, dir > 0 ? r0 : l0), setPage(back, dir > 0 ? l1 : r1)]);
+    if (dir > 0) await setPage($('pg-r'), r1); else await setPage($('pg-l'), l1);
+    leaf.className = 'leaf ' + (dir > 0 ? 'fwd' : 'bwd'); leaf.hidden = false; void leaf.offsetWidth;
+    leaf.classList.add('go');
+    await new Promise(r => setTimeout(r, 560));
+    leaf.hidden = true; book.v = nv; await showSpread();
+  } finally { book.busy = false; }
+}
+async function openBook() {
+  if (!kit?.pdf) return;
+  book.mode = 'pdf'; $('book').hidden = false; $('book-putaway').hidden = false; $('book-title').textContent = kit.pdfName?.replace(/\.pdf$/i, '') || 'Instructions';
+  $('book-nav').hidden = false; $('book-art').hidden = true; $('book-stage').hidden = false;
+  $('book-page').textContent = 'Opening…';
+  try { await pdfDoc(); const pg = kit.page || 1; book.v = Math.min(narrowBook() ? pg - 1 : Math.floor(pg / 2), narrowBook() ? book.n - 1 : Math.floor(book.n / 2)); await showSpread(); $('book-next').focus(); }
+  catch (e) { $('book-page').textContent = `Couldn't open the PDF: ${e.message}`; }
+}
+function openArt() {
+  if (!kit) return;
+  book.mode = 'art'; $('book').hidden = false; $('book-putaway').hidden = true; $('book-title').textContent = kit.name;
+  $('book-nav').hidden = true; $('book-stage').hidden = true; $('book-art').hidden = false;
+  const im = $('book-art').querySelector('img'); if (kit.image) { im.src = URL.createObjectURL(assetBlob(kit.image)); im.hidden = false; } else im.hidden = true;
+  $('book-page').textContent = [kit.artName, kit.pdfName].filter(Boolean).join(' · ');
+  $('book-open-pdf').hidden = !kit.pdf;
+}
+function closeBook() {
+  const wasOpen = !$('book').hidden; $('book').hidden = true;
+  if (!wasOpen || book.mode !== 'pdf' || !kit?.pdf) return;
+  const page = narrowBook() ? book.v + 1 : (book.v === 0 ? 1 : 2 * book.v);
+  if (page !== (kit.page || 1)) { kit.page = page; markDirty(); buildKit(); }   // left open at that page, on the bench too
+}
+function bindKit() {
+  $('book-prev').addEventListener('click', () => turn(-1)); $('book-next').addEventListener('click', () => turn(1));
+  $('book-close').addEventListener('click', closeBook);
+  $('book').addEventListener('click', e => { if (e.target === $('book')) closeBook(); });
+  $('book-open-pdf').addEventListener('click', openBook);
+  $('book-remove').addEventListener('click', () => { closeBook(); putAway('box'); });
+  $('book-putaway').addEventListener('click', () => { closeBook(); putAway('book'); });
+  $('book-spread').addEventListener('click', e => { if (book.mode !== 'pdf') return; const r = $('book-spread').getBoundingClientRect(); turn(e.clientX < r.left + r.width / 2 ? -1 : 1); });
+  window.addEventListener('keydown', e => {
+    if ($('book').hidden) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closeBook(); }
+    else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); e.stopImmediatePropagation(); turn(1); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); e.stopImmediatePropagation(); turn(-1); }
+  }, true);
+}
+// ---------------------------------------------------------------------------
+// Navigation cube: click a face, edge or corner to look from there; drag it to turn the view
+// ---------------------------------------------------------------------------
+const navCube = (() => {
+  const cv = $('navcube'), r = new THREE.WebGLRenderer({ canvas: cv, alpha: true, antialias: true });
+  r.setPixelRatio(Math.min(devicePixelRatio, 2)); r.setSize(112, 112, false);
+  const sc = new THREE.Scene(), cam = new THREE.PerspectiveCamera(26, 1, 0.1, 50);
+  const face = (text, tint) => {
+    const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d');
+    g.fillStyle = tint; g.fillRect(0, 0, 128, 128); g.strokeStyle = 'rgba(255,255,255,.18)'; g.lineWidth = 6; g.strokeRect(3, 3, 122, 122);
+    g.fillStyle = '#e9e4d8'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    let fs = 30; g.font = `700 ${fs}px "Barlow Condensed", system-ui, sans-serif`; while (g.measureText(text).width > 108) { fs -= 2; g.font = `700 ${fs}px "Barlow Condensed", system-ui, sans-serif`; }
+    g.fillText(text, 64, 66);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return new THREE.MeshBasicMaterial({ map: t, color: '#ffffff' });
+  };
+  // BoxGeometry faces: +x, -x, +y, -y, +z, -z; turned so its +y is our up (+z) and its +z is our front (-y)
+  const mats = [face('RIGHT', '#3b4650'), face('LEFT', '#3b4650'), face('TOP', '#45525d'), face('BOTTOM', '#2e363d'), face('FRONT', '#3f4a54'), face('BACK', '#3f4a54')];
+  const geo = new THREE.BoxGeometry(2, 2, 2); geo.rotateX(Math.PI / 2);
+  const cube = new THREE.Mesh(geo, mats); sc.add(cube);
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: '#8b96a0' })); sc.add(edges);
+  // little axes off the bottom corner: X red, Y green, Z blue
+  const ax = (to, col) => { const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(-1.25, -1.25, -1.25), V(-1.25, -1.25, -1.25).add(to)]), new THREE.LineBasicMaterial({ color: col })); sc.add(l); };
+  ax(V(1.1, 0, 0), '#d46a6a'); ax(V(0, 1.1, 0), '#7fbf5a'); ax(V(0, 0, 1.1), '#6a9be0');
+  const hl = new THREE.Mesh(new THREE.SphereGeometry(0.26, 16, 10), new THREE.MeshBasicMaterial({ color: '#d6a24a', transparent: true, opacity: 0.85, depthTest: false }));
+  hl.renderOrder = 5; hl.visible = false; sc.add(hl);
+  const NAMES = { '1,0,0': 'Right', '-1,0,0': 'Left', '0,1,0': 'Back', '0,-1,0': 'Front', '0,0,1': 'Top', '0,0,-1': 'Bottom' };
+  const rc = new THREE.Raycaster(), ndc = new THREE.Vector2();
+  /** Which view a point on the cube asks for: a face, an edge (two axes) or a corner (three). */
+  const regionAt = ev => {
+    const b = cv.getBoundingClientRect(); ndc.set(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1);
+    rc.setFromCamera(ndc, cam); const h = rc.intersectObject(cube)[0]; if (!h) return null;
+    const p = h.point, d = V(Math.abs(p.x) > 0.62 ? Math.sign(p.x) : 0, Math.abs(p.y) > 0.62 ? Math.sign(p.y) : 0, Math.abs(p.z) > 0.62 ? Math.sign(p.z) : 0);
+    // the face you're on always counts
+    const n = h.face.normal.clone(); ['x', 'y', 'z'].forEach(k => { if (Math.abs(n[k]) > 0.5) d[k] = Math.sign(n[k]); });
+    return d;
+  };
+  const label = d => { const parts = []; if (d.z) parts.push(d.z > 0 ? 'Top' : 'Bottom'); if (d.y) parts.push(d.y > 0 ? 'Back' : 'Front'); if (d.x) parts.push(d.x > 0 ? 'Right' : 'Left'); return parts.join(' ') || 'view'; };
+  let hover = null, drag = null, anim = null;
+  const showHover = d => {
+    hover = d; mats.forEach(m => m.color.set('#ffffff')); hl.visible = false;
+    if (!d) { cv.title = 'Click a face, edge or corner to look from there. Drag to turn the view.'; return; }
+    const nz = (d.x !== 0) + (d.y !== 0) + (d.z !== 0);
+    if (nz === 1) { const i = d.x > 0 ? 0 : d.x < 0 ? 1 : d.z > 0 ? 2 : d.z < 0 ? 3 : d.y < 0 ? 4 : 5; mats[i].color.set('#f3c977'); }
+    else { hl.position.copy(d).multiplyScalar(1.0); hl.visible = true; }
+    cv.title = `Look from the ${label(d).toLowerCase()}`;
+  };
+  /** Swing the main camera round the orbit centre to look from direction d (a unit-ish vector from the centre to the eye). */
+  const goTo = (d, ms = 380) => {
+    const to = d.clone().normalize();
+    const lim = Math.sin(89.4 * Math.PI / 180);
+    if (Math.abs(to.z) > lim) { to.set(0, -Math.sqrt(1 - lim * lim), Math.sign(to.z) * lim); }      // straight up/down: keep front at the bottom of the screen
+    const from = camera.position.clone().sub(orbit.target), dist = from.length();
+    anim = { q: new THREE.Quaternion().setFromUnitVectors(from.clone().normalize(), to), from: from.normalize(), dist, t0: performance.now(), ms };
+    nav.glide = null;
+  };
+  const step = () => {
+    if (!anim) return;
+    const t = Math.min(1, (performance.now() - anim.t0) / anim.ms), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const q = new THREE.Quaternion().slerp(anim.q, e);
+    camera.position.copy(orbit.target).addScaledVector(anim.from.clone().applyQuaternion(q), anim.dist);
+    camera.lookAt(orbit.target); orbit.update();
+    if (t >= 1) { anim = null; markViewMoved(); }
+  };
+  const render = () => {
+    step();
+    cam.quaternion.copy(camera.quaternion); cam.position.set(0, 0, 9).applyQuaternion(camera.quaternion); cam.up.copy(camera.up);
+    r.render(sc, cam);
+  };
+  cv.addEventListener('pointermove', e => {
+    if (drag) {
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y; if (!drag.moved && Math.hypot(dx, dy) < 3) return;
+      drag.moved = true; drag.x = e.clientX; drag.y = e.clientY; anim = null; turnView(dx * 2.2, dy * 2.2, orbit.target.clone()); return;
+    }
+    showHover(regionAt(e));
+  });
+  cv.addEventListener('pointerleave', () => { if (!drag) showHover(null); });
+  cv.addEventListener('pointerdown', e => { e.preventDefault(); drag = { x: e.clientX, y: e.clientY, moved: false }; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointerup', e => {
+    const d = drag; drag = null; if (!d) return;
+    if (d.moved) { markViewMoved(); return; }
+    const reg = regionAt(e); if (reg) { goTo(reg); toast(`${label(reg)} view`); }
+  });
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+  $('nav-home').addEventListener('click', () => { goTo(V(1, -1.2, 0.85)); setTimeout(() => frame(benchBox()), 400); });
+  $('nav-proj').addEventListener('click', () => setOrtho(!camera.isOrthographicCamera));
+  // keyboard: number-pad style views, like Blender
+  return { render, goTo, NAMES };
+})();
+/** Turn the view about a pivot by a screen drag (px): around the up axis for x, tilting for y, never past straight up or down. */
+function turnView(dx, dy, P) {
+  const k = 2 * Math.PI / renderer.domElement.clientHeight, f = fwd(), right = V().crossVectors(f, camera.up).normalize();
+  const q = new THREE.Quaternion().setFromAxisAngle(V(0, 0, 1), -dx * k);
+  let tilt = -dy * k; const pitch = Math.asin(Math.max(-1, Math.min(1, f.z))), lim = Math.PI / 2 - 0.01;
+  tilt = Math.max(-lim - pitch, Math.min(lim - pitch, tilt));
+  q.multiply(new THREE.Quaternion().setFromAxisAngle(right, tilt));
+  for (const v of [camera.position, orbit.target]) v.sub(P).applyQuaternion(q).add(P);
+  camera.lookAt(orbit.target); orbit.update();
+}
+// ---------------------------------------------------------------------------
+// Bench objects: the kit box, the instructions and whole sprues can be picked up and moved like parts
+// ---------------------------------------------------------------------------
+let benchSel = null;                 // { kind: 'box' | 'book' | 'sprue', k }
+const benchMark = new THREE.Box3Helper(new THREE.Box3(), new THREE.Color('#d6a24a')); benchMark.visible = false; scene.add(benchMark);
+function benchObj(sel = benchSel) {
+  if (!sel) return null;
+  if (sel.kind === 'box') return kitFx.getObjectByName('kit-box') || null;
+  if (sel.kind === 'book') return kitFx.getObjectByName('kit-book') || null;
+  if (sel.kind === 'ref') return refFx.children.find(c => c.userData.ref === sel.k) || null;
+  if (sel.kind === 'section') return sec.on ? secObj : null;
+  return sprueFx.children.find(c => c.userData.frame === sel.k) || null;
+}
+function markBench() {
+  const o = benchObj(); benchMark.visible = !!o;
+  if (o) { o.updateMatrixWorld(true); benchMark.box.setFromObject(o === secObj ? secQuad : o).expandByScalar(0.6); }
+}
+function selectBench(kind, k = 0) {
+  select(null); benchSel = { kind, k }; markBench(); syncGizmo(); renderPartPanel();
+  if (['move', 'rotate'].includes(tool) && kind === 'sprue' && tool === 'rotate') toast('Sprues slide but don\'t turn. Use Move.');
+}
+/** What's under the cursor among the box, the booklet and the sprue plastic (a part in front wins). */
+function benchHit(ev) {
+  const r = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster();
+  rc.setFromCamera(new THREE.Vector2(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1), camera);
+  const pickRefs = refFx.children.filter(m => m.visible && !refById(m.userData.ref)?.locked);
+  const h = rc.intersectObjects([...kitFx.children, ...sprueFx.children, ...pickRefs, ...(sec.on && sec.show ? [secQuad] : [])], true)[0]; if (!h) return null;
+  if (h.object === secQuad) { const part = raycast(ev); return part && part.distance < h.distance - 1e-4 ? null : { kind: 'section' }; }
+  const part = raycast(ev); if (part && (part.distance < h.distance || h.object.userData.ref !== undefined)) return null;    // a part in front (or anywhere over a picture) wins
+  let o = h.object; while (o && o.userData.kit === undefined && o.userData.frame === undefined && o.userData.ref === undefined) o = o.parent;
+  if (!o) return null;
+  if (o.userData.ref !== undefined) return { kind: 'ref', k: o.userData.ref };
+  return o.userData.frame !== undefined ? { kind: 'sprue', k: o.userData.frame } : { kind: o.userData.kit };
+}
+/** The pieces still held on sprue k. */
+function piecesOn(k) { return [...new Set(sprues.gates.filter(g => g.frame === k).map(g => g.part))].map(partById).filter(m => m && onSprue(m)); }
+/** Slide sprue k's plastic and everything about it by t (the pieces have already moved). */
+function shiftSprue(k, t) {
+  const f = sprues.frames[k];
+  f.x0 += t.x; f.x1 += t.x; f.y0 += t.y; f.y1 += t.y; f.z += t.z; f.runners = f.runners.map(y => y + t.y);
+  (f.dividers || []).forEach(d => { d.x += t.x; d.y0 += t.y; d.y1 += t.y; });
+  f.tags = (f.tags || []).map(([x, y, w]) => [x + t.x, y + t.y, w]);
+  const ids = new Set();
+  for (const g of sprues.gates) if (g.frame === k) { g.a = V(...g.a).add(t).toArray(); g.b = V(...g.b).add(t).toArray(); ids.add(g.part); }
+  for (const id of ids) { if (sprues.labels[id]) sprues.labels[id] = V(...sprues.labels[id]).add(t).toArray(); const m = partById(id); if (m) { m.updateMatrixWorld(true); sprues.poses[id] = m.matrixWorld.toArray(); } }
+}
+function removeSprue(k) {
+  pushUndo();
+  sprues.frames.splice(k, 1); sprues.gates = sprues.gates.filter(g => g.frame !== k).map(g => ({ ...g, frame: g.frame > k ? g.frame - 1 : g.frame }));
+  if (!sprues.frames.length) sprues = null;
+  select(null); afterHierarchyChange(); toast('Removed that sprue frame. Its pieces stay where they are.');
+}
+function sectionPanel(el) {
+  const head = document.createElement('div'); head.className = 'multi-head'; head.textContent = 'Section plane';
+  const sm = document.createElement('small'); sm.textContent = 'Move (G) slides it (its blue arrow pushes it through the model); Rotate (R) turns it. The arrow on the plane points to the side that stays. X turns the section off.'; head.append(sm);
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, title) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; if (title) x.title = title; x.addEventListener('click', fn); row.append(x); };
+  b('Flip', sectionFlip, 'Keep the other side'); b('Face the view', sectionFaceView, 'Turn it square to where you are looking from'); b('Turn off', () => setFitPinned(false));
+  el.append(head, row);
+}
+function renderBenchPanel(el) {
+  const o = benchObj(); if (!o) { benchSel = null; el.innerHTML = '<p class="note">Select a part to see its size and attachments.</p>'; return; }
+  if (benchSel.kind === 'ref') return refPanel(el, o);
+  if (benchSel.kind === 'section') return sectionPanel(el);
+  const head = document.createElement('div'); head.className = 'multi-head';
+  const dl = document.createElement('dl'); dl.className = 'props';
+  const add = (k, v) => { const dt = document.createElement('dt'); dt.textContent = k; const dd = document.createElement('dd'); dd.textContent = v; dl.append(dt, dd); };
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, primary) => { const x = document.createElement('button'); x.className = 'btn' + (primary ? ' primary' : ''); x.type = 'button'; x.textContent = txt; x.addEventListener('click', fn); row.append(x); };
+  const size = new THREE.Box3().setFromObject(o).getSize(V());
+  if (benchSel.kind === 'sprue') {
+    const f = sprues.frames[benchSel.k], on = piecesOn(benchSel.k);
+    head.textContent = `Sprue ${f.letter}`;
+    add('Size', `${(f.x1 - f.x0).toFixed(0)} × ${(f.y1 - f.y0).toFixed(0)} mm`); add('Pieces on it', `${on.length}`);
+    b('Export this sprue', () => exportSprues([benchSel.k]), true); b('Remove frame', () => removeSprue(benchSel.k));
+  } else if (benchSel.kind === 'box') {
+    head.textContent = kit.name + (kit.state === 'sealed' ? ' (sealed)' : ''); add('Kit box', `${kit.W.toFixed(0)} × ${kit.D.toFixed(0)} × ${kit.H.toFixed(0)} mm`);
+    if (kit.artName) add('Box art', kit.artName); if (kit.pdfName) add('Instructions', kit.pdfName);
+    if (kit.state === 'sealed') { add('Inside', `${sprues ? sprues.frames.length : 0} sprue${sprues?.frames.length === 1 ? '' : 's'}${kit.pdf ? ', instructions' : ''}`); b('Open the box', openBox, true); if (kit.image) b('Show box art', openArt); }
+    else { if (kit.image) b('Show box art', openArt, true); if (kit.pdf) b('Open instructions', openBook); if (kit.state === 'open') b('Put the lid back on', closeLid); }
+    b('Put the box away', () => putAway('box'));
+  } else {
+    head.textContent = 'Instructions'; add('File', kit.pdfName || '—'); if (book.n) add('Pages', String(book.n));
+    b('Open', openBook, true); b('Put the instructions away', () => putAway('book'));
+  }
+  const sm = document.createElement('small'); sm.textContent = 'Move (G) slides it' + (benchSel.kind === 'sprue' ? ', pieces and all.' : '; Rotate (R) turns it.') + ' Delete removes it.'; head.append(sm);
+  el.append(head, dl, row);
+}
+// ---------------------------------------------------------------------------
+// Reference images: a picture on a plane in the scene, to line parts up and pose against
+// ---------------------------------------------------------------------------
+let refs = [];                       // { id, asset, name, aspect (h/w), pos, quat, w (mm), opacity, behind, locked, visible, flip }
+const refFx = new THREE.Group(); scene.add(refFx);
+const refTex = new Map();            // asset key -> texture (with .image a bitmap)
+async function refTexture(key) {
+  if (refTex.has(key)) return refTex.get(key);
+  const blob = assetBlob(key); if (!blob) return null;
+  const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+  const t = new THREE.Texture(bmp); t.colorSpace = THREE.SRGBColorSpace; t.flipY = false; t.needsUpdate = true; t.anisotropy = 4;
+  refTex.set(key, t); return t;
+}
+let refGen = 0;
+async function rebuildRefs() {
+  const gen = ++refGen;
+  const meshes = [];
+  for (const r of refs) {
+    const tex = await refTexture(r.asset); if (gen !== refGen) return;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: tex, color: tex ? '#ffffff' : '#555b61', transparent: true, opacity: r.opacity, side: THREE.DoubleSide, depthWrite: false, depthTest: !r.behind, toneMapped: false }));
+    m.renderOrder = r.behind ? -10 : 1; m.userData.ref = r.id; m.name = 'ref-' + r.id;
+    m.position.fromArray(r.pos); m.quaternion.fromArray(r.quat); m.scale.set(r.w * (r.flip ? -1 : 1), r.w * r.aspect, 1); m.visible = r.visible !== false;
+    meshes.push(m);
+  }
+  while (refFx.children.length) { const c = refFx.children.pop(); c.geometry.dispose(); c.material.dispose(); }
+  meshes.forEach(m => refFx.add(m));
+  if (benchSel?.kind === 'ref') markBench();
+}
+const refById = id => refs.find(r => r.id === id) || null;
+/** Add a picture: it faces the current view, through the middle of the view, sized to the parts and set behind them. */
+async function addRefImage(file) {
+  if (!/^image\//.test(file.type) && !/\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name)) { toast(`${file.name} isn't a picture.`, 'bad'); return; }
+  const key = await addAsset(file); let aspect = 1;
+  try { const bmp = await createImageBitmap(assetBlob(key)); aspect = bmp.height / bmp.width; bmp.close?.(); } catch (e) { assets.delete(key); toast(`Couldn't read ${file.name} as a picture.`, 'bad'); return; }
+  scene.updateMatrixWorld(true);
+  const box = liveParts().length ? sceneBox() : null, f = fwd();
+  const h = box ? Math.max(box.getSize(V()).length() * 0.8, 10) : 80, w = h / aspect;
+  const c = box ? box.getCenter(V()).addScaledVector(f, box.getSize(V()).length() * 0.6) : orbit.target.clone();
+  pushUndo();
+  const r = { id: uid(), asset: key, name: file.name.replace(/\.[^.]+$/, ''), aspect, pos: c.toArray(), quat: camera.quaternion.toArray(), w, opacity: 0.6, behind: true, locked: false, visible: true, flip: false };
+  refs.push(r); await rebuildRefs(); markDirty(); renderOutliner(); selectBench('ref', r.id);
+  toast(`Added ${r.name} facing this view, behind the parts. Move (G) and Rotate (R) place it; set its size and see-through in Properties.`, 'ok');
+}
+function removeRef(id) { pushUndo(); refs = refs.filter(r => r.id !== id); if (benchSel?.kind === 'ref' && benchSel.k === id) { benchSel = null; benchMark.visible = false; tc.detach(); } rebuildRefs(); markDirty(); renderOutliner(); renderPartPanel(); }
+function refPanel(el, o) {
+  const r = refById(benchSel.k); if (!r) return;
+  const head = document.createElement('div'); head.className = 'multi-head';
+  const nm = document.createElement('input'); nm.className = 'name-input'; nm.value = r.name; nm.setAttribute('aria-label', 'Reference image name');
+  nm.addEventListener('change', () => { r.name = nm.value.trim() || r.name; markDirty(); renderOutliner(); });
+  const sec = document.createElement('div'); sec.className = 'conn';
+  const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); sec.append(f); return f; };
+  const upd = (fn, undo = true) => { if (undo) pushUndo(); fn(); rebuildRefs(); markDirty(); };
+  const wIn = document.createElement('input'); wIn.type = 'number'; wIn.className = 'num'; wIn.step = '1'; wIn.min = '1'; wIn.value = r.w.toFixed(1); wIn.setAttribute('aria-label', 'Width in mm');
+  const hOut = document.createElement('span'); hOut.textContent = `× ${(r.w * r.aspect).toFixed(1)} mm`;
+  wIn.addEventListener('change', () => { const v = +wIn.value; if (v > 0) upd(() => { r.w = v; }); hOut.textContent = `× ${(r.w * r.aspect).toFixed(1)} mm`; });
+  field('Size', wIn, hOut);
+  const op = document.createElement('input'); op.type = 'range'; op.min = '0.05'; op.max = '1'; op.step = '0.05'; op.value = r.opacity; op.setAttribute('aria-label', 'See-through');
+  op.addEventListener('input', () => { r.opacity = +op.value; const m = benchObj(); if (m) m.material.opacity = r.opacity; markDirty(); });
+  field('Solid', op);
+  const chk = (label, key, tip) => { const l = document.createElement('label'); l.className = 'check'; l.title = tip; const c = document.createElement('input'); c.type = 'checkbox'; c.checked = !!r[key];
+    c.addEventListener('change', () => upd(() => { r[key] = c.checked; })); l.append(c, ' ' + label); sec.append(l); };
+  chk('Always behind the parts', 'behind', 'Drawn behind everything, like a backdrop, wherever it is');
+  chk('Locked (clicks go through it)', 'locked', 'Stops clicks on empty space picking it. Select it again from the Parts list.');
+  chk('Mirrored', 'flip', 'Flip the picture left to right');
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const b = (txt, fn, tip, primary) => { const x = document.createElement('button'); x.className = 'btn' + (primary ? ' primary' : ''); x.type = 'button'; x.textContent = txt; if (tip) x.title = tip; x.addEventListener('click', fn); row.append(x); };
+  b('Face this view', () => upd(() => { r.quat = camera.quaternion.toArray(); }), 'Turn it to face the camera, about its middle');
+  b('Look straight at it', () => lookAtRef(r), 'Turn the view to face it square on, in orthographic, framed');
+  b(r.visible === false ? 'Show' : 'Hide', () => upd(() => { r.visible = r.visible === false; }));
+  b('Delete', () => removeRef(r.id));
+  b('Make a relief…', () => openRelief(assetBlob(r.asset), r.name), 'Turn this picture into a raised 3D relief (a logo, an emblem) you can put on a part');
+  const ap = document.createElement('div'); ap.className = 'conn'; ap.id = 'autopose-box';
+  head.append(nm); const sm = document.createElement('small'); sm.textContent = 'Reference image. Move (G) slides it, Rotate (R) turns it.'; head.append(sm);
+  el.append(head, sec, row, ap);
+  autoPoseRows(r, ap);
+}
+// ---- Auto-pose (experimental): bend the joints until the model's outline covers the figure in the picture ----
+const SIL_LAYER = 5;
+let silRT = null, silCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000); silCam.layers.set(SIL_LAYER);
+const silMat = new THREE.MeshBasicMaterial({ color: '#ffffff', side: THREE.DoubleSide });
+/** The picture's frame: centre, right, up, out (unit), and its size in mm. */
+function refFrame(r) {
+  const q = new THREE.Quaternion().fromArray(r.quat);
+  return { c: V(...r.pos), x: V(r.flip ? -1 : 1, 0, 0).applyQuaternion(q), y: V(0, 1, 0).applyQuaternion(q), n: V(0, 0, 1).applyQuaternion(q), w: r.w, h: r.w * r.aspect };
+}
+/** Where the figure is in the picture: a W×H mask cut out by transparency, or by distance from the background colour. */
+async function refMask(r, W, tol) {
+  const bmp = await createImageBitmap(assetBlob(r.asset)), H = Math.max(8, Math.round(W * r.aspect));
+  const cv = new OffscreenCanvas(W, H), g = cv.getContext('2d', { willReadFrequently: true }); g.drawImage(bmp, 0, 0, W, H);
+  const d = g.getImageData(0, 0, W, H).data, n = W * H, m = new Uint8Array(n);
+  let clear = 0; for (let i = 0; i < n; i++) if (d[4 * i + 3] < 128) clear++;
+  if (clear > n * 0.05) { for (let i = 0; i < n; i++) m[i] = d[4 * i + 3] >= 128 ? 1 : 0; return { m, W, H, how: 'transparency' }; }
+  const border = []; for (let x = 0; x < W; x++) border.push(x, x + (H - 1) * W); for (let y = 0; y < H; y++) border.push(y * W, y * W + W - 1);
+  const med = k => { const v = border.map(i => d[4 * i + k]).sort((a, b) => a - b); return v[v.length >> 1]; }, bg = [med(0), med(1), med(2)];
+  const t2 = (tol * 4.4) ** 2;
+  for (let i = 0; i < n; i++) { const dr = d[4 * i] - bg[0], dg = d[4 * i + 1] - bg[1], db = d[4 * i + 2] - bg[2]; m[i] = dr * dr + dg * dg + db * db > t2 ? 1 : 0; }
+  return { m, W, H, how: 'background', bg };
+}
+/** The figure's outline seen square-on to the picture, as a W×H mask in the picture's own pixels. */
+function silhouette(r, parts, W, H) {
+  if (!silRT || silRT.width !== W || silRT.height !== H) { silRT?.dispose(); silRT = new THREE.WebGLRenderTarget(W, H); silRT.buf = new Uint8Array(W * H * 4); }
+  const F = refFrame(r), D = sceneScale() * 4 + F.w;
+  silCam.left = -F.w / 2; silCam.right = F.w / 2; silCam.top = F.h / 2; silCam.bottom = -F.h / 2; silCam.near = 0.01; silCam.far = D * 3;
+  silCam.position.copy(F.c).addScaledVector(F.n, D); silCam.up.copy(F.y); silCam.lookAt(F.c); silCam.updateProjectionMatrix(); silCam.updateMatrixWorld(true);
+  if (r.flip) silCam.projectionMatrix.elements[0] *= -1;                 // a mirrored picture: mirror the outline to match
+  parts.forEach(m => m.layers.enable(SIL_LAYER));
+  const bg = scene.background, ov = scene.overrideMaterial, cc = renderer.getClearColor(new THREE.Color()), ca = renderer.getClearAlpha();
+  scene.background = null; scene.overrideMaterial = silMat; renderer.setClearColor(0x000000, 1);
+  renderer.setRenderTarget(silRT); renderer.clear(); renderer.render(scene, silCam); renderer.setRenderTarget(null);
+  scene.background = bg; scene.overrideMaterial = ov; renderer.setClearColor(cc, ca);
+  parts.forEach(m => m.layers.disable(SIL_LAYER));
+  renderer.readRenderTargetPixels(silRT, 0, 0, W, H, silRT.buf);
+  const m = new Uint8Array(W * H), b = silRT.buf;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) m[(H - 1 - y) * W + x] = b[4 * (y * W + x)] > 127 ? 1 : 0;   // GL rows run bottom up
+  return m;
+}
+const overlap = (a, b) => { let i = 0, u = 0; for (let k = 0; k < a.length; k++) { if (a[k] & b[k]) i++; if (a[k] | b[k]) u++; } return u ? i / u : 0; };
+/** The figures that could be posed: each assembly with joints, biggest first. */
+const poseFigures = () => liveParts().filter(p => !parentPart(p) && p.visible).map(p => ({ root: p, parts: subtreeParts(p).filter(m => m.visible && !m.userData.optOff) }))
+  .filter(f => f.parts.length > 1).sort((a, b) => b.parts.length - a.parts.length);
+let autoPose = { tol: 12, whole: true, busy: false, stop: false, fig: null, preview: false };
+function autoPoseRows(r, box) {
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = 'Match a pose to it (experimental)'; box.append(h);
+  const figs = poseFigures();
+  const note = document.createElement('p'); note.className = 'note';
+  note.textContent = figs.length ? 'Line the picture up with the figure first (size and place it so they overlap), ideally square on. Then it bends the joints until the outline covers the figure in the picture. Works best on a plain background or a cut-out.'
+    : 'Build a rig first: the figure needs jointed parts to pose.';
+  box.append(note); if (!figs.length) return;
+  const field = (label, ...kids) => { const f = document.createElement('div'); f.className = 'conn-f'; const l = document.createElement('label'); l.textContent = label; f.append(l, ...kids); box.append(f); return f; };
+  const fs = document.createElement('select'); fs.className = 'num osel'; fs.setAttribute('aria-label', 'Figure to pose');
+  figs.forEach((f, k) => { const o = document.createElement('option'); o.value = f.root.uuid; o.textContent = `${f.root.name} (${f.parts.length} parts)`; fs.append(o); });
+  if (autoPose.fig && figs.some(f => f.root.uuid === autoPose.fig)) fs.value = autoPose.fig; fs.addEventListener('change', () => { autoPose.fig = fs.value; });
+  field('Figure', fs);
+  const tl = document.createElement('input'); tl.type = 'range'; tl.min = '2'; tl.max = '60'; tl.step = '1'; tl.value = autoPose.tol; tl.setAttribute('aria-label', 'Background tolerance');
+  tl.addEventListener('input', () => { autoPose.tol = +tl.value; if (autoPose.preview) showMaskPreview(r); });
+  field('Background', tl);
+  const pv = document.createElement('label'); pv.className = 'check'; const pc = document.createElement('input'); pc.type = 'checkbox'; pc.checked = autoPose.preview;
+  pc.addEventListener('change', () => { autoPose.preview = pc.checked; if (pc.checked) showMaskPreview(r); else rebuildRefs(); }); pv.append(pc, ' Show what it sees as the figure'); box.append(pv);
+  const wh = document.createElement('label'); wh.className = 'check'; const wc = document.createElement('input'); wc.type = 'checkbox'; wc.checked = autoPose.whole;
+  wc.addEventListener('change', () => { autoPose.whole = wc.checked; }); wh.append(wc, ' Also slide and turn the whole figure in the picture'); box.append(wh);
+  const row = document.createElement('div'); row.className = 'btnrow';
+  const go = document.createElement('button'); go.type = 'button'; go.className = 'btn primary'; go.textContent = 'Match pose'; go.addEventListener('click', () => runAutoPose(r, figs.find(f => f.root.uuid === fs.value) || figs[0]));
+  row.append(go); box.append(row);
+  const out = document.createElement('p'); out.className = 'note'; out.id = 'autopose-out'; box.append(out);
+}
+/** Paint the cut-out on the picture: the figure as it reads it in colour, the rest dimmed. */
+async function showMaskPreview(r) {
+  const mk = await refMask(r, 320, autoPose.tol), cv = document.createElement('canvas'); cv.width = mk.W; cv.height = mk.H;
+  const g = cv.getContext('2d'), im = g.createImageData(mk.W, mk.H);
+  for (let i = 0; i < mk.m.length; i++) { const on = mk.m[i]; im.data.set(on ? [255, 160, 60, 255] : [20, 24, 28, 200], 4 * i); }
+  g.putImageData(im, 0, 0);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const m = refFx.children.find(c => c.userData.ref === r.id); if (m) { m.material.map = t; m.material.needsUpdate = true; }
+}
+/** The things auto-pose may change: the whole figure in the picture's plane, then each joint, big limbs first. */
+function poseDofs(fig, F, whole) {
+  const out = [], size = sceneBox(fig.parts).getSize(V()).length();
+  if (whole) {
+    const root = fig.root, c = sceneBox(fig.parts).getCenter(V());
+    const mv = d => () => { applyWorld(root, Tr(d)); };
+    out.push({ name: 'slide across', step: size * 0.06, min: size * 0.004, apply: (h) => applyWorld(root, Tr(F.x.clone().multiplyScalar(h))) });
+    out.push({ name: 'slide up', step: size * 0.06, min: size * 0.004, apply: (h) => applyWorld(root, Tr(F.y.clone().multiplyScalar(h))) });
+    out.push({ name: 'turn', step: 0.2, min: 0.01, apply: (h) => { const p = sceneBox(fig.parts).getCenter(V()); applyWorld(root, Tr(p).multiply(new THREE.Matrix4().makeRotationAxis(F.n, h)).multiply(Tr(p.clone().negate()))); } });
+  }
+  const js = [...new Set(fig.parts.map(jointOf).filter(Boolean))].sort((a, b) => subtreeParts(b).length - subtreeParts(a).length);
+  for (const j of js) {
+    const jd = j.userData.joint, t = jd.type || 'pinned';
+    if (t === 'hinge') out.push({ j, name: 'hinge', sweep: true, step: 0.35, min: 0.01, apply: h => setJointValue(j, jointValue(j) + h * 180 / Math.PI) });
+    else {
+      if (t === 'roller') out.push({ j, name: 'roller', step: size * 0.04, min: size * 0.002, apply: h => setJointValue(j, jointValue(j) + h) });
+      // pinned: turn in the picture's plane (what the outline shows best), and tilt toward or away from it (foreshortening),
+      // both about the joint's point; a turn about the limb's own length doesn't change its outline, so that's left alone
+      const turnWorld = (axis, h) => { const pw = j.parent.getWorldQuaternion(new THREE.Quaternion()); j.quaternion.premultiply(pw.clone().invert().multiply(new THREE.Quaternion().setFromAxisAngle(axis, h)).multiply(pw)); j.updateMatrixWorld(true); };
+      out.push({ j, name: 'swing', sweep: true, step: 0.35, min: 0.01, apply: h => turnWorld(F.n, h) });
+      out.push({ j, name: 'tilt', late: true, step: 0.2, min: 0.01, apply: h => {
+        const a = V().setFromMatrixPosition(j.matrixWorld), kid = j.children.find(isPart), tip = kid ? sceneBox(subtreeParts(kid)).getCenter(V()) : a.clone().add(F.x);
+        const limb = tip.sub(a); limb.addScaledVector(F.n, -limb.dot(F.n)); if (limb.lengthSq() < 1e-9) limb.copy(F.x);
+        turnWorld(limb.normalize().cross(F.n).normalize(), h); } });
+    }
+  }
+  return out;
+}
+async function runAutoPose(r, fig) {
+  if (autoPose.busy) return;
+  autoPose.busy = true; autoPose.stop = false;
+  const W = 140, mk = await refMask(r, W, autoPose.tol), H = mk.H, target = mk.m;
+  const tgtN = target.reduce((a, v) => a + v, 0);
+  if (tgtN < W * H * 0.01 || tgtN > W * H * 0.95) { autoPose.busy = false; toast(tgtN < W * H * 0.01 ? "It can't find a figure in the picture: raise Background, or use a picture with a plainer background." : "Almost all of the picture reads as figure: lower Background.", 'bad'); return; }
+  pushUndo(); lastOp = null;
+  const F = refFrame(r), dofs = poseDofs(fig, F, autoPose.whole);
+  const all = () => [...fig.parts, ...dofs.filter(d => d.j).map(d => d.j)];
+  const save = () => [fig.root, ...dofs.filter(d => d.j).map(d => d.j)].map(o => [o, o.position.clone(), o.quaternion.clone()]);
+  const load = st => { for (const [o, p, q] of st) { o.position.copy(p); o.quaternion.copy(q); } scene.updateMatrixWorld(true); };
+  const score = () => { scene.updateMatrixWorld(true); if (links.length) solveLinks(null, 8); return overlap(silhouette(r, fig.parts, W, H), target); };
+  let best = score(); const start = best;
+  loading.show('Matching the pose…'); loading.onStop(() => { autoPose.stop = true; });
+  let evals = 0, t0 = performance.now(), pass = 0;
+  const breathe = async (frac, what) => { if (performance.now() - t0 > 60) { loading.set(frac, `${what}: ${Math.round(best * 100)}% covered (from ${Math.round(start * 100)}%) · ${evals} tries`); await nextFrame(); t0 = performance.now(); } };
+  try {
+    // 1. each turning joint, biggest first, swept right round in the picture's plane (gets out of poses that are far off)
+    const sweeps = dofs.filter(d => d.sweep);
+    for (let k = 0; k < sweeps.length && !autoPose.stop; k++) {
+      const d = sweeps[k], st0 = save(); let bestA = 0;
+      for (let a = 15; a < 360; a += 15) {
+        load(st0); d.apply(a * Math.PI / 180); const sc = score(); evals++;
+        if (sc > best + 1e-4) { best = sc; bestA = a; }
+        await breathe(0.3 * (k + a / 360) / sweeps.length, 'Swinging each joint round');
+      }
+      load(st0); if (bestA) d.apply(bestA * Math.PI / 180); scene.updateMatrixWorld(true);
+    }
+    // 2. fine steps, in the plane first; the tilts join once that settles
+    let late = false;
+    for (; pass < 60 && !autoPose.stop; pass++) {
+      let moved = false;
+      for (const d of dofs) {
+        if (d.step < d.min || autoPose.stop || (d.late && !late)) continue;
+        for (const sgn of [1, -1]) {
+          const st = save(); d.apply(sgn * d.step); const sc = score(); evals++;
+          if (sc > best + 1e-4) { best = sc; moved = true; d.lastGood = sgn; break; }
+          load(st);
+        }
+        await breathe(Math.min(0.98, 0.3 + pass / 20), late ? 'Fine-tuning, with tilts' : 'Fine-tuning');
+      }
+      if (!moved) {
+        let any = false; for (const d of dofs) { if (d.late && !late) continue; d.step /= 2; if (d.step >= d.min) any = true; }
+        if (!any) { if (late) break; late = true; }            // the plane has settled: now let limbs tilt toward or away
+      }
+    }
+  } finally {
+    loading.hide(); autoPose.busy = false;
+    if (links.length) solveLinks(null);
+    afterHierarchyChange(); markDirty();
+    const out = $('autopose-out'); if (out) out.textContent = `Outline covers ${Math.round(best * 100)}% of the figure (was ${Math.round(start * 100)}%). Undo puts the old pose back.`;
+    toast(best > start + 0.01 ? `Matched: the outline now covers ${Math.round(best * 100)}% of the figure in the picture (was ${Math.round(start * 100)}%). Check it from the side too.` : "Couldn't improve on this pose. Line the picture up with the figure more closely and try again.", best > start + 0.01 ? 'ok' : 'bad');
+  }
+}
+/** Turn the view square on to a reference (orthographic, framed on it). */
+function lookAtRef(r) {
+  const n = V(0, 0, 1).applyQuaternion(new THREE.Quaternion().fromArray(r.quat)), c = V(...r.pos);
+  setOrtho(true); nav.glide = null;
+  const up = V(0, 1, 0).applyQuaternion(new THREE.Quaternion().fromArray(r.quat));
+  camera.up.copy(Math.abs(up.z) > 0.2 ? V(0, 0, 1) : up); orbit.target.copy(c);
+  camera.position.copy(c).addScaledVector(n, Math.max(sceneScale(), r.w) * 4); camera.lookAt(c); orbit.update();
+  camera.zoom = ORTHO_H * Math.min(1, (camera.right - camera.left) / (camera.top - camera.bottom)) / (Math.max(r.w, r.w * r.aspect) / 2 * 1.08); camera.updateProjectionMatrix();
+  fitClipPlanes(); markViewMoved();
+}
+function updateButtons() {
+  $('btn-undo').disabled = !undoStack.length; $('btn-redo').disabled = !redoStack.length;
+  const any = liveParts().length > 0;
+  $('exp-all').disabled = $('exp-each').disabled = !any; $('exp-sel').disabled = !selected;
+  if (!$('dlg-export').hidden) syncExportPick();
+}
+function updateStats() {
+  const ps = liveParts(), tris = ps.reduce((s, p) => s + p.userData.part.tris, 0);
+  $('stats').textContent = `${ps.length} parts · ${tris.toLocaleString()} tris · ${joints.filter(j => j.parent).length} joints`;
+}
+
+/*
+ * Connections you can select and change later: each joint (a part on its parent) and each extra link (a pin or a rail).
+ * Select one by clicking its marker, its icon in the Parts list, or ⌖ in Properties. Then:
+ *   - Move (G) drags the connection point itself, Rotate (R) turns its axes; the parts stay where they are
+ *   - Properties shows its type, axis and limits, offsets you can type (the point, and the part from the point),
+ *     and magnets placed at it: they follow when the connection changes
+ * Offsets are kept with the connection (joint: pointOff in its rest axes, partOff in its own axes; link: offA/offB in
+ * each part's axes), so they can be read and changed again at any point.
+ */
+let connSel = null;                 // { kind: 'joint', id: joint uuid } | { kind: 'link', id: link id }
+const jointById = id => joints.find(j => j.uuid === id && j.parent) || null;
+const linkById = id => links.find(l => l.id === id) || null;
+/** Everything about a connection, live: its parts, where it is and which way it points (world). */
+function connInfo(c) {
+  if (!c) return null;
+  if (c.kind === 'joint') {
+    const j = jointById(c.id); if (!j) return null;
+    const child = j.children.find(isPart), par = parentPart(child || j) || (isPart(j.parent) ? j.parent : null); if (!child || !par) return null;
+    j.updateMatrixWorld(true);
+    const jd = j.userData.joint, P = V().setFromMatrixPosition(j.matrixWorld), q = j.getWorldQuaternion(new THREE.Quaternion());
+    const rq = j.parent.getWorldQuaternion(new THREE.Quaternion()).multiply(jd.rest);
+    return { c, kind: 'joint', j, jd, a: child, b: par, point: P, axis: V(0, 0, 1).applyQuaternion(q), q, restQ: rq, name: `${child.name} on ${par.name}`, type: jd.type || 'pinned' };
+  }
+  const l = linkById(c.id); if (!l) return null;
+  const a = partByUuid(l.a), b = partByUuid(l.b); if (!a || !b) return null;
+  a.updateMatrixWorld(true); b.updateMatrixWorld(true);
+  const P = V(...l.pb).applyMatrix4(b.matrixWorld), ja = jointOf(a);
+  let axis = l.kind === 'rail' ? railAxisLocal(l).transformDirection(b.matrixWorld)
+    : ja ? V(...l.pa).applyMatrix4(a.matrixWorld).sub(V().setFromMatrixPosition(ja.matrixWorld)) : worldBox(a).getCenter(V()).sub(worldBox(b).getCenter(V()));
+  if (axis.lengthSq() < 1e-10) axis = V(0, 0, 1); axis.normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(V(0, 0, 1), axis);
+  return { c, kind: 'link', l, a, b, point: P, axis, q, restQ: b.getWorldQuaternion(new THREE.Quaternion()), name: `${a.name} ${l.kind === 'rail' ? 'on a rail on' : 'pinned to'} ${b.name}`, type: l.kind };
+}
+function allConns() {
+  return [...joints.filter(j => j.parent && j.children.some(isPart)).map(j => ({ kind: 'joint', id: j.uuid })), ...links.map(l => ({ kind: 'link', id: l.id }))].map(connInfo).filter(Boolean);
+}
+const sameConn = (x, y) => !!x && !!y && x.kind === y.kind && x.id === y.id;
+function selectConn(c) {
+  connSel = c || null;
+  if (connSel) { selection = []; selected = null; if (benchSel) { benchSel = null; benchMark.visible = false; } }
+  paintSelection(); syncGizmo(); renderOutliner(); renderPartPanel(); updateButtons();
+  if (connSel) { const ci = connInfo(connSel); if (ci) toast(`Connection: ${ci.name}. Move (G) drags its point, Rotate (R) turns its axes.`); }
+}
+/** The connection whose marker is within a few pixels of a click, nearest first. */
+function connAt(ev) {
+  if (!$('set-joints').checked) return null;
+  const r = renderer.domElement.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top; let best = null, bd = 12;
+  for (const ci of allConns()) {
+    if (!isVisibleChain(ci.a) || !isVisibleChain(ci.b)) continue;
+    const pts = [ci.point]; if (ci.kind === 'link') pts.push(V(...ci.l.pa).applyMatrix4(ci.a.matrixWorld));
+    for (const p of pts) { const v = p.clone().project(camera); if (v.z > 1) continue; const d = Math.hypot((v.x + 1) / 2 * r.width - x, (1 - v.y) / 2 * r.height - y); if (d < bd) { bd = d; best = ci.c; } }
+  }
+  return best;
+}
+// the selected connection's marker: a ring round its point, square to its axis
+const connMark = new THREE.Group();
+{ const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 48 }, (_, i) => { const a = i / 48 * Math.PI * 2; return V(Math.cos(a), Math.sin(a), 0); })), new THREE.LineBasicMaterial({ color: '#4db4dc', depthTest: false }));
+  const ax = new THREE.Line(new THREE.BufferGeometry().setFromPoints([V(0, 0, -1.6), V(0, 0, 1.6)]), new THREE.LineBasicMaterial({ color: '#4db4dc', depthTest: false }));
+  ring.renderOrder = ax.renderOrder = 1000; connMark.add(ring, ax); connMark.visible = false; scene.add(connMark); }
+function updateConnMark() {
+  const ci = connSel && connInfo(connSel); connMark.visible = !!ci; if (!ci) return;
+  const s2 = markerSize() * 3.5; connMark.position.copy(ci.point); connMark.quaternion.copy(ci.q); connMark.scale.setScalar(s2);
+}
+/** Move a joint's point (world mm) without moving anything on it: the parts stay put, the pivot moves. */
+function movePivot(j, dWorld) {
+  const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
+  home.updateMatrixWorld(true);
+  const inv = home.matrixWorld.clone().invert(), P = V().setFromMatrixPosition(j.matrixWorld), P2 = P.clone().add(dWorld).applyMatrix4(inv), dLocal = P2.sub(P.clone().applyMatrix4(inv));
+  j.position.add(dLocal); j.userData.joint.restPos.add(dLocal); j.updateMatrixWorld(true); kids.forEach(k => j.attach(k));
+}
+/** Turn a joint's axes (world turn dq about its point) without moving anything on it. */
+function turnPivot(j, dq) {
+  const kids = j.children.filter(isPart), home = j.parent; kids.forEach(k => home.attach(k));
+  const pq = home.getWorldQuaternion(new THREE.Quaternion()), jq = j.getWorldQuaternion(new THREE.Quaternion());
+  j.quaternion.copy(pq.clone().invert().multiply(dq.clone().multiply(jq)));
+  const jd = j.userData.joint, rw = pq.clone().multiply(jd.rest); jd.rest.copy(pq.clone().invert().multiply(dq.clone().multiply(rw)));
+  j.updateMatrixWorld(true); kids.forEach(k => j.attach(k));
+  if (jd.type === 'hinge' || jd.type === 'roller') { jd.axis = 'custom'; jd.axisName = 'Turned by hand'; }
+}
+/** The distances a connection has been shifted by, for showing and typing. */
+function connOffsets(ci) {
+  if (ci.kind === 'joint') return { point: ci.jd.pointOff || [0, 0, 0], part: ci.jd.partOff || [0, 0, 0] };
+  return { point: ci.l.offB || [0, 0, 0], part: ci.l.offA || [0, 0, 0] };
+}
+/**
+ * Shift a connection by d (3 numbers): which 'point' (the connection's point, in its rest axes; for a link, the end on
+ * its second part, in that part's axes) or 'part' (a joint's part away from its point, in the joint's axes; for a
+ * link, the end on its first part, in that part's axes).
+ */
+function shiftConn(ci, which, d) {
+  if (ci.kind === 'joint') {
+    const jd = ci.jd, key = which === 'point' ? 'pointOff' : 'partOff', o = jd[key] || [0, 0, 0]; jd[key] = o.map((v, i) => +(v + d[i]).toFixed(6));
+    if (which === 'point') movePivot(ci.j, V(...d).applyQuaternion(ci.restQ));
+    else { const kid = ci.a; kid.position.add(V(...d).applyQuaternion(kid.quaternion.clone().identity())); kid.updateMatrixWorld(true); }   // the joint's own frame is the child's parent frame
+  } else {
+    const l = ci.l, key = which === 'point' ? 'offB' : 'offA', o = l[key] || [0, 0, 0]; l[key] = o.map((v, i) => +(v + d[i]).toFixed(6));
+    if (which === 'point') l.pb = V(...l.pb).add(V(...d)).toArray(); else l.pa = V(...l.pa).add(V(...d)).toArray();
+  }
+  scene.updateMatrixWorld(true);
+}
+/** After a connection changed: close the loops again and re-seat its magnets. */
+function connChanged(c) { if (links.length) solveLinks(c.kind === 'joint' ? jointById(c.id) : null); scene.updateMatrixWorld(true); placeConnMagnets(c); afterHierarchyChange(); }
+
+/*
+ * Image to relief: a picture (a logo) becomes a solid. The picture is read as numbers, no AI: how much "ink" each
+ * pixel has (dark on light, light on dark, or a cut-out PNG's see-through background). The outline is traced where
+ * that crosses the threshold; the height is flat (with an optional rounded bevel) or follows the brightness (a depth
+ * map). It's built in the background with Manifold, so it comes out as one clean closed solid.
+ * Then it can go on a part: click the spot, and it lies on the surface there, wrapped to its shape if you like,
+ * sunk in a little so it joins up when exported, and fixed to that part so it poses with it.
+ */
+const rl = { img: null, name: '', field: null, w: 0, h: 0, t: 0.5, autoT: 0.5, raise: 'auto', mode: 'flat', busy: false };
+async function openRelief(blob = null, name = '') {
+  $('relief').hidden = false; syncReliefSegs();
+  if (blob) await reliefPicture(blob, name);
+}
+function closeRelief() { $('relief').hidden = true; }
+async function reliefPicture(blob, name) {
+  try { rl.img?.close?.(); rl.img = await createImageBitmap(blob); } catch (e) { toast(`Couldn't read ${name || 'that'} as a picture.`, 'bad'); return; }
+  rl.name = (name || 'Relief').replace(/\.[^.]+$/, ''); $('rl-name').textContent = `${rl.name} · ${rl.img.width} × ${rl.img.height} px`;
+  rl.tAuto = true; reliefField(); $('rl-make').disabled = $('rl-place').disabled = false;
+}
+/** Read the picture into the ink field at the chosen detail, then preview. */
+function reliefField() {
+  if (!rl.img) return;
+  const D = +$('rl-detail').value, sc = Math.min(1, D / Math.max(rl.img.width, rl.img.height)) || 1;
+  const w = Math.max(8, Math.round(rl.img.width * sc)), h = Math.max(8, Math.round(rl.img.height * sc));
+  const cv = new OffscreenCanvas(w, h), cx = cv.getContext('2d'); cx.drawImage(rl.img, 0, 0, w, h);
+  const { field, raise } = inkField(cx.getImageData(0, 0, w, h).data, w, h, rl.raise);
+  rl.field = blurField(field, w, h, +$('rl-blur').value); rl.w = w; rl.h = h; rl.found = raise;
+  rl.autoT = otsu(rl.field); if (rl.tAuto) { rl.t = rl.autoT; $('rl-t').value = Math.round(rl.t * 100); }
+  reliefPreview();
+}
+function reliefPreview() {
+  const cv = $('rl-prev'), { w, h, field: f } = rl; if (!f) return;
+  const W = cv.width, H = Math.round(W * h / w); cv.height = H;
+  const cx = cv.getContext('2d'), im = cx.createImageData(w, h), mode = rl.mode, t = mode === 'image' ? -1 : rl.t;
+  for (let i = 0; i < w * h; i++) {
+    const v = f[i], inside = v >= t, g = mode === 'flat' ? (inside ? 40 : 238) : inside ? Math.round(230 - 200 * (mode === 'image' ? v : Math.min(1, (v - t) / Math.max(1e-6, 1 - t)))) : 238;
+    im.data[4 * i] = g; im.data[4 * i + 1] = g; im.data[4 * i + 2] = g + (inside ? 0 : 4); im.data[4 * i + 3] = 255;
+  }
+  const tmp = new OffscreenCanvas(w, h); tmp.getContext('2d').putImageData(im, 0, 0);
+  cx.imageSmoothingEnabled = true; cx.clearRect(0, 0, W, H); cx.drawImage(tmp, 0, 0, W, H);
+  if (mode !== 'image') {                                             // the traced outline
+    const loops = traceOutline(f, w, h, t), k = W / w; cx.strokeStyle = '#2f8fc0'; cx.lineWidth = 1.2;
+    for (const l of loops) { cx.beginPath(); l.forEach(([x, y], i) => i ? cx.lineTo((x + 0.5) * k, (y + 0.5) * k) : cx.moveTo((x + 0.5) * k, (y + 0.5) * k)); cx.closePath(); cx.stroke(); }
+    $('rl-note').textContent = `${loops.length} outline${loops.length === 1 ? '' : 's'} traced${rl.raise === 'auto' ? `, ${rl.found} parts raised` : ''}. The picture is read as is: no AI.`;
+  } else $('rl-note').textContent = 'The whole picture becomes a panel, its brightness the height. The picture is read as is: no AI.';
+  const wmm = +$('rl-w').value || 30; $('rl-size').textContent = `× ${(wmm * h / w).toFixed(1)} mm`;
+}
+function syncReliefSegs() {
+  document.querySelectorAll('#rl-mode button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === rl.mode)));
+  document.querySelectorAll('#rl-raise button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === rl.raise)));
+  $('rl-t').disabled = $('rl-tauto').disabled = rl.mode === 'image';
+}
+async function makeRelief(place) {
+  if (!rl.field || rl.busy) return;
+  const p = { field: rl.field, w: rl.w, h: rl.h, t: rl.t, mode: rl.mode, width: Math.max(1, +$('rl-w').value || 30), height: Math.max(0.1, +$('rl-h').value || 1),
+    low: Math.max(0.05, +$('rl-lo').value || 0.3), bevel: Math.max(0, +$('rl-bev').value || 0), base: Math.max(0, +$('rl-base').value || 0) };
+  p.cell = Math.max(0.08, p.width / (+$('rl-detail').value * 0.5));      // fine enough to wrap and to print, no finer
+  if (p.bevel > 0 || p.mode !== 'flat') p.cell = Math.min(p.cell, Math.max(0.03, (p.bevel || p.cell * 3) / 4));   // a slope needs a few rows to look smooth
+  rl.busy = true; loading.show('Making the relief'); loading.set(0.3, 'Tracing the outline and building the solid…'); await nextFrame();
+  let r;
+  try { r = await solidJob({ relief: { ...p, field: Float32Array.from(p.field) } }); }
+  catch (e) { console.warn(e); toast(`Couldn't make the relief (${e.message || e}).`, 'bad'); return; }
+  finally { rl.busy = false; loading.hide(); }
+  if (!r.positions.length) { toast('Nothing to raise at that threshold. Move the Threshold, or switch Raised part.', 'bad'); return; }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
+  pushUndo();
+  const m = addPart(`${rl.name} relief`, g);
+  // flat on the bench, beside everything else
+  scene.updateMatrixWorld(true);
+  const others = liveParts().filter(x => x !== m), mb = worldBox(m);
+  if (others.length) { const sb = sceneBox(others); applyWorld(m, Tr(V(sb.max.x + 8 - mb.min.x, (sb.min.y + sb.max.y) / 2 - (mb.min.y + mb.max.y) / 2, -mb.min.z))); }
+  m.userData.part.relief = { flat: m.geometry, size: r.size, params: p };       // params: to lay it out again as copies, trimmed to a face
+  afterHierarchyChange(); select(m); closeRelief();
+  toast(`${m.name}: ${r.size[0].toFixed(1)} × ${r.size[1].toFixed(1)} mm, ${r.size[2].toFixed(2)} mm high.` + (place ? ' Now click where it goes on a part.' : ''), 'ok');
+  if (place) startReliefPlace(m); else frame(worldBox(m));
+}
+// ---- placing a relief on a part
+// rp: { m (the relief), target, pL / nL (the spot and its normal, in the target's frame), right (the view's right, world),
+//       seedTri (the triangle clicked), baseList (the face round it, up to its sharp edges), added / removed (faces
+//       Shift-clicked in or out), face: { list, set, kind } (the faces it goes on), regionVer,
+//       uv (each of their corners laid flat, mm, in the X0/Y0 frame from the spot: seen straight on, or unfolded round
+//       the corners), dom (the triangles laid flat), off: [x, y] (mm across that flat layout from the spot),
+//       rep ('once' | 'grid' | 'fill'), cache / cacheKey (the laid-out copies), running / again, outline, before }
+let rp = null;
+function startReliefPlace(m) {
+  endReliefPlace(false);
+  rp = { kind: 'relief', m, target: null, before: snapshot(), off: [0, 0], rep: 'once', added: [], removed: new Set(), regionVer: 0 };
+  $('rlplace').dataset.kind = 'relief'; $('rp-title').textContent = 'Place the relief';
+  $('rlplace').hidden = false; $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = true; rpStatus('');
+  $('rp-note').textContent = `Click where ${m.name} goes on a part. It lies on the surface there, facing out.`;
+  $('rp-spin').value = $('rp-spin-n').value = 0; $('rp-size').value = 100; $('rp-trim').checked = false;
+  setRpOff(0, 0); syncRpRows();
+}
+function endReliefPlace(keep = true) {
+  $('rp-bake').hidden = true; $('rp-btns').hidden = false;
+  if (!rp) return;
+  rpOutline(true);
+  if (!keep && rp.target) { restore(rp.before); afterHierarchyChange(); }
+  rp = null; $('rlplace').hidden = true;
+}
+function rpStatus(t) { $('rp-status').textContent = t; $('rp-status').hidden = !t; }
+function setRpOff(x, y) {
+  if (rp) rp.off = [x, y];
+  const r = v => Math.round(v * 100) / 100;
+  for (const [id, v] of [['rp-x', x], ['rp-y', y]]) {
+    const el = $(id); if (v < +el.min) el.min = Math.floor(v); if (v > +el.max) el.max = Math.ceil(v);
+    el.value = v; $(id + '-n').value = r(v);
+  }
+}
+function syncRpRows() {
+  const rep = rp?.rep || 'once', trim = $('rp-trim').checked, corners = $('rp-corners').checked;
+  document.querySelectorAll('#rp-rep button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === rep)));
+  document.querySelectorAll('#rlplace .rp-isgrid').forEach(e => { e.hidden = rep !== 'grid'; });
+  document.querySelectorAll('#rlplace .rp-many').forEach(e => { e.hidden = rep === 'once'; });
+  document.querySelectorAll('#rlplace .rp-trimmed').forEach(e => { e.hidden = !trim; });
+  document.querySelectorAll('#rlplace .rp-cornered').forEach(e => { e.hidden = !corners; });
+  const noFace = !!rp?.target && !rp.face;
+  $('rp-trim').disabled = $('rp-centre').disabled = $('rp-square').disabled = noFace;
+  document.querySelector('#rp-rep [data-v="fill"]').disabled = noFace;
+  $('rp-wrap').disabled = corners;                                     // round corners it always follows the surface
+}
+/** The frame the relief sits in: the spot P and normal N; X0/Y0 across the surface (X0 the view's right); C its
+ *  centre (moved along the face); X/Y its own sideways and up (turned). World space. */
+function rpFrame() {
+  const t = rp.target; t.updateMatrixWorld(true);
+  const P = rp.pL.clone().applyMatrix4(t.matrixWorld), N = rp.nL.clone().transformDirection(t.matrixWorld).normalize();
+  let X0 = rp.right.clone().projectOnPlane(N); if (X0.lengthSq() < 1e-6) X0 = (Math.abs(N.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).cross(N); X0.normalize();
+  const Y0 = N.clone().cross(X0).normalize();
+  const C = P.clone().addScaledVector(X0, rp.off[0]).addScaledVector(Y0, rp.off[1]);
+  const X = X0.clone().applyAxisAngle(N, (+$('rp-spin').value || 0) * Math.PI / 180), Y = N.clone().cross(X).normalize();
+  return { P, N, X0, Y0, C, X, Y };
+}
+/** Work out which faces it goes on (the face round the spot, or on round the corners), then lay them flat. */
+function rpRegion() {
+  const t = rp.target, topo = topoOf(t), { fn, fa, eps } = topo;
+  let base = rp.baseList || [];
+  if ($('rp-corners').checked) {
+    // on across creases while the surface stays within the angle of the face you clicked
+    const s = rp.seedTri, cos = Math.cos(Math.min(175, Math.max(5, +$('rp-turn').value || 60)) * Math.PI / 180), n0 = [fn[3 * s], fn[3 * s + 1], fn[3 * s + 2]];
+    base = growRegion(topo, s, (a, n) => fa[n] < eps || fn[3 * n] * n0[0] + fn[3 * n + 1] * n0[1] + fn[3 * n + 2] * n0[2] > cos).list;
+  }
+  const set = new Set(base); for (const l of rp.added) l.forEach(x => set.add(x)); for (const x of rp.removed) set.delete(x);
+  const list = [...set];
+  rp.face = list.length ? { list, set, kind: faceAxes(t, list)?.kind || 'round' } : null;
+  rp.regionVer++; rp.cacheKey = null;
+  rpLayFlat(); rpOutline();
+  if (rp.face) {                                                     // the sliders reach across the faces
+    const { box } = faceTris2D();
+    $('rp-x').min = Math.floor(box[0] - 1); $('rp-x').max = Math.ceil(box[1] + 1); $('rp-y').min = Math.floor(box[2] - 1); $('rp-y').max = Math.ceil(box[3] + 1);
+  } else { $('rp-x').min = $('rp-y').min = -20; $('rp-x').max = $('rp-y').max = 20; }
+  setRpOff(...rp.off);
+}
+/**
+ * Lay the faces flat, in mm in the X0/Y0 frame from the spot. Straight on (each corner seen along the normal) for
+ * one face; round corners, unfolded instead: out from the clicked triangle, each next triangle hinged flat across
+ * the edge it shares with one already laid, keeping its edge lengths. A bent plate (or a tube) comes out exactly
+ * flat; a doubly curved one, near enough over the part a relief covers.
+ */
+function rpLayFlat() {
+  rp.uv = null; rp.dom = null; rp.grid = null; rp.groups = null; rp.uvFill = null; rp.domFill = null; if (!rp.face) return;
+  const t = rp.target, topo = topoOf(t), { idx, pos, nb } = topo, M = t.matrixWorld, set = rp.face.set;
+  const { P, X0, Y0 } = rpFrame(), Wc = [], W = k => (Wc[k] ||= V(pos[3 * k], pos[3 * k + 1], pos[3 * k + 2]).applyMatrix4(M));
+  const uv = new Map(), flat = k => { const q = W(k).clone().sub(P); return [q.dot(X0), q.dot(Y0)]; };
+  rp.unfoldFailed = false;
+  if (!$('rp-corners').checked) {
+    for (const tri of rp.face.list) for (let e = 0; e < 3; e++) { const k = idx[3 * tri + e]; if (!uv.has(k)) uv.set(k, flat(k)); }
+    rp.uv = uv; rp.dom = rp.face.list; rp.unfolded = false; return;
+  }
+  // what can unfold: everywhere the surface lies flat round each corner (its angles add up to a full turn, as on a
+  // plate, a fold or a tube). Round a rivet or a bump they don't; those spots are left out of the unfolding and the
+  // relief is draped over them instead.
+  const angSum = new Map(), edgeOf = new Set();
+  for (const tri of rp.face.list) {
+    const ks = [0, 1, 2].map(e => idx[3 * tri + e]);
+    for (let e = 0; e < 3; e++) {
+      const k = ks[e], p0 = W(k), ang = W(ks[(e + 1) % 3]).clone().sub(p0).angleTo(W(ks[(e + 2) % 3]).clone().sub(p0));
+      if (isFinite(ang)) angSum.set(k, (angSum.get(k) || 0) + ang);
+      if (!set.has(nb[3 * tri + e])) { edgeOf.add(ks[e]); edgeOf.add(ks[(e + 1) % 3]); }
+    }
+  }
+  const bump = k => !edgeOf.has(k) && Math.abs(2 * Math.PI - (angSum.get(k) || 0)) > 10 * Math.PI / 180;
+  const goodList = rp.face.list.filter(tri => ![0, 1, 2].some(e => bump(idx[3 * tri + e])));
+  const good = new Set(goodList);
+  // the first triangle as it is seen straight on; it's the one you clicked, or failing that the nearest
+  let seed = rp.seedTri;
+  if (!good.size) { rp.unfoldFailed = true; for (const tri of rp.face.list) for (let e = 0; e < 3; e++) { const k = idx[3 * tri + e]; if (!uv.has(k)) uv.set(k, flat(k)); } rp.uv = uv; rp.dom = rp.face.list; rp.unfolded = false; return; }
+  if (!good.has(seed)) { let bd = Infinity; for (const tri of goodList) { const d = V(topo.fc[3 * tri], topo.fc[3 * tri + 1], topo.fc[3 * tri + 2]).applyMatrix4(M).distanceTo(P); if (d < bd) { bd = d; seed = tri; } } }
+  for (let e = 0; e < 3; e++) { const k = idx[3 * seed + e]; uv.set(k, flat(k)); }
+  const orient = tri => { const [a, b, c] = [0, 1, 2].map(e => uv.get(idx[3 * tri + e])); return (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]); };
+  const sign = Math.sign(orient(seed)) || 1;
+  // the third corner of tri, from its other two already laid flat: same shape, the same way round as the first
+  const place = tri => {
+    const ks = [0, 1, 2].map(e => idx[3 * tri + e]), have = ks.map(k => uv.has(k)), nh = have.filter(Boolean).length;
+    if (nh === 3) return true; if (nh < 2) return false;
+    const ci = have.indexOf(false), ai = (ci + 1) % 3, bi = (ci + 2) % 3, a = W(ks[ai]), b = W(ks[bi]), c = W(ks[ci]);
+    const ab = b.clone().sub(a), L = ab.length(); if (L < 1e-9) return false;
+    const s = c.clone().sub(a).dot(ab) / (L * L), h = c.clone().sub(a).addScaledVector(ab, -s).length();
+    // true lengths from a (no rescaling to the laid edge: on a doubly curved patch that would snowball)
+    const a2 = uv.get(ks[ai]), b2 = uv.get(ks[bi]), dx = b2[0] - a2[0], dy = b2[1] - a2[1], L2 = Math.hypot(dx, dy); if (L2 < 1e-12) return false;
+    const ex = dx / L2, ey = dy / L2, fx = a2[0] + s * L * ex, fy = a2[1] + s * L * ey;
+    uv.set(ks[ci], [fx - ey * h, fy + ex * h]);
+    if (Math.sign(orient(tri)) !== sign) uv.set(ks[ci], [fx + ey * h, fy - ex * h]);
+    return true;
+  };
+  const done = new Set([seed]), dom = [seed], queue = [seed];
+  for (let qi = 0; qi < queue.length; qi++) {
+    const tr = queue[qi];
+    for (let e = 0; e < 3; e++) { const n = nb[3 * tr + e]; if (n < 0 || !good.has(n) || done.has(n)) continue; if (place(n)) { done.add(n); dom.push(n); queue.push(n); } }
+  }
+  // triangles reached only through a corner (a T-junction): any with two corners laid by now
+  for (let more = true, guard = 0; more && guard < 20; guard++) {
+    more = false; for (const tri of goodList) if (!done.has(tri) && place(tri)) { done.add(tri); dom.push(tri); more = true; }
+  }
+  // where the unfolding came round both sides of something and met itself (a seam), the triangles that closed it up
+  // are stretched or turned over: leave those out, as if they were bumps, rather than fold the relief there
+  {
+    const ok = tr => {
+      const ks = [0, 1, 2].map(e => idx[3 * tr + e]), q = ks.map(k => uv.get(k));
+      if (Math.sign(orient(tr)) !== sign) return false;
+      for (let e = 0; e < 3; e++) { const a = ks[e], b = ks[(e + 1) % 3], L3 = W(a).distanceTo(W(b)), L2 = Math.hypot(q[(e + 1) % 3][0] - q[e][0], q[(e + 1) % 3][1] - q[e][1]);
+        if (L3 > 1e-9 && Math.abs(L2 / L3 - 1) > 0.25) return false; }
+      return true;
+    };
+    for (let i = dom.length - 1; i > 0; i--) if (!ok(dom[i])) { done.delete(dom[i]); dom.splice(i, 1); }
+    // corners only the left-out triangles used are no longer laid
+    const used = new Set(); for (const tr of dom) for (let e = 0; e < 3; e++) used.add(idx[3 * tr + e]);
+    for (const k of [...uv.keys()]) if (!used.has(k)) uv.delete(k);
+  }
+  // a patch that won't lie flat (a dome) comes out stretched; a little (round a rivet) is fine, a lot isn't: then it's
+  // seen straight on instead
+  {
+    let bx = [Infinity, -Infinity, Infinity, -Infinity], b3 = new THREE.Box3(); for (const [u, v] of uv.values()) bx = [Math.min(bx[0], u), Math.max(bx[1], u), Math.min(bx[2], v), Math.max(bx[3], v)];
+    for (const k of uv.keys()) b3.expandByPoint(W(k));
+    let area3 = 0, area2 = 0; for (const tr of dom) { area3 += topo.fa[tr]; const [a, b, c] = [0, 1, 2].map(e => uv.get(idx[3 * tr + e])); area2 += Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2; }
+    const S3 = new THREE.Vector3().setFromMatrixScale(M), sc2 = Math.abs(S3.x * S3.y);   // topo areas are in the part's own units
+    const diag = b3.getSize(V()).length(); rp.unfoldStats = { bx, diag, area2, area3: area3 * sc2, n: dom.length, of: rp.face.list.length };
+    if (Math.max(bx[1] - bx[0], bx[3] - bx[2]) > 2.5 * diag || area2 > 2 * area3 * sc2) {
+      rp.unfoldFailed = true; uv.clear();
+      for (const tri of rp.face.list) for (let e = 0; e < 3; e++) { const k = idx[3 * tri + e]; if (!uv.has(k)) uv.set(k, flat(k)); }
+      rp.uv = uv; rp.dom = rp.face.list; rp.unfolded = false; return;
+    }
+  }
+  rp.unfoldFailed = false;
+  rp.uv = uv; rp.dom = dom; rp.unfolded = true;
+  // the faces left out (bumps) laid in roughly, each loose corner the average of its neighbours, only so the outline
+  // used for trimming runs round them rather than leaving a hole there (a real hole in the part stays a hole)
+  {
+    const holes = rp.face.list.filter(tr => !done.has(tr)), fill = new Map(uv), nbr = new Map();
+    for (const tr of holes) { const ks = [0, 1, 2].map(e => idx[3 * tr + e]); for (const k of ks) { if (!nbr.has(k)) nbr.set(k, new Set()); ks.forEach(q => q !== k && nbr.get(k).add(q)); } }
+    const loose = [...nbr.keys()].filter(k => !uv.has(k));
+    for (let it = 0; it < 60; it++) {
+      for (const k of loose) {
+        let su = 0, sv = 0, n = 0; for (const q of nbr.get(k)) { const f = fill.get(q); if (f) { su += f[0]; sv += f[1]; n++; } }
+        if (n) fill.set(k, [su / n, sv / n]);
+      }
+    }
+    // only bumps ringed all round by unfolded faces, and only if laying them in didn't turn any triangle over: one at
+    // the edge of the faces (or a tangle) is left out, and the relief stops there
+    const hset = new Set(holes), comp = new Map(), keep = [];
+    for (const h0 of holes) {
+      if (comp.has(h0)) continue;
+      const list = [h0], st = [h0]; comp.set(h0, h0); let ok = true;
+      while (st.length) { const tr = st.pop();
+        for (let e = 0; e < 3; e++) { const n = nb[3 * tr + e];
+          if (hset.has(n)) { if (!comp.has(n)) { comp.set(n, h0); list.push(n); st.push(n); } }
+          else if (!done.has(n)) ok = false; } }
+      if (ok) for (const tr of list) {
+        const q = [0, 1, 2].map(e => fill.get(idx[3 * tr + e])); if (q.some(x => !x)) { ok = false; break; }
+        const o = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]); if (Math.sign(o) !== sign || Math.abs(o) < 1e-12) { ok = false; break; }
+      }
+      if (ok) for (const tr of list) keep.push(tr);
+    }
+    rp.uvFill = fill; rp.domFill = dom.concat(keep);
+  }
+  // the flat facets (triangles within a degree or two of each other, edge to edge): the relief is cut along their
+  // creases so each piece lies flat on one. A finely curved surface has too many: then it's a fine mesh instead
+  const fn = topo.fn, cosG = Math.cos(2 * Math.PI / 180), gid = new Map(), groups = [];
+  for (const s0 of dom) {
+    if (gid.has(s0) || topo.fa[s0] < topo.eps) continue;
+    const g = groups.length, n0 = [fn[3 * s0], fn[3 * s0 + 1], fn[3 * s0 + 2]], list = [], stack = [s0]; gid.set(s0, g);
+    while (stack.length) { const tr = stack.pop(); list.push(tr);
+      for (let e = 0; e < 3; e++) { const n = nb[3 * tr + e]; if (n < 0 || !done.has(n) || gid.has(n) || topo.fa[n] < topo.eps) continue;
+        if (fn[3 * n] * n0[0] + fn[3 * n + 1] * n0[1] + fn[3 * n + 2] * n0[2] > cosG) { gid.set(n, g); stack.push(n); } } }
+    groups.push(list);
+  }
+  rp.groups = groups.length <= 60 ? groups : null;
+  // a grid over the flat layout (the bumps laid in too), to find which triangle a flat spot is on
+  const uvF = rp.uvFill, domF = rp.domFill;
+  let box = [Infinity, -Infinity, Infinity, -Infinity]; for (const [u, v] of uvF.values()) { box = [Math.min(box[0], u), Math.max(box[1], u), Math.min(box[2], v), Math.max(box[3], v)]; }
+  const cs = Math.max(1e-3, Math.sqrt((box[1] - box[0]) * (box[3] - box[2]) / Math.max(1, domF.length)) * 1.5), cells = new Map();
+  for (const tri of domF) {
+    const q = [0, 1, 2].map(e => uvF.get(idx[3 * tri + e]));
+    const i0 = Math.floor((Math.min(q[0][0], q[1][0], q[2][0]) - box[0]) / cs), i1 = Math.floor((Math.max(q[0][0], q[1][0], q[2][0]) - box[0]) / cs);
+    const j0 = Math.floor((Math.min(q[0][1], q[1][1], q[2][1]) - box[2]) / cs), j1 = Math.floor((Math.max(q[0][1], q[1][1], q[2][1]) - box[2]) / cs);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) { const key = i * 100003 + j; const c = cells.get(key); if (c) c.push(tri); else cells.set(key, [tri]); }
+  }
+  const s0 = V(topo.fn[3 * seed], topo.fn[3 * seed + 1], topo.fn[3 * seed + 2]).transformDirection(M), N = rp.nL.clone().transformDirection(M);
+  const flip = s0.dot(N) < 0 ? -1 : 1;
+  // over a bump the relief follows its shape, but stands off the way the faces round it face (so it can't fold
+  // into itself on a steep side): each bump triangle takes the normal of the nearest unfolded face
+  const holeN = new Map(), domSet = new Set(dom), vN = new Map(), fnW = x => V(topo.fn[3 * x], topo.fn[3 * x + 1], topo.fn[3 * x + 2]).transformDirection(M).normalize().multiplyScalar(flip);
+  for (const tr of dom) for (let e = 0; e < 3; e++) { const k = idx[3 * tr + e]; if (!vN.has(k)) vN.set(k, fnW(tr)); }
+  let todo = domF.filter(tr => !domSet.has(tr));
+  for (let pass = 0; pass < 200 && todo.length; pass++) {
+    const next = [];
+    for (const tr of todo) { const ks = [0, 1, 2].map(e => idx[3 * tr + e]), k = ks.find(q => vN.has(q)); if (k === undefined) { next.push(tr); continue; } holeN.set(tr, vN.get(k)); }
+    for (const tr of todo) if (holeN.has(tr)) for (let e = 0; e < 3; e++) { const k = idx[3 * tr + e]; if (!vN.has(k)) vN.set(k, holeN.get(tr)); }
+    if (next.length === todo.length) break; todo = next;
+  }
+  // and on a fine mesh, each corner's normal the average of the faces round it (angle-weighted), so the relief's top
+  // follows a smooth offset of the surface and can't fold through itself where it turns (in a concave crease)
+  const cornerN = new Map();
+  for (const tr of dom) {
+    const ks = [0, 1, 2].map(e => idx[3 * tr + e]), n = fnW(tr);
+    for (let e = 0; e < 3; e++) { const p0 = W(ks[e]), ang = W(ks[(e + 1) % 3]).clone().sub(p0).angleTo(W(ks[(e + 2) % 3]).clone().sub(p0));
+      if (!isFinite(ang)) continue; const c = cornerN.get(ks[e]) || V(); c.addScaledVector(n, ang); cornerN.set(ks[e], c); }
+  }
+  for (const c of cornerN.values()) c.normalize();
+  for (const [k, n] of vN) if (!cornerN.has(k)) cornerN.set(k, n);
+  rp.grid = { box, cs, cells, W, flip, holeN, domSet, cornerN };
+}
+/** A flat spot (u, v) back on the surface: the point, and the face's normal there (world). out: off the faces laid flat. */
+function rpUnflatten(u, v) {
+  const { box, cs, cells, W, flip, holeN, domSet, cornerN } = rp.grid, topo = topoOf(rp.target), idx = topo.idx, uv = rp.uvFill;
+  const bary = tri => {
+    const [a, b, c] = [0, 1, 2].map(e => uv.get(idx[3 * tri + e])), d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+    if (Math.abs(d) < 1e-14) return null;
+    const l0 = ((b[1] - c[1]) * (u - c[0]) + (c[0] - b[0]) * (v - c[1])) / d, l1 = ((c[1] - a[1]) * (u - c[0]) + (a[0] - c[0]) * (v - c[1])) / d;
+    return [l0, l1, 1 - l0 - l1];
+  };
+  const i = Math.floor((u - box[0]) / cs), j = Math.floor((v - box[2]) / cs);
+  let best = null, bo = Infinity;
+  for (let r = 0; r <= 3 && (!best || bo > 0); r++) {
+    for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) {
+      if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+      for (const tri of cells.get((i + di) * 100003 + (j + dj)) || []) {
+        const l = bary(tri); if (!l) continue;
+        const o = -Math.min(0, l[0]) - Math.min(0, l[1]) - Math.min(0, l[2]);       // how far outside it (0: inside)
+        if (o < bo) { bo = o; best = [tri, l]; }
+      }
+    }
+    if (best && bo <= 1e-9) break;
+  }
+  if (!best) return null;
+  // how far outside the best triangle, in mm (0 inside)
+  let outMM = 0;
+  if (bo > 0) { const [a, b2, c] = [0, 1, 2].map(e => uv.get(idx[3 * best[0] + e])); outMM = bo * Math.sqrt(Math.abs((b2[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b2[1] - a[1]))); }
+  const [tri, l] = best, p = V(), M = rp.target.matrixWorld, fnW = x => V(topo.fn[3 * x], topo.fn[3 * x + 1], topo.fn[3 * x + 2]).transformDirection(M).normalize().multiplyScalar(flip);
+  for (let e = 0; e < 3; e++) p.addScaledVector(W(idx[3 * tri + e]), l[e]);           // past the edge: the face carried on flat
+  if (!rp.groups) {                                                 // a fine mesh: the smooth normal, so it stands its height off the face
+    const n = V(); for (let e = 0; e < 3; e++) { const c = cornerN.get(idx[3 * tri + e]); if (c) n.addScaledVector(c, Math.min(1, Math.max(0, l[e]))); }
+    const f = domSet.has(tri) ? fnW(tri) : (holeN.get(tri) || fnW(tri)); if (n.lengthSq() < 1e-12) n.copy(f); n.normalize();
+    return { p, n: n.multiplyScalar(1 / Math.max(0.35, n.dot(f))), out: outMM > 0.005 };
+  }
+  if (!domSet.has(tri)) {                                            // on a bump
+    const n = holeN.get(tri) || fnW(tri);
+    if (outMM > 0.005) { const pl = n.dot(p); return { p: p.clone(), n, out: true, pl }; }
+    return { p, n, out: false };
+  }
+  const n1 = fnW(tri);
+  if (outMM > 0.005) return { p, n: n1, out: true };                 // past the edge: carried on flat
+  // on a crease (or a corner): mitred, so the relief stands its full height off each face it touches
+  if (bo <= 1e-6) {
+    const ns = [];
+    for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++) for (const t2 of cells.get((i + di) * 100003 + (j + dj)) || []) {
+      if (t2 === tri || !domSet.has(t2)) continue; const l2 = bary(t2); if (!l2 || Math.min(...l2) < -1e-5) continue;
+      const n2 = fnW(t2); if (n2.dot(n1) < 0.9998 && !ns.some(q => q.dot(n2) > 0.9998)) ns.push(n2);
+    }
+    if (ns.length) {
+      const m = n1.clone(); ns.forEach(q => m.add(q)); m.normalize();
+      const c = Math.min(m.dot(n1), ...ns.map(q => m.dot(q)));
+      return { p, n: m.multiplyScalar(1 / Math.max(0.35, c)), out: false };
+    }
+  }
+  return { p, n: n1, out: false };
+}
+/** Where a point on the target sits in the flat layout ([u, v]), or null if it isn't on the faces laid flat. */
+function rpFlatOf(worldPoint) {
+  const t = rp.target, local = worldPoint.clone().applyMatrix4(t.matrixWorld.clone().invert());
+  const h = t.geometry.boundsTree.closestPointToPoint(local); if (!h || !rp.face?.set.has(h.faceIndex)) return null;
+  const topo = topoOf(t), idx = topo.idx, ks = [0, 1, 2].map(e => idx[3 * h.faceIndex + e]); if (!ks.every(k => rp.uv.has(k))) return null;
+  const Pk = k => V(topo.pos[3 * k], topo.pos[3 * k + 1], topo.pos[3 * k + 2]);
+  const l = new THREE.Triangle(Pk(ks[0]), Pk(ks[1]), Pk(ks[2])).getBarycoord(h.point, V());
+  return [0, 1].map(c => ks.reduce((s, k, e) => s + rp.uv.get(k)[c] * l.getComponent(e), 0));
+}
+/** The faces laid flat, in the relief's own frame (its centre and turn): their triangles in 2D, and their extent. */
+function faceTris2D(off = [0, 0], deg = 0, list = rp.dom, uv = rp.uv) {
+  const t = rp.target, idx = topoOf(t).idx, a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+  const tris = new Float32Array(list.length * 6), box = [Infinity, -Infinity, Infinity, -Infinity]; let o = 0;
+  for (const tri of list) for (let e = 0; e < 3; e++) {
+    const [p, q] = uv.get(idx[3 * tri + e]), dx = p - off[0], dy = q - off[1], u = dx * c + dy * s, w = -dx * s + dy * c;
+    tris[o++] = u; tris[o++] = w;
+    if (u < box[0]) box[0] = u; if (u > box[1]) box[1] = u; if (w < box[2]) box[2] = w; if (w > box[3]) box[3] = w;
+  }
+  return { tris, box };
+}
+/** The edge of the faces it goes on, drawn on the part while placing. */
+function rpOutline(clear = false) {
+  if (rp?.outline) { rp.outline.parent?.remove(rp.outline); rp.outline.geometry.dispose(); rp.outline.material.dispose(); rp.outline = null; }
+  if (clear || !rp?.face) return;
+  const topo = topoOf(rp.target), { idx, pos, nb } = topo, set = rp.face.set, seg = [];
+  for (const tri of rp.face.list) for (let e = 0; e < 3; e++) {
+    if (set.has(nb[3 * tri + e])) continue;
+    const i = idx[3 * tri + e], j = idx[3 * tri + (e + 1) % 3]; seg.push(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2], pos[3 * j], pos[3 * j + 1], pos[3 * j + 2]);
+  }
+  if (!seg.length) return;
+  const lg = new LineSegmentsGeometry().setPositions(new Float32Array(seg));
+  const mat = new LineMaterial({ color: '#3aa6e0', linewidth: 2, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false });
+  const line = new LineSegments2(lg, mat); line.renderOrder = 998; line.onBeforeRender = r => { r.getSize(mat.resolution); };
+  rp.target.add(line); rp.outline = line;
+}
+function reliefPlaceClick(hit, shift = false) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  // Shift: take a face in, or out (it's on another part: no)
+  if (shift && rp.target) {
+    if (hit.object !== rp.target && !rp.copies?.includes(hit.object)) { toast(`Shift-click faces on ${rp.target.name}, the part it's going on.`); return; }
+    const res = pickSurface(topoOf(rp.target), rp.target.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+    const l = res.err || !res.region?.length ? [hit.faceIndex] : res.region;
+    { const lp = hit.point.clone().applyMatrix4(rp.target.matrixWorld.clone().invert()).toArray(); (rp.face?.set.has(hit.faceIndex) ? (rp.remPts ||= []) : (rp.addPts ||= [])).push(lp); }
+    if (rp.face?.set.has(hit.faceIndex)) { l.forEach(x => rp.removed.add(x)); rp.added = rp.added.map(a => a.filter(x => !rp.removed.has(x))); toast('Took that face out.'); }
+    else { l.forEach(x => rp.removed.delete(x)); rp.added.push(l); toast('Added that face.'); }
+    rpRegion(); syncRpRows(); reliefReplace(); return;
+  }
+  // on the relief, or elsewhere on the same faces: slide it there
+  if (rp.kind === 'scatter' && rp.target && (rp.copies.includes(hit.object) || (hit.object === rp.target && rp.face?.set.has(hit.faceIndex)))) {
+    toast('Shift-click faces to add them or take them out; Shuffle for a new pattern; click another face or part to start over there.'); return;
+  }
+  if (rp.target && (hit.object === rp.m || (hit.object === rp.target && rp.face?.set.has(hit.faceIndex)))) {
+    const f = rp.face ? rpFlatOf(hit.point) : null;
+    if (f) setRpOff(f[0], f[1]); else { const { P, X0, Y0 } = rpFrame(), d = hit.point.clone().sub(P); setRpOff(d.dot(X0), d.dot(Y0)); }
+    reliefReplace(); return;
+  }
+  if (rpOwns(hit.object)) { toast(rp.kind === 'scatter' ? "Click a face on another part: not one you're scattering." : 'Click a spot on another part.'); return; }
+  const t = hit.object; t.updateMatrixWorld(true);
+  const inv = t.matrixWorld.clone().invert(), n = hitNormal(hit);
+  if (n.dot(camera.position.clone().sub(hit.point)) < 0) n.negate();          // facing the way you're looking from
+  rpOutline(true);
+  rp.target = t; rp.pL = hit.point.clone().applyMatrix4(inv); rp.nL = n.clone().transformDirection(inv); rp.seedTri = hit.faceIndex;
+  rp.right = V(1, 0, 0).applyQuaternion(camera.quaternion); rp.added = []; rp.removed = new Set(); rp.addPts = []; rp.remPts = [];
+  // the face round the spot, up to its sharp edges: what Centre, Square, Fill and Trim go by
+  const res = pickSurface(topoOf(t), t.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+  rp.baseList = res.err || !res.region?.length ? null : res.region;
+  rp.off = [0, 0]; rpRegion();
+  if (!rp.face && (rp.rep === 'fill' || $('rp-trim').checked)) { rp.rep = rp.rep === 'fill' ? 'once' : rp.rep; $('rp-trim').checked = false; }
+  $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = false; syncRpRows();
+  $('rp-note').textContent = rp.kind === 'scatter' ? `On ${t.name}, over the faces outlined in blue. Shift-click faces to add or take them out; Shuffle for a new pattern; then Done.`
+    : `On ${t.name}. Click elsewhere on ${rp.face ? 'the outlined faces' : 'it'} to slide it there, Shift-click faces to add or take them out; turn, size, repeat or wrap it, then Done.`;
+  reliefReplace();
+}
+function rpCentre() {
+  if (!rp?.target || !rp.face) return;
+  const { box } = faceTris2D(); setRpOff((box[0] + box[1]) / 2, (box[2] + box[3]) / 2); reliefReplace();
+}
+function rpSquare() {
+  if (!rp?.target || !rp.face) return;
+  const cur = +$('rp-spin').value || 0;
+  // the way the outline of the faces runs, laid flat: its edges' directions folded onto a quarter turn, weighted by length
+  const t = rp.target, topo = topoOf(t), { idx, nb } = topo, set = rp.face.set, uv = rp.uv;
+  let sc = 0, ss = 0;
+  for (const tri of rp.dom) for (let e = 0; e < 3; e++) {
+    if (set.has(nb[3 * tri + e])) continue;
+    const p = uv.get(idx[3 * tri + e]), q = uv.get(idx[3 * tri + (e + 1) % 3]); if (!p || !q) continue;
+    const u = q[0] - p[0], w = q[1] - p[1], L = Math.hypot(u, w); if (!L) continue;
+    const th = Math.atan2(w, u); sc += L * Math.cos(4 * th); ss += L * Math.sin(4 * th);
+  }
+  let a;
+  if (Math.hypot(sc, ss) > 1e-6) a = Math.atan2(ss, sc) / 4 * 180 / Math.PI;
+  else { const ax = faceAxes(t, rp.face.list); if (!ax) return; const { X0, Y0 } = rpFrame(); a = Math.atan2(ax.along.dot(Y0), ax.along.dot(X0)) * 180 / Math.PI; }
+  // whichever square turn (along or across, either way round) is nearest how it sits now
+  let best = 0, bd = Infinity;
+  for (let q = -4; q <= 4; q++) { let v = a + q * 90; v = ((v + 540) % 360) - 180; const d = Math.abs(((v - cur + 540) % 360) - 180); if (d < bd) { bd = d; best = v; } }
+  best = Math.round(best * 10) / 10; $('rp-spin').value = $('rp-spin-n').value = best; reliefReplace();
+}
+/** Re-lay the relief after a change; one layout at a time, the latest settings winning. */
+function reliefReplace() {
+  if (!rp?.target) return;
+  const me = rp; if (me.running) { me.again = true; return; }
+  me.running = true; $('rp-done').disabled = true;
+  (me.kind === 'scatter' ? applyScatter() : applyReliefPlace()).catch(e => { console.warn(e); toast(`Couldn't lay it out (${e.message || e}).`, 'bad'); })
+    .finally(() => { me.running = false; if (rp !== me) return; $('rp-done').disabled = false; if (me.again) { me.again = false; reliefReplace(); } });
+}
+
+// ---- popups you can move and resize
+/*
+ * Every popup card and dialog can be dragged by its title bar and resized from its bottom-right corner. Where you
+ * leave one (and its size) is remembered, per popup, for next time it opens; double-click the title bar to put it
+ * back where it was. Popups are kept on screen when the window gets smaller.
+ */
+const FLOATS = ['ooze', 'relief', 'dmg', 'burst', 'rlplace', 'dirpick', 'marr', 'orient', 'autorig', 'fitcheck', 'dlg-export', 'dlg-prefs', 'dlg-projects'];
+function floatFrame(el) {
+  const fixed = getComputedStyle(el).position === 'fixed', par = fixed ? null : el.offsetParent;
+  return par ? par.getBoundingClientRect() : { left: 0, top: 0, width: innerWidth, height: innerHeight };
+}
+function floatPin(el) {                                          // from wherever CSS put it to plain left/top, so it can move
+  const r = el.getBoundingClientRect(), f = floatFrame(el);
+  Object.assign(el.style, { left: `${r.left - f.left}px`, top: `${r.top - f.top}px`, right: 'auto', bottom: 'auto', transform: 'none', margin: '0' });
+}
+function floatClamp(el) {
+  if (el.hidden || !el.style.left) return;
+  const f = floatFrame(el), r = el.getBoundingClientRect();
+  if (el.style.height && r.height > f.height - 8) el.style.height = `${Math.max(120, f.height - 8)}px`;
+  if (el.style.width && r.width > f.width - 8) el.style.width = `${Math.max(220, f.width - 8)}px`;
+  const w = el.getBoundingClientRect().width, x = parseFloat(el.style.left) || 0, y = parseFloat(el.style.top) || 0;
+  el.style.left = `${Math.min(Math.max(x, 60 - w), f.width - 60)}px`; el.style.top = `${Math.min(Math.max(y, 0), f.height - 36)}px`;
+  // no taller than the room below it (it scrolls inside instead), so its corner stays where you can grab it
+  const room = f.height - (parseFloat(el.style.top) || 0) - 8;
+  if (el.style.height) { if (parseFloat(el.style.height) > room) el.style.height = `${Math.max(120, room)}px`; }
+  else el.style.maxHeight = `${Math.max(120, room)}px`;
+}
+function floatSave(el) {
+  try { localStorage.setItem('kitbash-pop-' + el.id, JSON.stringify({ left: el.style.left, top: el.style.top, width: el.style.width, height: el.style.height })); } catch (e) {}
+}
+function floatRestore(el) {
+  let s = null; try { s = JSON.parse(localStorage.getItem('kitbash-pop-' + el.id) || 'null'); } catch (e) {}
+  if (!s) return;
+  if (s.left) Object.assign(el.style, { left: s.left, top: s.top, right: 'auto', bottom: 'auto', transform: 'none', margin: '0' });
+  if (s.width) Object.assign(el.style, { width: s.width, maxWidth: 'none' });
+  if (s.height) Object.assign(el.style, { height: s.height, maxHeight: 'none' });
+  floatClamp(el);
+}
+function floatReset(el) {
+  for (const k of ['left', 'top', 'right', 'bottom', 'transform', 'margin', 'width', 'height', 'maxWidth', 'maxHeight']) el.style[k] = '';
+  try { localStorage.removeItem('kitbash-pop-' + el.id); } catch (e) {}
+}
+function floatFront(el) { document.querySelectorAll('.float-front').forEach(x => x !== el && x.classList.remove('float-front')); el.classList.add('float-front'); }
+function bindFloating() {
+  for (const id of FLOATS) {
+    const el = document.getElementById(id); if (!el) continue;
+    const handle = el.querySelector(':scope > header') || el.querySelector(':scope > b'); if (!handle) continue;
+    el.classList.add('floating'); handle.classList.add('float-handle'); handle.title ||= 'Drag to move it; double-click to put it back';
+    el.addEventListener('pointerdown', () => floatFront(el), true);
+    // move: drag the title bar (not its buttons)
+    handle.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.target.closest('button, input, select, a, label')) return;
+      e.preventDefault(); floatPin(el);
+      const x0 = e.clientX, y0 = e.clientY, l0 = parseFloat(el.style.left), t0 = parseFloat(el.style.top);
+      handle.setPointerCapture(e.pointerId); el.classList.add('float-moving');
+      const mv = ev => { el.style.left = `${l0 + ev.clientX - x0}px`; el.style.top = `${t0 + ev.clientY - y0}px`; floatClamp(el); };
+      const up = () => { handle.removeEventListener('pointermove', mv); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up); el.classList.remove('float-moving'); floatSave(el); };
+      handle.addEventListener('pointermove', mv); handle.addEventListener('pointerup', up); handle.addEventListener('pointercancel', up);
+    });
+    handle.addEventListener('dblclick', e => { if (e.target.closest('button, input, select, a, label')) return; floatReset(el); });
+    // resize: the grip in the bottom-right corner (it stays in view as the popup scrolls)
+    const grip = document.createElement('div'); grip.className = 'float-grip'; grip.title = 'Drag to resize'; grip.setAttribute('aria-hidden', 'true');
+    const knob = document.createElement('span'); grip.append(knob); el.append(grip);
+    knob.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return; e.preventDefault(); e.stopPropagation(); floatPin(el);
+      const r = el.getBoundingClientRect(), x0 = e.clientX, y0 = e.clientY;
+      knob.setPointerCapture(e.pointerId); el.classList.add('float-moving');
+      const mv = ev => { const f = floatFrame(el);
+        el.style.width = `${Math.min(Math.max(220, r.width + ev.clientX - x0), f.width - (r.left - f.left) - 4)}px`; el.style.maxWidth = 'none';
+        el.style.height = `${Math.min(Math.max(120, r.height + ev.clientY - y0), f.height - (r.top - f.top) - 4)}px`; el.style.maxHeight = 'none'; };
+      const up = () => { knob.removeEventListener('pointermove', mv); knob.removeEventListener('pointerup', up); knob.removeEventListener('pointercancel', up); el.classList.remove('float-moving'); floatSave(el); };
+      knob.addEventListener('pointermove', mv); knob.addEventListener('pointerup', up); knob.addEventListener('pointercancel', up);
+    });
+    // where you left it, each time it opens
+    new MutationObserver(() => { if (!el.hidden) requestAnimationFrame(() => { floatRestore(el); floatFront(el); }); }).observe(el, { attributes: true, attributeFilter: ['hidden'] });
+    if (!el.hidden) floatRestore(el);
+  }
+  addEventListener('resize', () => FLOATS.forEach(id => { const el = document.getElementById(id); if (el) floatClamp(el); }));
+}
+
+// ---- modifiers
+/*
+ * Like Blender's modifier stack: a part keeps its mesh as it came in (its base), and a list of modifiers worked on it
+ * in order, each one on or off, with its settings open to change, applied (made part of the base for good) or
+ * removed. What you see, export and print is the result of the stack.
+ *   crack    Crack & cave in: settings and where it got hit
+ *   relief   a relief from a picture placed on this part (the relief is its own part, kept by the modifier)
+ *   scatter  copies of other parts scattered over this part (the copies are kept by the modifier)
+ * A relief or scatter is Separate (its parts sit on this one), Merge (joined into this mesh) or Cut (taken away from it).
+ * The stack is worked out in the background; each modifier's result is kept, so changing one only redoes it and the
+ * ones after.
+ */
+const modCache = new Map();                                      // part:modifier id → { inG, key, out }
+const MOD_NAMES = { grow: 'Pushed by a growth', burst: 'Burst & growth', crack: 'Crack & cave in', relief: 'Relief', scatter: 'Scatter', split: 'Split', clean: 'Clean out insides' };
+const CLEAN_DEFAULT = { pieces: 'all', open: 'outside', detail: 0.12, rays: 64 };
+/** The outside skin of a mesh and nothing inside it (worked out in the part's own frame). */
+async function cleanGeometry(m, g, mod) {
+  const soup = soupOfGeom(g, new THREE.Matrix4());
+  const r = await solidJob({ clean: { ...mod.p, soup } });
+  mod.stats = r.stats; return geomFromSoup(r.positions);
+}
+/** Add Clean out insides to a part's stack (or the selected one). */
+function startClean(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part to clean out first, then Clean out insides.', 'bad'); return; }
+  pushUndo(); ensureStack(m).push({ id: newModId(), type: 'clean', name: MOD_NAMES.clean, on: true, p: { ...CLEAN_DEFAULT } }); select(m);
+  toast(`Cleaning out ${m.name}… (a big messy mesh can take a minute)`);
+  evalStack(m).then(() => { const md = m.userData.part.mods?.at(-1); if (!md || md.type !== 'clean') return;
+    if (md.err) toast(`Couldn't clean it out: ${md.err}`, 'bad');
+    else toast(`${m.name} cleaned out: ${cleanSummary(md.stats)}. It's a modifier: change it, turn it off or Apply it in Properties › Modifiers.`, 'ok'); });
+}
+function cleanSummary(st) {
+  if (!st) return 'working it out…';
+  const k = n => n >= 1e4 ? Math.round(n / 1000) + 'k' : String(n), bits = [`${k(st.before)} → ${k(st.after)} triangles`];
+  if (st.inputShells > st.pieces) bits.push(`${st.inputShells} shells joined into ${st.pieces}`);
+  if (st.hollows) bits.push(`${st.hollows} sealed hollow${st.hollows === 1 ? '' : 's'} filled`);
+  if (st.piecesDropped) bits.push(`${st.piecesDropped} separate piece${st.piecesDropped === 1 ? '' : 's'} removed`);
+  const tri = n => `${k(n)} open triangle${n === 1 ? '' : 's'}`;
+  if (st.openDropped) bits.push(st.openChecked ? `${tri(st.openDropped)} inside removed` : `${tri(st.openDropped)} removed`);
+  if (st.openKept) bits.push(`${tri(st.openKept)} kept on the outside`);
+  if (st.rebuilt) bits.push(`${k(st.openRebuilt)} open triangles: the whole thing shrink-wrapped at ${st.rebuilt} mm`);
+  if (st.mended) bits.push(`${st.mended} broken spot${st.mended === 1 ? '' : 's'} mended`);
+  return bits.join(', ');
+}
+function modKids(m, mod) { return (mod.kids || []).map(partById).filter(k => k && k.parent); }
+function storedGeom(m) { const pt = m.userData.part; return pt.base ? pt.base : { geometry: m.geometry, geomKey: pt.geomKey }; }
+function storedKey(m) { return storedGeom(m).geomKey; }
+/** Give a part a stack (its mesh as it is now is the base), if it hasn't one. */
+function ensureStack(m, base = m.geometry, key = m.userData.part.geomKey) {
+  const pt = m.userData.part; if (!pt.base) pt.base = { geometry: base, geomKey: key }; pt.mods ||= []; return pt.mods;
+}
+function newModId() { return 'mod-' + THREE.MathUtils.generateUUID().slice(0, 8); }
+const geomFromSoup = soup => { const g1 = new THREE.BufferGeometry(); g1.setAttribute('position', new THREE.BufferAttribute(soup, 3)); const g = weldGeometry(g1, 1e-9); g.computeBoundingBox(); g.computeBoundsTree(); return g; };
+function soupOfGeom(g, M) {
+  const pos = g.attributes.position, ix = g.index ? g.index.array : null, n = ix ? ix.length : pos.count, out = new Float32Array(n * 3), v = V();
+  for (let i = 0; i < n; i++) { v.fromBufferAttribute(pos, ix ? ix[i] : i).applyMatrix4(M); out[3 * i] = v.x; out[3 * i + 1] = v.y; out[3 * i + 2] = v.z; }
+  return out;
+}
+/** Crack a mesh (the part's g) where hit: { pL, nL, right, thick } in the part's frame; p the settings. */
+async function crackGeometry(m, g, hit, p) {
+  m.updateMatrixWorld(true);
+  const pL = V().fromArray(hit.pL), nL = V().fromArray(hit.nL), right = V().fromArray(hit.right);
+  const P = pL.applyMatrix4(m.matrixWorld), N = nL.transformDirection(m.matrixWorld).normalize();
+  let X = right.projectOnPlane(N); if (X.lengthSq() < 1e-6) X = (Math.abs(N.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).cross(N); X.normalize();
+  const Y = N.clone().cross(X).normalize(), F = new THREE.Matrix4().makeBasis(X, Y, N).setPosition(P);
+  const soup = soupOfGeom(g, F.clone().invert().multiply(m.matrixWorld));
+  const r = await solidJob({ crack: { ...p, soup, thick: hit.thick } });
+  if (!r.positions.length) throw new Error('that left nothing of it: try a smaller radius');
+  const back = m.matrixWorld.clone().invert().multiply(F), out = r.positions, v = V();
+  for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(back); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+  return { geometry: geomFromSoup(out), slabs: r.slabs, shells: r.shells };
+}
+/** A mesh (the part's g) with parts joined on (merge) or taken away (cut). */
+async function boolGeometry(m, g, kids, mode) {
+  m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert();
+  const iSoups = kids.map(k => { k.updateMatrixWorld(true); return soupOfGeom(k.geometry, inv.clone().multiply(k.matrixWorld)); });
+  const [r] = await mergeJobs([mode === 'merge' ? { soups: [soupOfGeom(g, new THREE.Matrix4()), ...iSoups], subtract: [] } : { soups: [soupOfGeom(g, new THREE.Matrix4())], subtract: iSoups }], { fillHollows: false, loose: 'keep' });
+  if (!r?.positions?.length) throw new Error('that left nothing of it');
+  return geomFromSoup(r.positions);
+}
+function modKey(m, mod) {
+  if (mod.type === 'crack' || mod.type === 'burst') return JSON.stringify([mod.p, mod.hit]);
+  if (mod.type === 'split') return JSON.stringify([mod.p, mod.at]);
+  if (mod.type === 'clean') return JSON.stringify(mod.p);
+  if (mod.type === 'grow') return growKey(m, mod);
+  m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert();
+  return mod.mode + '|' + modKids(m, mod).map(k => k.uuid + k.geometry.uuid + inv.clone().multiply(k.matrixWorld).elements.map(x => Math.round(x * 1e5)).join(',')).join('|');
+}
+/** One modifier on its input mesh (kept, so it's only worked out again when its input or settings change). */
+async function evalMod(m, mod, gIn) {
+  const key = modKey(m, mod), ck = m.uuid + ':' + mod.id, c = modCache.get(ck);
+  if (c && c.inG === gIn && c.key === key) return c.out;
+  let out = gIn;
+  if (mod.type === 'crack') out = (await crackGeometry(m, gIn, mod.hit, mod.p)).geometry;
+  else if (mod.type === 'burst') { const r = await burstGeometry(m, gIn, mod.hit, mod.p); out = r.geometry; mod.stats = r.stats; }
+  else if (mod.type === 'split') out = (await splitGeometry(m, gIn, mod)).geometry;
+  else if (mod.type === 'clean') out = await cleanGeometry(m, gIn, mod);
+  else if (mod.type === 'grow') out = await growWarpGeometry(m, gIn, mod);
+  else if (mod.mode !== 'join') { const kids = modKids(m, mod); if (kids.length) out = await boolGeometry(m, gIn, kids, mod.mode); }
+  modCache.set(ck, { inG: gIn, key, out }); return out;
+}
+/** The mesh going into modifier i (the base, through the ones before it that are on). */
+async function stackInput(m, i) {
+  const pt = m.userData.part; let g = pt.base.geometry;
+  for (let k = 0; k < i; k++) { const mod = pt.mods[k]; if (mod.on) g = await evalMod(m, mod, g); }
+  return g;
+}
+/** Work the stack out and show the result. */
+async function evalStack(m) {
+  const pt = m.userData.part; if (!pt.base) return;
+  const ver = pt.stackVer = (pt.stackVer || 0) + 1; pt.stackBusy = true; if (selected === m) renderModBusy(m);
+  let g = pt.base.geometry;
+  for (const mod of pt.mods) {
+    if (mod.type === 'relief' || mod.type === 'scatter') modKids(m, mod).forEach(k => { k.visible = mod.on && mod.mode === 'join'; });
+    if (!mod.on) continue;
+    try { g = await evalMod(m, mod, g); mod.err = null; } catch (e) { console.warn(e); mod.err = String(e.message || e); }
+    if (pt.stackVer !== ver || !m.parent) return;
+  }
+  pt.stackBusy = false;
+  if (m.geometry !== g) {
+    m.geometry = g; pt.geomKey = g === pt.base.geometry ? pt.base.geomKey : (g.userData.key ||= THREE.MathUtils.generateUUID());
+    pt.topo = null; pt.tris = g.index.count / 3; if (pt.paint && pt.paint.length !== g.attributes.position.count * 4) pt.paint = null; refreshPaint(m);
+  }
+  if (!pt.mods.length) { pt.base = null; pt.mods = null; }
+  afterHierarchyChange();
+}
+function dropKids(m, mod, free) {
+  for (const k of modKids(m, mod)) { const kp = k.userData.part; delete kp.owner;
+    if (free) k.visible = true; else { if (selection.includes(k)) selection = selection.filter(x => x !== k); detach(k); k.parent?.remove(k); } }
+}
+function removeMod(m, mod) {
+  const pt = m.userData.part; pushUndo();
+  if (mod.type === 'grow') { pt.noGrow = [...new Set([...(pt.noGrow || []), mod.grower])]; }      // that growth leaves it alone from now on
+  dropKids(m, mod, false); pt.mods = pt.mods.filter(x => x !== mod);
+  evalStack(m); toast(`Removed ${mod.name}.`);
+}
+/** Make a modifier (and the ones before it that are on) part of the base for good. */
+async function applyMod(m, mod) {
+  const pt = m.userData.part, i = pt.mods.indexOf(mod); if (i < 0) return;
+  if (!mod.on) { toast('Turn it on first: a modifier that is off has nothing to apply.', 'bad'); return; }
+  pushUndo();
+  let g;
+  try { g = await stackInput(m, i + 1); } catch (e) { toast(`Couldn't apply it (${e.message || e}).`, 'bad'); return; }
+  const done = pt.mods.slice(0, i + 1).filter(x => x.on);
+  for (const x of done) if (x.type === 'relief' || x.type === 'scatter') dropKids(m, x, x.mode === 'join');
+  pt.mods = pt.mods.filter(x => !done.includes(x));
+  // a split with both halves kept, applied last: the second half becomes a part of its own
+  let other = null;
+  const sp = g.userData.split, lastSplit = done.at(-1)?.type === 'split' && done.at(-1).p.keep === 'both';
+  if (sp && lastSplit && sp.sides.includes(1) && sp.sides.includes(0)) {
+    const pick = side => { let n = 0; for (const x of sp.sides) if (x === side) n++; const out = new Float32Array(n * 9); let o = 0;
+      for (let t = 0; t < sp.sides.length; t++) if (sp.sides[t] === side) { out.set(sp.positions.subarray(9 * t, 9 * t + 9), o); o += 9; } return geomFromSoup(out); };
+    g = pick(0); const gB = pick(1);
+    other = addPart(`${m.name} B`, gB, { welded: true, color: pt.color });
+    m.parent.add(other); other.position.copy(m.position); other.quaternion.copy(m.quaternion); other.scale.copy(m.scale);
+    if (pt.fill) other.userData.part.fill = pt.fill;
+  }
+  pt.base = { geometry: g, geomKey: g === pt.base.geometry ? pt.base.geomKey : (g.userData.key ||= THREE.MathUtils.generateUUID()) };
+  await evalStack(m);
+  if (other) { refreshPaint(other); afterHierarchyChange(); toast(`Applied ${done.map(x => x.name).join(', ')}: ${m.name} is cut in two, and the other half is its own part, ${other.name}.`, 'ok'); return; }
+  toast(done.length > 1 ? `Applied ${done.map(x => x.name).join(', ')}: they're part of ${m.name}'s mesh now.` : `Applied ${mod.name}: it's part of ${m.name}'s mesh now.`, 'ok');
+}
+function moveMod(m, mod, d) {
+  const pt = m.userData.part, i = pt.mods.indexOf(mod), j = i + d; if (j < 0 || j >= pt.mods.length) return;
+  pushUndo(); [pt.mods[i], pt.mods[j]] = [pt.mods[j], pt.mods[i]]; evalStack(m);
+}
+function setModOn(m, mod, on) { pushUndo(); mod.on = on; evalStack(m); }
+
+// "Move the hit": the next click on the part sets a crack modifier's hit
+let modHit = null;   // { m, mod }
+async function modHitClick(hit, ev) {
+  const { m, mod, kind } = modHit; modHit = null;
+  if (kind === 'split-new' || kind === 'split-move') {
+    if (!hit || hit.object !== m) { toast(`That wasn't on ${m.name}: nothing was cut.`); return; }
+    pushUndo();
+    if (kind === 'split-new') { const mods = ensureStack(m); mods.push({ id: newModId(), type: 'split', name: MOD_NAMES.split, on: true, p: { ...SPLIT_DEFAULT, seed: (Math.random() * 2 ** 31) | 0 }, at: splitAtFromView(m, hit.point) }); select(m); }
+    else { const keepView = mod.at; mod.at = { ...keepView, pL: hit.point.clone().applyMatrix4(m.matrixWorld.clone().invert()).toArray() }; }
+    evalStack(m).then(() => { const md = m.userData.part.mods?.at(-1); if (kind === 'split-new' && md?.err) toast(`Couldn't split it: ${md.err}`, 'bad'); else if (kind === 'split-new') toast(`${m.name} is split, as a modifier: set the break's style, turn, tilt and pull it apart in Properties › Modifiers; Apply makes the two halves separate parts.`, 'ok'); });
+    return;
+  }
+  if (!hit || hit.object !== m) { toast(`That wasn't on ${m.name}: the hit stays where it was.`); return; }
+  const gIn = await stackInput(m, m.userData.part.mods.indexOf(mod)), cur = m.geometry; m.geometry = gIn; m.updateMatrixWorld(true);
+  const b = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster(); rc.firstHitOnly = true;
+  rc.setFromCamera(new THREE.Vector2(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1), camera);
+  const h = rc.intersectObject(m, false)[0] || hit, n = hitNormal(h); if (n.dot(camera.position.clone().sub(h.point)) < 0) n.negate();
+  rc.set(h.point.clone().addScaledVector(n, -1e-3), n.clone().negate()); const backHit = rc.intersectObject(m, false)[0];
+  m.geometry = cur;
+  const inv = m.matrixWorld.clone().invert();
+  pushUndo();
+  mod.hit = { pL: h.point.clone().applyMatrix4(inv).toArray(), nL: n.clone().transformDirection(inv).toArray(), right: V(1, 0, 0).applyQuaternion(camera.quaternion).toArray(), thick: backHit ? backHit.distance + 1e-3 : 2 };
+  evalStack(m);
+}
+
+/** The Modifiers section of a part's panel. */
+function renderModBusy(m) { const s = document.getElementById('mods-busy'); if (s) s.hidden = !m.userData.part.stackBusy; }
+function modifierRows(p, el) {
+  const pt = p.userData.part, sec = document.createElement('div'); sec.className = 'conn mods';
+  const h = document.createElement('div'); h.className = 'conn-h'; h.textContent = 'Modifiers';
+  const busy = document.createElement('span'); busy.id = 'mods-busy'; busy.className = 'mods-busy'; busy.textContent = ' working…'; busy.hidden = !pt.stackBusy; h.append(busy);
+  sec.append(h);
+  if (pt.owner) { const o = partById(pt.owner.part), mo = o?.userData.part.mods?.find(x => x.id === pt.owner.mod);
+    if (o && mo) { const n = document.createElement('p'); n.className = 'note'; n.textContent = `Kept by the ${mo.name} modifier on ${o.name}. `;
+      const go = document.createElement('button'); go.type = 'button'; go.className = 'mini'; go.textContent = `Select ${o.name}`; go.addEventListener('click', () => select(o)); n.append(go); sec.append(n); } }
+  const mods = pt.mods || [];
+  if (!mods.length && !pt.owner) return;                              // nothing to show: no section
+  if (!mods.length) { const n = document.createElement('p'); n.className = 'note'; n.textContent = 'None. Cracks, reliefs and scatters you add to this part show here, to turn on and off, change or apply.'; sec.append(n); }
+  mods.forEach((mod, i) => {
+    const card = document.createElement('div'); card.className = 'mod' + (mod.on ? '' : ' off');
+    const top = document.createElement('div'); top.className = 'mod-h';
+    const on = document.createElement('input'); on.type = 'checkbox'; on.checked = mod.on; on.title = 'On or off'; on.setAttribute('aria-label', `${mod.name} on`);
+    on.addEventListener('change', () => setModOn(p, mod, on.checked));
+    const nm = document.createElement('b'); nm.textContent = mod.name;
+    const mk = (t, title, fn, dis = false) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'mini'; b.textContent = t; b.title = title; b.disabled = dis; b.addEventListener('click', fn); return b; };
+    top.append(on, nm, mk('▲', 'Earlier in the stack', () => moveMod(p, mod, -1), i === 0), mk('▼', 'Later in the stack', () => moveMod(p, mod, 1), i === mods.length - 1),
+      mk('Apply', i ? 'Make it part of the mesh for good (with the ones above it that are on)' : 'Make it part of the mesh for good', () => applyMod(p, mod)),
+      mk('✕', 'Remove it' + (mod.type === 'relief' || mod.type === 'scatter' ? ' (and its parts)' : ''), () => removeMod(p, mod)));
+    card.append(top);
+    if (mod.err) { const e = document.createElement('p'); e.className = 'note bad'; e.textContent = mod.err; card.append(e); }
+    const grid = document.createElement('div'); grid.className = 'mod-grid'; card.append(grid);
+    const row = (label, ctl, title = '') => { const l = document.createElement('label'); l.textContent = label; if (title) l.title = title; grid.append(l, ctl); };
+    const change = fn => () => { pushUndo(); fn(); evalStack(p); };
+    if (mod.type === 'burst') {
+      const q = mod.p;
+      const num = (label, key, step, min, max, scale = 1, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
+        n.addEventListener('change', change(() => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); q[key] = ['petals', 'pustules', 'pocks', 'horns'].includes(key) ? Math.round(v) : v / scale; })); row(label, n, title); };
+      const chk = (label, key) => { const c = document.createElement('input'); c.type = 'checkbox'; c.checked = q[key] !== false; c.addEventListener('change', change(() => { q[key] = c.checked; })); row(label, c); };
+      if (q.from === 'sphere') {
+        num('Sphere radius mm', 'sr', 0.5, 0.3, 300); num('Depth mm', 'depth', 0.5, -100, 300, 1, 'How far under the surface its middle sits; less than its radius and it breaks through'); chk('Warp the part', 'warp');
+        if (q.warp !== false) { num('Push mm', 'push', 0.25, 0, 100); num('Push reach %', 'preach', 10, 110, 600, 100); num('Lumpy push %', 'pnoise', 5, 0, 100, 100); }
+      } else { num('Radius mm', 'radius', 0.5, 0.3, 200); num('Swell mm', 'swell', 0.1, 0, 50); num('Swell reach %', 'reach', 10, 110, 500, 100); }
+      chk('Torn open', 'tear');
+      if (q.tear !== false) { num('Petals', 'petals', 1, 2, 16); num('Peel °', 'peel', 5, 0, 120); num('Jagged %', 'jag', 5, 0, 100, 100); num('Plate mm', 'plate', 0.1, 0.2, 10); }
+      num('Growth size %', 'grow', 5, 0, 400, 100);
+      if (q.grow > 0) { num('Stands out mm', 'height', 0.5, 0.2, 100); num('Lumpy %', 'lumps', 5, 0, 100, 100); num('Rings %', 'ridges', 5, 0, 100, 100); num('Pustules', 'pustules', 1, 0, 200); num('Pock holes', 'pocks', 1, 0, 100); num('Horns', 'horns', 1, 0, 60); num('Horn length mm', 'hornLen', 0.5, 0.5, 60); num('Curl %', 'curl', 5, 0, 100, 100); }
+      num('Detail mm', 'detail', 0.02, 0.08, 2);
+      const sh = document.createElement('button'); sh.type = 'button'; sh.className = 'btn'; sh.textContent = 'Shuffle'; sh.title = 'New tears, lumps and horns with the same settings';
+      sh.addEventListener('click', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })); row('', sh);
+      if (growthSpots(liveParts()).length >= 2) { const co = document.createElement('button'); co.type = 'button'; co.className = 'btn'; co.textContent = 'Connect with ooze'; co.title = 'String ooze from this burst to the other bursts and growths there are, nearest to nearest';
+        co.addEventListener('click', () => connectWithOoze([p, ...liveParts().filter(o => o !== p)])); row('', co); }
+    } else if (mod.type === 'crack') {
+      const q = mod.p;
+      const num = (label, key, step, min, max, scale = 1, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
+        n.addEventListener('change', change(() => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); q[key] = key === 'rings' || key === 'cracks' ? Math.round(v) : v / scale; })); row(label, n, title); };
+      num('Radius mm', 'radius', 0.5, 0.3, 200); num('Cave in mm', 'depth', 0.1, 0, 50); num('Rings', 'rings', 1, 1, 8); num('Cracks out', 'cracks', 1, 2, 24);
+      num('Crack width mm', 'width', 0.05, 0.02, 5); num('Jagged %', 'jag', 5, 0, 100, 100); num('Tumble °', 'tumble', 1, 0, 45); num('Spider cracks %', 'spider', 10, 0, 200, 100);
+      const mid = document.createElement('select'); mid.className = 'num osel'; for (const [v, t] of [['dent', 'Caved in'], ['hole', 'Punched through']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; mid.append(o); }
+      mid.value = q.hole ? 'hole' : 'dent'; mid.addEventListener('change', change(() => { q.hole = mid.value === 'hole'; })); row('Middle', mid);
+      num('Middle size %', 'core', 5, 0, 80, 100);
+      const goes = document.createElement('select'); goes.className = 'num osel'; for (const [v, t] of [['through', 'Through the part'], ['surface', 'Surface only']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; goes.append(o); }
+      goes.value = q.surface ? 'surface' : 'through'; goes.addEventListener('change', change(() => { q.surface = goes.value === 'surface'; q.crackDepth ??= 1; q.effectDepth ??= 0.6; }));
+      row('Goes', goes, 'Surface only: just a layer at the top breaks up and caves in; the part underneath stays whole');
+      if (q.surface) {
+        num('Crack depth mm', 'crackDepth', 0.1, 0.05, 50, 1, 'How deep the cracks cut in from the surface, at most');
+        num('Effect depth mm', 'effectDepth', 0.1, 0.05, 50, 1, 'How thick the layer is that breaks into slabs and caves in');
+      } else {
+        const th = document.createElement('input'); th.type = 'checkbox'; th.checked = !!q.through; th.addEventListener('change', change(() => { q.through = th.checked; }));
+        const tl = document.createElement('label'); tl.className = 'check'; tl.append(th, ' Break right through'); row('', tl);
+        if (!q.through) num('Hold together mm', 'skin', 0.05, 0.02, 10, 1, 'Left uncracked at the back so it holds together');
+      }
+      const btns = document.createElement('span'); btns.className = 'btnrow';
+      btns.append(mk('Shuffle', 'A new crack pattern with the same settings', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })),
+        mk('Move the hit', 'Click on the part where it got hit instead', () => { modHit = { m: p, mod }; toast(`Click where ${p.name} got hit.`); }));
+      row('', btns);
+    } else if (mod.type === 'clean') {
+      const q = mod.p;
+      const sel = (label, key, opts, title = '') => { const e = document.createElement('select'); e.className = 'num osel'; for (const [v, t] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; e.append(o); }
+        e.value = String(q[key]); e.addEventListener('change', change(() => { q[key] = key === 'rays' ? +e.value : e.value; })); row(label, e, title); };
+      sel('Keep', 'pieces', [['all', 'Every outside piece'], ['largest', 'Biggest piece only']], 'Biggest piece only: just the main body, nothing else (separate bits and open bits go too)');
+      if (q.pieces !== 'largest') {
+        if (q.open === 'rebuild') q.open = 'outside';                   // (the old name: broken shells are mended exactly now)
+        sel('Open bits', 'open', [['outside', 'Keep the ones outside'], ['drop', 'Remove them all'], ['wrap', 'Shrink-wrap it all (re-mesh)']], "Broken shells (small holes, flaps, pinches) are mended first, exactly, so this is only for what's still open after that: sheets with nothing behind them. Keep the ones outside / remove them all; or, as a last resort, shrink-wrap the whole thing as one watertight solid at the detail below (a new surface all over: it loses fine detail)");
+        if (q.open === 'wrap') { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = 0.02; n.min = 0.04; n.max = 2; n.value = q.detail ?? 0.12;
+          n.addEventListener('change', change(() => { const v = +n.value; if (isFinite(v)) q.detail = Math.min(2, Math.max(0.04, v)); })); row('Detail mm', n, 'The smallest detail the rebuilt surface keeps; cracks and holes narrower than this are sealed. Finer is slower'); }
+        if (q.open === 'outside') sel('Check', 'rays', [['32', 'Quick'], ['64', 'Normal'], ['128', 'Thorough']], 'How hard it looks for a way out from each open triangle: Thorough keeps more of the deep crevices, and takes longer');
+      }
+      const info = document.createElement('span'); info.className = 'note'; info.textContent = cleanSummary(mod.stats); row('Result', info);
+    } else if (mod.type === 'split') {
+      const q = mod.p;
+      const sel = (label, key, opts, title = '') => { const e = document.createElement('select'); e.className = 'num osel'; for (const [v, t] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; e.append(o); }
+        e.value = q[key]; e.addEventListener('change', change(() => { q[key] = e.value; })); row(label, e, title); };
+      const num = (label, key, step, min, max, title = '') => { const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(+q[key]).toFixed(3);
+        n.addEventListener('change', change(() => { const v = +n.value; if (isFinite(v)) q[key] = Math.min(max, Math.max(min, v)); })); row(label, n, title); };
+      sel('Break', 'style', [['snapped', 'Snapped'], ['torn', 'Torn'], ['lance', 'Melted (lance)'], ['clean', 'Clean cut']], 'What the break looks like');
+      if (q.style !== 'clean') { num('Roughness mm', 'amp', 0.1, 0, 20, 'How far the break wanders off flat'); num('Feature size mm', 'size', 0.1, 0.1, 50, 'How big its teeth, facets or ripples are'); }
+      num('Cut away mm', 'kerf', 0.05, 0, 20, 'Material taken out between the halves (a lance burns a gap)');
+      num('Pull apart mm', 'gap', 0.5, 0, 200, 'How far the second half is moved off the first');
+      num('Turn °', 'angle', 5, -180, 180, 'Turn the cut on screen, round the spot (as seen when it was set)'); num('Tilt °', 'tilt', 5, -80, 80, 'Lean the cut toward or away from you');
+      sel('Keep', 'keep', [['both', 'Both halves'], ['a', 'Side A only'], ['b', 'Side B only']]);
+      if (q.style === 'lance') { const bd = document.createElement('input'); bd.type = 'checkbox'; bd.checked = !!q.beads; bd.addEventListener('change', change(() => { q.beads = bd.checked; }));
+        const bl = document.createElement('label'); bl.className = 'check'; bl.append(bd, ' Slag beads on the edges'); row('', bl); }
+      const btns = document.createElement('span'); btns.className = 'btnrow';
+      btns.append(mk('Shuffle', 'A new break with the same settings', change(() => { q.seed = (Math.random() * 2 ** 31) | 0; })),
+        mk('Move the cut', 'Click where the cut goes instead', () => { modHit = { m: p, mod, kind: 'split-move' }; toast(`Click where to cut ${p.name}.`); }),
+        mk('Line up with the view', 'Set the cut up again across the screen as you look at it now', change(() => { const at = splitAtFromView(p, V().fromArray(mod.at.pL).applyMatrix4(p.matrixWorld)); mod.at = at; q.angle = 0; q.tilt = 0; })));
+      row('', btns);
+    } else {
+      const kids = modKids(p, mod), info = document.createElement('span'); info.className = 'note';
+      info.textContent = mod.type === 'relief' ? (kids[0] ? kids[0].name : 'its relief is gone') : `${kids.length} cop${kids.length === 1 ? 'y' : 'ies'}`;
+      row(mod.type === 'relief' ? 'Relief' : 'Copies', info);
+      const seg = document.createElement('span'); seg.className = 'seg';
+      for (const [v, t, title] of [['join', 'Separate', 'Its parts sit on this one, fixed to it'], ['merge', 'Merge', 'Joined into this mesh as one solid'], ['cut', 'Cut', 'Taken away from this mesh, as deep as they sink in']]) {
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.title = title; b.setAttribute('aria-pressed', String(mod.mode === v));
+        b.addEventListener('click', change(() => { mod.mode = v; })); seg.append(b); }
+      row('Result', seg);
+      const btns = document.createElement('span'); btns.className = 'btnrow';
+      btns.append(mk('Change placement…', 'Open the placing card again: move, turn, size, repeat, spacing…', () => editPlacement(p, mod), !kids.length));
+      if (mod.type === 'scatter') btns.append(mk('Shuffle', 'A new random pattern with the same settings', () => editPlacement(p, mod, { shuffle: true }), !kids.length));
+      row('', btns);
+    }
+    sec.append(card);
+  });
+  el.append(sec);
+}
+
+
+// ---- the Split modifier: a part cut in two, the break melted, torn, snapped or clean
+const SPLIT_DEFAULT = { style: 'snapped', amp: 0.6, size: 1.5, kerf: 0.1, gap: 1, angle: 0, tilt: 0, keep: 'both', beads: true };
+/** The cut's frame (world): through the spot, its normal turned and tilted from the view it was set up in. */
+function splitFrame(m, mod) {
+  m.updateMatrixWorld(true);
+  const at = mod.at, q = mod.p, W = a => V().fromArray(a).transformDirection(m.matrixWorld).normalize();
+  const P = V().fromArray(at.pL).applyMatrix4(m.matrixWorld), R0 = W(at.R0), D0 = W(at.D0);
+  const n = R0.clone().applyAxisAngle(D0, (q.angle || 0) * Math.PI / 180);
+  let X = D0.clone().cross(n); if (X.lengthSq() < 1e-8) X = W(at.U0); X.normalize();
+  n.applyAxisAngle(X, (q.tilt || 0) * Math.PI / 180).normalize();
+  X = X.projectOnPlane(n).normalize(); const Y = n.clone().cross(X).normalize();
+  return new THREE.Matrix4().makeBasis(X, Y, n).setPosition(P);
+}
+async function splitGeometry(m, g, mod) {
+  const F = splitFrame(m, mod), soup = soupOfGeom(g, F.clone().invert().multiply(m.matrixWorld));
+  const r = await solidJob({ split: { ...mod.p, soup, seed: mod.p.seed | 0 } });
+  const back = m.matrixWorld.clone().invert().multiply(F), out = r.positions, v = V();
+  for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(back); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+  const geometry = geomFromSoup(out.slice());
+  geometry.userData.split = { positions: out, sides: r.sides };             // which side each triangle is on, for Apply
+  return { geometry };
+}
+/** Start a Split: the next click on the part is where it's cut (across, as the cut looks on screen). */
+function startSplit(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part to split first, then Split.', 'bad'); return; }
+  endCrack(false); endReliefPlace(false);
+  modHit = { m, kind: 'split-new' }; toast(`Click where to cut ${m.name}. The cut runs up the screen through that spot; turn and tilt it after.`);
+}
+function splitAtFromView(m, point) {
+  const inv = m.matrixWorld.clone().invert(), loc = a => a.clone().transformDirection(inv).toArray();
+  return { pL: point.clone().applyMatrix4(inv).toArray(), R0: loc(V(1, 0, 0).applyQuaternion(camera.quaternion)), U0: loc(V(0, 1, 0).applyQuaternion(camera.quaternion)), D0: loc(V(0, 0, 1).applyQuaternion(camera.quaternion)) };
+}
+
+// ---- placing settings, kept on a relief or scatter modifier so its placement can be changed later
+const RP_VALS = ['rp-spin', 'rp-spin-n', 'rp-size', 'rp-sink', 'rp-cols', 'rp-rows', 'rp-gap', 'rp-margin', 'rp-turn', 'sc-n', 'sc-gap', 'sc-smin', 'sc-smax', 'sc-jit', 'sc-tilt', 'sc-axis', 'sc-margin', 'sc-poke'];
+const RP_CHECKS = ['rp-wrap', 'rp-trim', 'rp-corners', 'sc-inside', 'sc-through'];
+function rpSettings() {
+  return { pL: rp.pL.toArray(), nL: rp.nL.toArray(), right: rp.right.toArray(), off: [...rp.off], rep: rp.rep, turn: rp.turn || 'random', seed: rp.seed ?? 0,
+    addPts: rp.addPts || [], remPts: rp.remPts || [], v: Object.fromEntries(RP_VALS.map(id => [id, $(id).value])), c: Object.fromEntries(RP_CHECKS.map(id => [id, $(id).checked])) };
+}
+function applyRpSettings(s) {
+  for (const [id, v] of Object.entries(s.v || {})) if ($(id)) $(id).value = v;
+  for (const [id, v] of Object.entries(s.c || {})) if ($(id)) $(id).checked = !!v;
+  document.querySelectorAll('#sc-turn button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === (s.turn || 'random'))));
+}
+/** A relief made in an earlier session: build its flat original again from the picture kept with it. */
+async function ensureReliefFlat(k) {
+  const info = k.userData.part.relief; if (!info || info.flat || !info.params) return;
+  const r = await solidJob({ relief: { ...info.params, field: Float32Array.from(info.params.field) } });
+  info.flat = geomFromSoup(r.positions); info.size = r.size;
+}
+const b64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 32768) s += String.fromCharCode.apply(null, u8.subarray(i, i + 32768)); return btoa(s); };
+const unb64 = s => { const t = atob(s), u = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) u[i] = t.charCodeAt(i); return u; };
+function encodeRelief(info) {
+  if (!info?.params?.field) return null;
+  const f = info.params.field, q = new Uint8Array(f.length); for (let i = 0; i < f.length; i++) q[i] = Math.round(Math.min(1, Math.max(0, f[i])) * 255);
+  const { field, ...rest } = info.params; return { size: info.size, params: rest, field8: b64(q) };
+}
+function decodeRelief(rec) {
+  if (!rec?.field8) return null;
+  const q = unb64(rec.field8), f = new Float32Array(q.length); for (let i = 0; i < q.length; i++) f[i] = q[i] / 255;
+  return { flat: null, size: rec.size, params: { ...rec.params, field: f } };
+}
+/** Open the placing card on a relief or scatter modifier again, as it was set, to change it. */
+async function editPlacement(t, mod, { shuffle = false } = {}) {
+  const kids = modKids(t, mod), s = mod.place; if (!kids.length || !s) { toast("There's no placement kept for it to change.", 'bad'); return; }
+  const src = mod.type === 'scatter' ? (mod.sources || []).map(partById).filter(Boolean) : null;
+  if (mod.type === 'scatter' && !src.length) { toast(`The parts it scatters are gone, so it can't be laid out again: Apply or remove it.`, 'bad'); return; }
+  endCrack(false); endReliefPlace(false);
+  const before = snapshot(), i = t.userData.part.mods.indexOf(mod);
+  let gIn; try { gIn = await stackInput(t, i); if (mod.type === 'relief') await ensureReliefFlat(kids[0]); } catch (e) { toast(`Couldn't open it (${e.message || e}).`, 'bad'); return; }
+  // while placing: the mesh as it goes into this modifier, with the modifier's own parts showing
+  const pt = t.userData.part; t.geometry = gIn; pt.topo = null; kids.forEach(k => { k.visible = true; });
+  rp = { kind: mod.type, m: mod.type === 'relief' ? kids[0] : null, src, copies: mod.type === 'scatter' ? kids : [], target: t, before, off: [...(s.off || [0, 0])], rep: s.rep || 'once',
+    turn: s.turn || 'random', seed: shuffle ? (Math.random() * 2 ** 31) | 0 : s.seed, added: [], removed: new Set(), addPts: [...(s.addPts || [])], remPts: [...(s.remPts || [])], regionVer: 0, mod };
+  applyRpSettings(s);
+  $('rlplace').dataset.kind = mod.type; $('rp-title').textContent = mod.type === 'scatter' ? `Change the scatter on ${t.name}` : `Change ${kids[0].name}`;
+  $('rlplace').hidden = false; $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = false; rpStatus('');
+  rp.pL = V().fromArray(s.pL); rp.nL = V().fromArray(s.nL); rp.right = V().fromArray(s.right);
+  t.updateMatrixWorld(true);
+  const W = q => q.clone().applyMatrix4(t.matrixWorld), near = q => gIn.boundsTree.closestPointToPoint(q)?.faceIndex ?? 0;
+  const regionAt = q => { const f = near(q), res = pickSurface(topoOf(t), t.matrixWorld.clone(), f, W(q), settings()); return res.err || !res.region?.length ? [f] : res.region; };
+  rp.seedTri = near(rp.pL);
+  { const res = pickSurface(topoOf(t), t.matrixWorld.clone(), rp.seedTri, W(rp.pL), settings()); rp.baseList = res.err || !res.region?.length ? null : res.region; }
+  rp.added = rp.addPts.map(a => regionAt(V().fromArray(a)));
+  for (const a of rp.remPts) regionAt(V().fromArray(a)).forEach(x => rp.removed.add(x));
+  rpRegion(); syncRpRows();
+  $('rp-note').textContent = mod.type === 'scatter' ? `Changing the scatter on ${t.name}. Shift-click faces in or out; click another face to start over there; then Done.`
+    : `Changing ${kids[0].name} on ${t.name}. Click elsewhere on the outlined faces to slide it there; then Done.`;
+  reliefReplace();
+}
+
+// ---- ooze & growths: organic strands strung between spots clicked on the parts
+/*
+ * Click spots on any parts, one after another, and an ooze is strung between them: drooping, lumpy, with pustules,
+ * drips and a splat where it sticks. It's a part of its own, fixed to the part it starts on; the spots are kept (on
+ * the parts they're on), so Change ooze… opens it again to add spots or change how it looks, and it follows those
+ * parts if they've moved.
+ */
+let oz = null;   // { m (the ooze part, once there is one), anchors: [{ part, pL, nL }], seed, before, running, again, marks }
+const OZ_IDS = ['oz-thick', 'oz-lumpy', 'oz-sag', 'oz-strands', 'oz-twist', 'oz-pust', 'oz-pustsize', 'oz-pustsurf', 'oz-drips', 'oz-driplen', 'oz-splat', 'oz-detail', 'oz-web', 'oz-webth', 'oz-webholes', 'oz-web-joint', 'oz-web-strand', 'oz-web-surf', 'oz-stretch', 'oz-threads', 'oz-threadth', 'oz-cell'];
+function oozeParams() {
+  const n = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
+  return { thick: Math.max(0.2, n('oz-thick', 1.2)), lumpy: Math.min(1, Math.max(0, n('oz-lumpy', 45) / 100)), sag: Math.min(1, Math.max(0, n('oz-sag', 35) / 100)),
+    strands: Math.round(Math.min(4, Math.max(1, n('oz-strands', 1)))), twist: Math.max(0, n('oz-twist', 1)), pustules: Math.max(0, n('oz-pust', 3)),
+    drips: Math.round(Math.max(0, n('oz-drips', 2))), dripLen: Math.max(0.2, n('oz-driplen', 3)), splat: Math.max(0, n('oz-splat', 2.5)), detail: Math.max(0.05, n('oz-detail', 0.2)),
+    pustSize: Math.max(0.1, n('oz-pustsize', 100) / 100), pustSurf: Math.round(Math.max(0, n('oz-pustsurf', 0))),
+    webJoint: $('oz-web-joint').checked, webStrand: $('oz-web-strand').checked, webSurf: $('oz-web-surf').checked,
+    web: Math.min(1, Math.max(0.05, n('oz-web', 50) / 100)), webTh: Math.max(0.1, n('oz-webth', 0.4)), webHoles: Math.min(0.95, Math.max(0, n('oz-webholes', 30) / 100)),
+    stretch: Math.min(0.95, Math.max(0, n('oz-stretch', 0) / 100)), threads: Math.round(Math.max(0, n('oz-threads', 0))), threadTh: Math.max(0.1, n('oz-threadth', 0.25)),
+    webStyle: document.querySelector('#oz-webstyle [aria-pressed="true"]')?.dataset.v || 'torn', cell: Math.max(0.3, n('oz-cell', 2.2)) };
+}
+function setOozeParams(q) {
+  const v = { 'oz-thick': q.thick, 'oz-lumpy': q.lumpy * 100, 'oz-sag': q.sag * 100, 'oz-strands': q.strands, 'oz-twist': q.twist, 'oz-pust': q.pustules, 'oz-drips': q.drips, 'oz-driplen': q.dripLen, 'oz-splat': q.splat, 'oz-detail': q.detail,
+    'oz-pustsize': (q.pustSize ?? 1) * 100, 'oz-pustsurf': q.pustSurf ?? 0, 'oz-web': (q.web ?? 0.5) * 100, 'oz-webth': q.webTh ?? 0.4, 'oz-webholes': (q.webHoles ?? 0.3) * 100,
+    'oz-stretch': (q.stretch ?? 0) * 100, 'oz-threads': q.threads ?? 0, 'oz-threadth': q.threadTh ?? 0.25, 'oz-cell': q.cell ?? 2.2 };
+  document.querySelectorAll('#oz-webstyle button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === (q.webStyle || 'torn'))));
+  for (const [id, x] of Object.entries(v)) if (x != null) $(id).value = +(+x).toFixed(3);
+  $('oz-web-joint').checked = !!q.webJoint; $('oz-web-strand').checked = !!q.webStrand; $('oz-web-surf').checked = !!q.webSurf; syncOozeRows();
+}
+const ozMarks = new THREE.Group(); scene.add(ozMarks);
+const ozMarkMat = new THREE.MeshBasicMaterial({ color: '#9be36b', depthTest: false, transparent: true, opacity: 0.9 });
+function oozeMarks() {
+  while (ozMarks.children.length) ozMarks.children.pop();
+  if (!oz) return;
+  const r = Math.max(0.25, (+$('oz-thick').value || 1.2) * 0.35);
+  for (const a of oozeWorld()) { const s = new THREE.Mesh(new THREE.SphereGeometry(r, 12, 8), ozMarkMat); s.position.fromArray(a.p); s.renderOrder = 999; ozMarks.add(s); }
+}
+/** The spots as they are now, in world space (each rides on its part). */
+function oozeWorld() {
+  const out = [];
+  for (const a of oz.anchors) { const m = partById(a.part); if (!m) continue; m.updateMatrixWorld(true);
+    out.push({ p: V().fromArray(a.pL).applyMatrix4(m.matrixWorld).toArray(), n: V().fromArray(a.nL).transformDirection(m.matrixWorld).normalize().toArray() }); }
+  return out;
+}
+function startOoze(m = null) {
+  endCrack(false); endReliefPlace(false); endOoze(false);
+  const kept = m?.userData.part.ooze;
+  oz = { m: kept ? m : null, anchors: kept ? JSON.parse(JSON.stringify(kept.anchors)) : [], seed: kept?.seed ?? ((Math.random() * 2 ** 31) | 0), before: snapshot() };
+  if (kept) setOozeParams(kept.params);
+  $('ooze').hidden = false; $('oz-title').textContent = kept ? `Change ${m.name}` : 'Ooze & growths';
+  $('oz-note').textContent = kept ? 'Click more spots to carry it on; change how it looks below; then Done.' : 'Click spots on the parts to string it between, one after another (two or more). Backspace takes the last one off.';
+  oozeStatus(''); oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2; syncGizmo();
+  if (kept) oozeRedo();
+}
+function endOoze(keep = true) {
+  if (!oz) return;
+  if (!keep) { restore(oz.before); afterHierarchyChange(); }
+  oz = null; $('ooze').hidden = true; oozeMarks(); syncGizmo();
+}
+function oozeStatus(t) { $('oz-status').textContent = t; $('oz-status').hidden = !t; }
+function oozeClick(hit) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  if (hit.object === oz.m) { toast('Click on a part to stick it to, not on the ooze itself.'); return; }
+  const t = hit.object; t.updateMatrixWorld(true);
+  const n = hitNormal(hit); if (n.dot(camera.position.clone().sub(hit.point)) < 0) n.negate();
+  const inv = t.matrixWorld.clone().invert();
+  oz.anchors.push({ part: t.uuid, pL: hit.point.clone().applyMatrix4(inv).toArray(), nL: n.clone().transformDirection(inv).toArray() });
+  oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2;
+  if (oz.anchors.length < 2) { oozeStatus('One spot. Click the next one to string it to.'); return; }
+  oozeRedo();
+}
+function oozeUndo() {
+  if (!oz?.anchors.length) return;
+  oz.anchors.pop(); oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2;
+  if (oz.anchors.length >= 2) oozeRedo();
+  else if (oz.m) { oz.m.visible = false; oozeStatus('Click another spot to string it to.'); }
+}
+function oozeRedo() {
+  if (!oz || oz.anchors.length < 2) return;
+  const me = oz; if (me.running) { me.again = true; return; }
+  me.running = true; $('oz-done').disabled = true;
+  applyOoze().catch(e => { console.warn(e); oozeStatus(`Couldn't make it: ${e.message || e}`); })
+    .finally(() => { me.running = false; if (oz !== me) return; $('oz-done').disabled = me.anchors.length < 2; if (me.again) { me.again = false; oozeRedo(); } });
+}
+async function applyOoze() {
+  const me = oz, anchors = oozeWorld(); if (anchors.length < 2) return;
+  oozeStatus(`Growing it between ${anchors.length} spots…`);
+  const q = oozeParams();
+  // pustules on the surfaces: spots found on each part round where it sticks (so none hang off an edge)
+  if (q.pustSurf > 0) {
+    const rc = new THREE.Raycaster(); rc.firstHitOnly = true;
+    me.anchors.forEach((an, i) => {
+      const part = partById(an.part), a = anchors[i]; if (!part || !a) return;
+      const rnd = mulberry(me.seed + 7919 * (i + 1)), n = V().fromArray(a.n), P = V().fromArray(a.p), want = Math.round(q.pustSurf * (0.6 + rnd() * 0.8)), surf = [];
+      let x = n.clone().cross(V(0, 0, 1)); if (x.lengthSq() < 1e-6) x = n.clone().cross(V(1, 0, 0)); x.normalize(); const y = n.clone().cross(x);
+      for (let k = 0; k < want * 6 && surf.length < want; k++) {
+        const ang = rnd() * 2 * Math.PI, rr = Math.max(q.thick * 0.6, q.splat) * (0.5 + rnd() * 1.1), o = P.clone().addScaledVector(x, Math.cos(ang) * rr).addScaledVector(y, Math.sin(ang) * rr);
+        rc.set(o.clone().addScaledVector(n, 3), n.clone().negate()); rc.far = 6; const h = rc.intersectObject(part, false)[0]; if (!h) continue;
+        const hn = hitNormal(h); if (hn.dot(n) < 0.3) continue;
+        surf.push({ p: h.point.toArray(), n: hn.toArray() });
+      }
+      a.surf = surf;
+    });
+  }
+  const r = await solidJob({ ooze: { ...q, anchors, down: [0, 0, -1], seed: me.seed } });
+  if (oz !== me) return;
+  let m = me.m;
+  if (!m) { m = addPart(liveParts().some(x => /^Ooze( \d+)?$/.test(x.name)) ? nextName('Ooze') : 'Ooze', geomFromSoup(r.positions), { welded: true, color: '#7d9a3e' }); me.m = m; }
+  else {
+    m.updateMatrixWorld(true); const inv = m.matrixWorld.clone().invert(), out = r.positions, v = V();       // into the ooze's own frame
+    for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(inv); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+    const g = geomFromSoup(out), pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m);
+  }
+  m.visible = true; afterHierarchyChange();
+  oozeStatus(`${anchors.length} spots · ${Math.round(m.userData.part.tris / 1000)}k triangles${r.edge > q.detail + 1e-6 ? ` · detail ${r.edge.toFixed(2)} mm (it's big, so a little coarser)` : ''}` +
+    (r.webTh && r.webTh > q.webTh + 1e-6 ? ` · webbing ${r.webTh.toFixed(2)} mm thick (as thin as this detail can show; a smaller Detail lets it be thinner)` : ''));
+}
+function syncOozeRows() {
+  const any = $('oz-web-joint').checked || $('oz-web-strand').checked || $('oz-web-surf').checked; document.querySelectorAll('#ooze .oz-webbed').forEach(e => { e.hidden = !any; });
+  document.querySelectorAll('#ooze .oz-net').forEach(e => { e.hidden = document.querySelector('#oz-webstyle [aria-pressed="true"]')?.dataset.v !== 'net'; });
+}
+// looks to start from
+const OOZE_LOOKS = {
+  ooze: { thick: 1.2, lumpy: 0.45, sag: 0.35, stretch: 0, strands: 1, twist: 1, pustules: 3, pustSize: 1, pustSurf: 0, drips: 2, dripLen: 3, splat: 2.5, detail: 0.2, threads: 0, threadTh: 0.25, webJoint: false, webStrand: false, webSurf: false, web: 0.5, webTh: 0.4, webHoles: 0.3, webStyle: 'torn', cell: 2.2 },
+  slime: { thick: 0.6, lumpy: 0.15, sag: 0.2, stretch: 0.8, strands: 1, twist: 0, pustules: 0, pustSize: 1, pustSurf: 0, drips: 1, dripLen: 2, splat: 1.4, detail: 0.12, threads: 3, threadTh: 0.22, webJoint: true, webStrand: false, webSurf: false, web: 0.9, webTh: 0.25, webHoles: 0.75, webStyle: 'net', cell: 2.2 },
+  growth: { thick: 2, lumpy: 0.9, sag: 0.15, stretch: 0, strands: 3, twist: 0.6, pustules: 8, pustSize: 1.4, pustSurf: 8, drips: 0, dripLen: 2, splat: 3.5, detail: 0.2, threads: 0, threadTh: 0.25, webJoint: false, webStrand: true, webSurf: true, web: 0.6, webTh: 0.4, webHoles: 0.2, webStyle: 'torn', cell: 2.2 },
+};
+function bindOoze() {
+  OZ_IDS.forEach(id => $(id).addEventListener('change', () => { syncOozeRows(); oozeMarks(); oozeRedo(); })); syncOozeRows();
+  document.querySelectorAll('#oz-webstyle button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#oz-webstyle button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncOozeRows(); oozeRedo(); }));
+  $('oz-preset').addEventListener('change', () => { const L = OOZE_LOOKS[$('oz-preset').value]; $('oz-preset').value = ''; if (!L) return; setOozeParams(L); oozeMarks(); oozeRedo(); });
+  $('oz-undo').addEventListener('click', oozeUndo);
+  $('oz-join').addEventListener('click', oozeJoinGrowths);
+  $('oz-shuffle').addEventListener('click', () => { if (!oz) return; oz.seed = (Math.random() * 2 ** 31) | 0; oozeRedo(); });
+  $('oz-done').addEventListener('click', () => {
+    if (!oz?.m || oz.running || oz.anchors.length < 2) return;
+    const m = oz.m, first = partById(oz.anchors[0].part);
+    m.userData.part.ooze = { anchors: JSON.parse(JSON.stringify(oz.anchors)), params: oozeParams(), seed: oz.seed };
+    if (first && m.parent !== first) { detach(m); first.attach(m); }         // it rides on the part it starts from
+    pushUndo(oz.before); endOoze(true); afterHierarchyChange(); select(m);
+    toast(`${m.name} is on, fixed to ${first?.name || 'the bench'}. Change ooze… in its Properties opens it again.`, 'ok');
+  });
+  $('oz-cancel').addEventListener('click', () => { endOoze(false); toast('No ooze.'); });
+}
+
+// ---- crack & cave in
+/*
+ * A part made to look punched: click where it got hit, and round that spot it's cracked into slabs (rings round the
+ * hit, cracks running out), each slab tipped and pushed in, deepest in the middle, with hairline cracks running on
+ * past the edge. Worked out in the background from the part as it was, so every change starts afresh; Done keeps it
+ * (one Undo takes it back), Cancel puts the part back as it was.
+ */
+let dm = null;     // { m, g0 (its mesh before), pL / nL (the hit and its normal, in the part's frame), right, thick, seed, before, running, again }
+function startCrack(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part to crack first, then Crack & cave in.', 'bad'); return; }
+  endCrack(false); endReliefPlace(false); if (typeof endBurst === 'function') endBurst(false);
+  dm = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: (Math.random() * 2 ** 31) | 0 };
+  $('dmg').hidden = false; $('dm-ctl').hidden = $('dm-done').hidden = true; dmStatus(''); syncGizmo();
+  $('dm-note').textContent = `Click where ${m.name} got hit.`;
+  syncDmRows();
+}
+function endCrack(keep = true) {
+  if (!dm) return;
+  if (!keep && dm.pL) { restore(dm.before); afterHierarchyChange(); }
+  dm = null; $('dmg').hidden = true; syncGizmo();
+}
+function dmStatus(t) { $('dm-status').textContent = t; $('dm-status').hidden = !t; }
+function syncDmRows() {
+  const surf = document.querySelector('#dm-goes [aria-pressed="true"]')?.dataset.v === 'surface';
+  document.querySelectorAll('#dmg .dm-thru').forEach(e => { e.hidden = surf; });
+  document.querySelectorAll('#dmg .dm-surf').forEach(e => { e.hidden = !surf; });
+  if (!surf) document.querySelectorAll('#dmg .dm-held').forEach(e => { e.hidden = $('dm-through').checked; });
+}
+function crackClick(hit, ev) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  const m = hit.object;
+  if (m !== dm.m) {                                             // another part: that one gets it instead
+    if (dm.pL) { restore(dm.before); afterHierarchyChange(); }
+    dm = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: dm.seed };
+  }
+  // the hit as it is on the part before any cracking (the preview's slabs have moved)
+  m.updateMatrixWorld(true);
+  const cur = m.geometry; m.geometry = dm.g0;
+  let h = hit;
+  if (cur !== dm.g0 && ev) { const b = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster(); rc.setFromCamera(new THREE.Vector2(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1), camera); h = rc.intersectObject(m, false)[0] || hit; }
+  const n = hitNormal(h); if (n.dot(camera.position.clone().sub(h.point)) < 0) n.negate();
+  // how thick the part is there: straight in to its back
+  const rc = new THREE.Raycaster(); rc.firstHitOnly = true; rc.set(h.point.clone().addScaledVector(n, -1e-3), n.clone().negate()); const back = rc.intersectObject(m, false)[0];
+  m.geometry = cur;
+  const inv = m.matrixWorld.clone().invert();
+  dm.pL = h.point.clone().applyMatrix4(inv); dm.nL = n.clone().transformDirection(inv); dm.thick = back ? back.distance + 1e-3 : 2;
+  dm.right = V(1, 0, 0).applyQuaternion(camera.quaternion);
+  $('dm-ctl').hidden = $('dm-done').hidden = false;
+  $('dm-note').textContent = `Hit on ${m.name} (${dm.thick.toFixed(2)} mm thick there). Click elsewhere to hit it there instead; Shuffle for new cracks; then Done.`;
+  crackRedo();
+}
+function crackRedo() {
+  if (!dm?.pL) return;
+  const me = dm; if (me.running) { me.again = true; return; }
+  me.running = true;
+  applyCrack().catch(e => { console.warn(e); dmStatus(`Couldn't crack it: ${e.message || e}`); })
+    .finally(() => { me.running = false; if (dm !== me) return; if (me.again) { me.again = false; crackRedo(); } else if (me.finish) $('dm-done').click(); });
+}
+function crackCardParams(seed) {
+  const num = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
+  return { radius: Math.max(0.3, num('dm-r', 5)), depth: Math.max(0, num('dm-d', 1)), rings: Math.round(num('dm-rings', 3)), cracks: Math.round(num('dm-cracks', 7)),
+    width: Math.max(0.02, num('dm-w', 0.25)), jag: Math.min(1, Math.max(0, num('dm-jag', 60) / 100)), tumble: Math.max(0, num('dm-tum', 8)), spider: Math.max(0, num('dm-sp', 60) / 100),
+    hole: document.querySelector('#dm-mid [aria-pressed="true"]')?.dataset.v === 'hole', core: Math.min(0.8, Math.max(0, num('dm-core', 25) / 100)),
+    through: $('dm-through').checked, skin: Math.max(0.02, num('dm-skin', 0.4)), seed,
+    surface: document.querySelector('#dm-goes [aria-pressed="true"]')?.dataset.v === 'surface', crackDepth: Math.max(0.05, num('dm-cdepth', 1)), effectDepth: Math.max(0.05, num('dm-edepth', 0.6)) };
+}
+const dmHit = me => ({ pL: me.pL.toArray(), nL: me.nL.toArray(), right: me.right.toArray(), thick: me.thick });
+async function applyCrack() {
+  const me = dm, m = me.m, p = crackCardParams(me.seed);
+  dmStatus(`Cracking ${Math.round((me.g0.index ? me.g0.index.count : me.g0.attributes.position.count) / 3 / 1000)}k triangles…`);
+  const r = await crackGeometry(m, me.g0, dmHit(me), p);
+  if (dm !== me) return;
+  const g = r.geometry, pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null;
+  refreshPaint(m); afterHierarchyChange();
+  dmStatus(`${r.slabs} slab${r.slabs === 1 ? '' : 's'}` + (p.surface ? `, a ${p.effectDepth} mm layer at the surface, cracks up to ${p.crackDepth} mm deep` : p.through ? `, broken right through: ${r.shells} separate piece${r.shells === 1 ? '' : 's'}` : ', held together at the back') + ` · ${Math.round(pt.tris / 1000)}k triangles`);
+}
+function bindCrack() {
+  const re = () => crackRedo();
+  ['dm-r', 'dm-d', 'dm-rings', 'dm-cracks', 'dm-w', 'dm-jag', 'dm-tum', 'dm-sp', 'dm-core', 'dm-skin'].forEach(id => $(id).addEventListener('change', re));
+  $('dm-through').addEventListener('change', () => { syncDmRows(); re(); });
+  ['dm-cdepth', 'dm-edepth'].forEach(id => $(id).addEventListener('change', re));
+  document.querySelectorAll('#dm-goes button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#dm-goes button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncDmRows(); re(); }));
+  document.querySelectorAll('#dm-mid button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#dm-mid button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); re(); }));
+  $('dm-shuffle').addEventListener('click', () => { if (!dm) return; dm.seed = (Math.random() * 2 ** 31) | 0; re(); });
+  // Done: it goes on the part as a Crack modifier, to turn off, change or apply later
+  $('dm-done').addEventListener('click', () => { if (!dm?.pL) return; if (dm.running) { dm.finish = true; dmStatus('Finishing it off…'); return; }
+    const m = dm.m, mods = ensureStack(m, dm.g0, dm.gk0), mod = { id: newModId(), type: 'crack', name: MOD_NAMES.crack, on: true, p: crackCardParams(dm.seed), hit: dmHit(dm) };
+    mods.push(mod); modCache.set(m.uuid + ':' + mod.id, { inG: dm.g0, key: modKey(m, mod), out: m.geometry });
+    pushUndo(dm.before); endCrack(true); select(m); evalStack(m);
+    toast(`${m.name} is cracked and caved in, as a modifier: turn it off, change it or Apply it in Properties › Modifiers.`, 'ok'); });
+  $('dm-cancel').addEventListener('click', () => { endCrack(false); toast('Left it as it was.'); });
+}
+
+// ---- burst & growth
+/*
+ * A growth bursting out of a part: click where it comes out, and round that spot the hull is swollen, torn open in a
+ * jagged hole with the plate round it peeled back in petals, and a lumpy, ringed growth with pustules, pock holes
+ * and horns swells out of it. Worked out in the background from the part as it was; Done keeps it as a modifier.
+ */
+let bz = null;     // { m, g0, gk0, pL, nL, right, thick, seed, before, running, again }
+const BZ_IDS = ['bz-sr', 'bz-depth', 'bz-warp', 'bz-push', 'bz-preach', 'bz-pnoise', 'bz-r', 'bz-swell', 'bz-reach', 'bz-tear', 'bz-petals', 'bz-peel', 'bz-jag', 'bz-plate', 'bz-grow', 'bz-h', 'bz-lumps', 'bz-ridges', 'bz-pust', 'bz-pocks', 'bz-horns', 'bz-hlen', 'bz-curl', 'bz-detail'];
+const BZ_LOOKS = {
+  burst: { swell: 1.5, reach: 200, tear: true, petals: 6, peel: 40, jag: 65, grow: 85, h: 1, lumps: 60, ridges: 60, pust: 12, pocks: 5, horns: 6, hlen: 0.8, curl: 60 },
+  boil: { swell: 3, reach: 220, tear: false, petals: 6, peel: 0, jag: 50, grow: 0, h: 0.5, lumps: 40, ridges: 0, pust: 0, pocks: 0, horns: 0, hlen: 0.6, curl: 20 },
+  over: { swell: 2, reach: 260, tear: true, petals: 8, peel: 60, jag: 80, grow: 140, h: 1.4, lumps: 85, ridges: 75, pust: 30, pocks: 9, horns: 12, hlen: 1, curl: 75 },
+  torn: { swell: 0.8, reach: 170, tear: true, petals: 7, peel: 55, jag: 85, grow: 45, h: 0.5, lumps: 50, ridges: 30, pust: 6, pocks: 0, horns: 2, hlen: 0.5, curl: 30 },
+};
+function startBurst(m = selected) {
+  if (!m || !isPart(m)) { toast('Select the part it bursts out of first, then Burst & growth.', 'bad'); return; }
+  endCrack(false); endReliefPlace(false); endBurst(false);
+  bz = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: (Math.random() * 2 ** 31) | 0 };
+  $('burst').hidden = false; $('bz-ctl').hidden = $('bz-done').hidden = true; bzStatus(''); syncGizmo();
+  $('bz-note').textContent = `Click where it bursts out of ${m.name}. With Sphere inside, click the surface over where the ball goes.`; syncBzRows();
+}
+function endBurst(keep = true) {
+  if (!bz) return;
+  bzSphereMark(false);
+  if (!keep && bz.pL) { restore(bz.before); afterHierarchyChange(); }
+  bz = null; $('burst').hidden = true; syncGizmo();
+}
+/** The ball, shown see-through where it sits inside the part (and its reach, fainter), while placing from a sphere. */
+let bzBall = null;
+function bzSphereMark(on) {
+  if (!on || !bz?.pL) { if (bzBall) { scene.remove(bzBall); bzBall.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); }); bzBall = null; } return; }
+  const m = bz.m; m.updateMatrixWorld(true);
+  const P = bz.pL.clone().applyMatrix4(m.matrixWorld), N = bz.nL.clone().transformDirection(m.matrixWorld).normalize(), q = burstParams(bz.seed);
+  if (!bzBall) {
+    bzBall = new THREE.Group(); bzBall.renderOrder = 5;
+    const mk = (op, col) => new THREE.Mesh(new THREE.SphereGeometry(1, 40, 24), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: op, depthTest: false, depthWrite: false }));
+    bzBall.add(mk(0.28, 0xd6a24a), mk(0.07, 0xd6a24a)); scene.add(bzBall);
+  }
+  bzBall.position.copy(P).addScaledVector(N, -q.depth);
+  bzBall.children[0].scale.setScalar(q.sr); bzBall.children[1].scale.setScalar(q.warp ? q.sr * q.preach : 0.001);
+}
+function bzStatus(t) { $('bz-status').textContent = t; $('bz-status').hidden = !t; }
+const bzFrom = () => document.querySelector('#bz-from [aria-pressed="true"]')?.dataset.v || 'surface';
+function syncBzRows() {
+  const sph = bzFrom() === 'sphere';
+  document.querySelectorAll('#burst .bz-surf').forEach(e => { e.hidden = sph; });
+  document.querySelectorAll('#burst .bz-sph').forEach(e => { e.hidden = !sph; });
+  if (sph) document.querySelectorAll('#burst .bz-w').forEach(e => { e.hidden = !$('bz-warp').checked; });
+  bzSphereMark(sph);
+  document.querySelectorAll('#burst .bz-torn').forEach(e => { e.hidden = !$('bz-tear').checked; });
+  document.querySelectorAll('#burst .bz-g').forEach(e => { e.hidden = !(+$('bz-grow').value > 0); });
+}
+function burstClick(hit, ev) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  const m = hit.object;
+  if (m !== bz.m) { if (bz.pL) { restore(bz.before); afterHierarchyChange(); } bz = { m, g0: m.geometry, gk0: m.userData.part.geomKey, before: snapshot(), seed: bz.seed }; }
+  m.updateMatrixWorld(true);
+  const cur = m.geometry; m.geometry = bz.g0;
+  let h = hit;
+  if (cur !== bz.g0 && ev) { const b = renderer.domElement.getBoundingClientRect(), rc = new THREE.Raycaster(); rc.setFromCamera(new THREE.Vector2(((ev.clientX - b.left) / b.width) * 2 - 1, -((ev.clientY - b.top) / b.height) * 2 + 1), camera); h = rc.intersectObject(m, false)[0] || hit; }
+  // the surface's way out there: averaged over a patch, so a rivet or a panel line doesn't tip it
+  let n = hitNormal(h); if (n.dot(camera.position.clone().sub(h.point)) < 0) n.negate();
+  const avg = surfNormalNear(m, h.point, Math.max(1, +$('bz-r').value * 0.6 || 3), n); if (avg && avg.dot(n) > 0.3) n = avg;
+  const rc = new THREE.Raycaster(); rc.firstHitOnly = true; rc.set(h.point.clone().addScaledVector(n, -1e-3), n.clone().negate()); const back = rc.intersectObject(m, false)[0];
+  m.geometry = cur;
+  const inv = m.matrixWorld.clone().invert();
+  bz.pL = h.point.clone().applyMatrix4(inv); bz.nL = n.clone().transformDirection(inv); bz.thick = back ? back.distance + 1e-3 : 2;
+  bz.right = V(1, 0, 0).applyQuaternion(camera.quaternion);
+  // a first radius that suits the part, if it's never been set
+  if (!bz.sized && !$('bz-r').dataset.touched) { const s = exactBox(m).getSize(V()), r = Math.max(1, Math.min(40, Math.round(Math.min(s.x, s.y, s.z) > 0 ? Math.max(s.x, s.y, s.z) * 0.08 : 6))); $('bz-r').value = r; $('bz-h').value = +(r * +($('bz-h').dataset.k || 1)).toFixed(1); $('bz-hlen').value = +(r * +($('bz-hlen').dataset.k || 0.8)).toFixed(1); bz.sized = true; }
+  $('bz-ctl').hidden = $('bz-done').hidden = false; syncBzRows();
+  if (!bz.sized2 && !$('bz-sr').dataset.touched) { const r = +$('bz-r').value || 6; $('bz-sr').value = +(r * 1.3).toFixed(1); $('bz-depth').value = +(r * 0.6).toFixed(1); $('bz-push').value = +(r * 0.4).toFixed(1); bz.sized2 = true; }
+  syncBzRows();
+  $('bz-note').textContent = bzFrom() === 'sphere' ? `Sphere under ${m.name} (${bz.thick.toFixed(2)} mm thick there). Set its size and depth; click elsewhere to move it; Shuffle for a new one; then Done.`
+    : `Bursting out of ${m.name} (${bz.thick.toFixed(2)} mm thick there). Click elsewhere to move it; Shuffle for a new one; then Done.`;
+  burstRedo();
+}
+function burstRedo() {
+  if (!bz?.pL) return;
+  const me = bz; if (me.running) { me.again = true; return; }
+  me.running = true;
+  applyBurst().catch(e => { console.warn(e); bzStatus(`Couldn't burst it: ${e.message || e}`); })
+    .finally(() => { me.running = false; if (bz !== me) return; if (me.again) { me.again = false; burstRedo(); } else if (me.finish) burstDone(); });
+}
+function burstParams(seed) {
+  const num = (id, d) => { const x = +$(id).value; return isFinite(x) ? x : d; };
+  return { radius: Math.max(0.3, num('bz-r', 6)), swell: Math.max(0, num('bz-swell', 1.5)), reach: Math.max(1.1, num('bz-reach', 200) / 100), tear: $('bz-tear').checked,
+    petals: Math.round(num('bz-petals', 6)), peel: Math.max(0, num('bz-peel', 40)), jag: Math.min(1, Math.max(0, num('bz-jag', 65) / 100)), plate: Math.max(0.2, num('bz-plate', 1.5)),
+    grow: Math.max(0, num('bz-grow', 85) / 100), height: Math.max(0.2, num('bz-h', 6)), lumps: Math.min(1, Math.max(0, num('bz-lumps', 60) / 100)), ridges: Math.min(1, Math.max(0, num('bz-ridges', 60) / 100)),
+    pustules: Math.round(num('bz-pust', 12)), pocks: Math.round(num('bz-pocks', 5)), horns: Math.round(num('bz-horns', 6)), hornLen: Math.max(0.5, num('bz-hlen', 5)), curl: Math.min(1, Math.max(0, num('bz-curl', 40) / 100)),
+    detail: Math.max(0.08, num('bz-detail', 0.25)), seed,
+    from: bzFrom(), sr: Math.max(0.3, num('bz-sr', 8)), depth: num('bz-depth', 4), warp: $('bz-warp').checked, push: Math.max(0, num('bz-push', 3)), preach: Math.max(1.1, num('bz-preach', 220) / 100), pnoise: Math.max(0, num('bz-pnoise', 35) / 100) };
+}
+function setBurstParams(q) {
+  const set = (id, v) => { if (v !== undefined) $(id).value = v; };
+  set('bz-r', q.radius); set('bz-swell', q.swell); set('bz-reach', q.reach !== undefined ? Math.round(q.reach * 100) : undefined); if (q.tear !== undefined) $('bz-tear').checked = q.tear;
+  set('bz-petals', q.petals); set('bz-peel', q.peel); set('bz-jag', q.jag !== undefined ? Math.round(q.jag * 100) : undefined); set('bz-plate', q.plate);
+  set('bz-grow', q.grow !== undefined ? Math.round(q.grow * 100) : undefined); set('bz-h', q.height); set('bz-lumps', q.lumps !== undefined ? Math.round(q.lumps * 100) : undefined);
+  set('bz-ridges', q.ridges !== undefined ? Math.round(q.ridges * 100) : undefined); set('bz-pust', q.pustules); set('bz-pocks', q.pocks); set('bz-horns', q.horns); set('bz-hlen', q.hornLen);
+  set('bz-curl', q.curl !== undefined ? Math.round(q.curl * 100) : undefined); set('bz-detail', q.detail);
+  set('bz-sr', q.sr); set('bz-depth', q.depth); if (q.warp !== undefined) $('bz-warp').checked = q.warp; set('bz-push', q.push); set('bz-preach', q.preach !== undefined ? Math.round(q.preach * 100) : undefined); set('bz-pnoise', q.pnoise !== undefined ? Math.round(q.pnoise * 100) : undefined);
+  if (q.from) document.querySelectorAll('#bz-from button').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.v === q.from)));
+  syncBzRows();
+}
+const bzHit = me => ({ pL: me.pL.toArray(), nL: me.nL.toArray(), right: me.right.toArray(), thick: me.thick });
+/** Burst a mesh (the part's g) where hit, worked out in the hit's own frame like a crack. */
+async function burstGeometry(m, g, hit, p) {
+  m.updateMatrixWorld(true);
+  const P = V().fromArray(hit.pL).applyMatrix4(m.matrixWorld), N = V().fromArray(hit.nL).transformDirection(m.matrixWorld).normalize();
+  let X = V().fromArray(hit.right).projectOnPlane(N); if (X.lengthSq() < 1e-6) X = (Math.abs(N.z) < 0.9 ? V(0, 0, 1) : V(1, 0, 0)).cross(N); X.normalize();
+  const Y = N.clone().cross(X).normalize(), F = new THREE.Matrix4().makeBasis(X, Y, N).setPosition(P);
+  // the burst works in mm: a scaled part is taken into the frame at its real size, and back again
+  const soup = soupOfGeom(g, F.clone().invert().multiply(m.matrixWorld));
+  const r = await solidJob({ burst: { ...p, soup, thick: hit.thick } });
+  if (!r.positions.length) throw new Error('that left nothing of it');
+  const back = m.matrixWorld.clone().invert().multiply(F), out = r.positions, v = V();
+  for (let i = 0; i < out.length; i += 3) { v.set(out[i], out[i + 1], out[i + 2]).applyMatrix4(back); out[i] = v.x; out[i + 1] = v.y; out[i + 2] = v.z; }
+  return { geometry: geomFromSoup(out), stats: r.stats };
+}
+async function applyBurst() {
+  const me = bz, m = me.m, p = burstParams(me.seed);
+  bzStatus(`Bursting it open… (${Math.round((me.g0.index ? me.g0.index.count : me.g0.attributes.position.count) / 3 / 1000)}k triangles)`);
+  const r = await burstGeometry(m, me.g0, bzHit(me), p);
+  if (bz !== me) return;
+  const g = r.geometry, pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null;
+  refreshPaint(m); afterHierarchyChange();
+  const st = r.stats, bits = [];
+  if (p.tear && st.petals) bits.push(`${st.petals} petal${st.petals === 1 ? '' : 's'} peeled back`);
+  if (p.grow > 0 && (st.horns || st.pustules || st.pocks)) bits.push(`${st.horns} horn${st.horns === 1 ? '' : 's'}, ${st.pustules} pustule${st.pustules === 1 ? '' : 's'}, ${st.pocks} pock hole${st.pocks === 1 ? '' : 's'}`);
+  const sph = p.from === 'sphere', through = !sph || p.depth < p.sr * 0.98;
+  if (sph && !through) bits.length = 0;
+  bzStatus((bits.join(' · ') || (sph ? (through ? 'Broken through' : `Pushed out from inside (the ball's ${(p.depth - p.sr).toFixed(1)} mm short of the surface, so it doesn't break through)`) : 'Swollen')) + ` · ${Math.round(pt.tris / 1000)}k triangles`);
+}
+function bindBurst() {
+  const re = () => burstRedo();
+  BZ_IDS.forEach(id => $(id).addEventListener('change', () => { syncBzRows(); re(); }));
+  $('bz-r').addEventListener('input', () => { $('bz-r').dataset.touched = '1'; });
+  $('bz-sr').addEventListener('input', () => { $('bz-sr').dataset.touched = '1'; });
+  document.querySelectorAll('#bz-from button').forEach(b => b.addEventListener('click', () => { document.querySelectorAll('#bz-from button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); syncBzRows(); re(); }));
+  $('bz-look').addEventListener('change', () => { const L = BZ_LOOKS[$('bz-look').value]; $('bz-look').value = ''; if (!L) return;
+    const r = +$('bz-r').value || 6; setBurstParams({ swell: L.swell, reach: L.reach / 100, tear: L.tear, petals: L.petals, peel: L.peel, jag: L.jag / 100, grow: L.grow / 100, height: +(L.h * r).toFixed(1), lumps: L.lumps / 100, ridges: L.ridges / 100, pustules: L.pust, pocks: L.pocks, horns: L.horns, hornLen: +(L.hlen * r).toFixed(1), curl: L.curl / 100 }); re(); });
+  $('bz-shuffle').addEventListener('click', () => { if (!bz) return; bz.seed = (Math.random() * 2 ** 31) | 0; re(); });
+  $('bz-done').addEventListener('click', () => { if (!bz?.pL) return; if (bz.running) { bz.finish = true; bzStatus('Finishing it off…'); return; } burstDone(); });
+  $('bz-cancel').addEventListener('click', () => { endBurst(false); toast('Left it as it was.'); });
+}
+/** Keep it: it goes on the part as a modifier (a change still being worked out finishes first: see burstRedo). */
+function burstDone() {
+  if (!bz?.pL || bz.running) return;
+  { const m = bz.m, mods = ensureStack(m, bz.g0, bz.gk0), mod = { id: newModId(), type: 'burst', name: MOD_NAMES.burst, on: true, p: burstParams(bz.seed), hit: bzHit(bz) };
+    mods.push(mod); modCache.set(m.uuid + ':' + mod.id, { inG: bz.g0, key: modKey(m, mod), out: m.geometry });
+    pushUndo(bz.before); endBurst(true); select(m); evalStack(m);
+    toast(`${m.name} has burst open, as a modifier: turn it off, change it or Apply it in Properties › Modifiers. Burst again for more.`, 'ok'); }
+}
+
+// ---- basic shapes: cube, sphere, pyramid, cylinder
+/*
+ * Plain shapes to build with: a part like any other (snap it, cut magnet holes in it, crack it…), made to the size
+ * you set. Its origin is the middle of its base, so it sits on the mat. Until it has modifiers, its size and sides
+ * can be changed in Properties and it's made again.
+ */
+const SHAPES = {
+  cube: { name: 'Cube', w: 20, d: 20, h: 20 },
+  sphere: { name: 'Sphere', w: 20, d: 20, h: 20, seg: 48 },
+  pyramid: { name: 'Pyramid', w: 20, d: 20, h: 20, sides: 4 },
+  cylinder: { name: 'Cylinder', w: 20, d: 20, h: 20, sides: 48 },
+};
+function shapeGeometry(q) {
+  const { w, d, h } = q; let g;
+  const ring = (n, tall, top) => {     // a prism / pyramid of n sides, flats square to x and y where they can be
+    const r = n < 12 ? 0.5 / Math.cos(Math.PI / n) : 0.5, start = n % 2 === 0 ? Math.PI / n : Math.PI / 2;
+    return new THREE.CylinderGeometry(top * r, r, 1, n, 1, false, start);
+  };
+  if (q.kind === 'cube') g = new THREE.BoxGeometry(1, 1, 1);
+  else if (q.kind === 'sphere') { const n = Math.max(8, Math.round(q.seg || 48)); g = new THREE.SphereGeometry(0.5, n, Math.max(4, Math.round(n / 2))); g.rotateX(Math.PI / 2); }
+  else if (q.kind === 'pyramid') { g = ring(Math.max(3, Math.round(q.sides || 4)), 1, 0); g.rotateX(Math.PI / 2); }
+  else { g = ring(Math.max(3, Math.round(q.sides || 48)), 1, 1); g.rotateX(Math.PI / 2); }
+  g.scale(w, d, h); g.translate(0, 0, h / 2);
+  return g;
+}
+function addShape(kind) {
+  closeDialogs();
+  const q = { kind, ...SHAPES[kind] }; delete q.name;
+  // sized to what's selected (a quarter of it), else the defaults
+  if (selected?.userData.part?.prim) { const o = selected.userData.part.prim; q.w = o.w; q.d = o.d; q.h = o.h; }
+  else if (selected) { const s = exactBox(selected).getSize(V()), k = Math.min(40, Math.max(5, Math.round(Math.max(s.x, s.y, s.z) * 0.25))); q.w = q.d = q.h = k; }
+  pushUndo();
+  const nm = SHAPES[kind].name, name = liveParts().some(x => x.name === nm) ? nextName(nm) : nm;
+  const m = addPart(name, shapeGeometry(q), {});
+  m.userData.part.prim = q;
+  // beside the selected part, on the mat
+  if (selected && selected !== m) { const b = exactBox(selected); m.position.copy(world.worldToLocal(V(b.max.x + 5 + q.w / 2, (b.min.y + b.max.y) / 2, 0))); }
+  afterHierarchyChange(); select(m); setTool('move');
+  toast(`Added a ${nm.toLowerCase()}: move it into place, and set its size in Properties.`, 'ok');
+}
+function remakeShape(m) {
+  const pt = m.userData.part, q = pt.prim; if (!q || pt.mods?.length) return;
+  const g0 = shapeGeometry(q); g0.deleteAttribute('normal'); g0.deleteAttribute('uv');
+  const g = weldGeometry(g0); g.computeBoundingBox(); g.computeBoundsTree();
+  m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m);
+}
+function shapeRows(p, el) {
+  const pt = p.userData.part, q = pt.prim; if (!q) return;
+  const box = document.createElement('div'); box.className = 'mods'; el.append(box);
+  const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = SHAPES[q.kind]?.name || 'Shape'; box.append(h);
+  if (pt.mods?.length) { const n = document.createElement('p'); n.className = 'note'; n.textContent = 'It has modifiers now, so its size is fixed: remove them to change it.'; box.append(n); return; }
+  const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
+  const num = (label, key, step, min, max, title = '') => {
+    const l = document.createElement('label'); l.textContent = label; if (title) l.title = title;
+    const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = q[key];
+    n.addEventListener('change', () => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); if (['sides', 'seg'].includes(key)) v = Math.round(v); pushUndo(); q[key] = v; remakeShape(p); afterHierarchyChange(); });
+    grid.append(l, n);
+  };
+  num(q.kind === 'cube' ? 'Width mm' : 'Across mm', 'w', 0.5, 0.2, 500); num('Depth mm', 'd', 0.5, 0.2, 500); num('Height mm', 'h', 0.5, 0.2, 500);
+  if (q.kind === 'pyramid') num('Sides', 'sides', 1, 3, 96, '3 for a triangular pyramid, 4 square, more and it becomes a cone');
+  if (q.kind === 'cylinder') num('Sides', 'sides', 1, 3, 128, '6 for a hex prism, 8 an octagon; more is rounder');
+  if (q.kind === 'sphere') num('Smoothness', 'seg', 4, 8, 128, 'Segments round it: more is smoother');
+}
+
+// ---- growths that push the parts round them out of the way
+/*
+ * A growth is a part (a lumpy ball made for you, or any part you choose: a sculpted growth you imported, say) that
+ * you place and move like any other, fixed to the part you put it on. Every part round it is pushed out of its way,
+ * as if it had swollen up between them: each gets a "Pushed by" modifier, kept up to date whenever anything moves.
+ * Its room is a sphere for a ball, or the ellipsoid that fits a shape; the push is fullest at its skin and dies
+ * away by its reach.
+ */
+const GROW_DEFAULT = { kind: 'ball', mode: 'away', r: 8, reach: 2.6, sink: 0.12, strength: 0.5, noise: 0.3, fit: 0.8, lumps: 0.6, ridges: 0.6, pustules: 16, pocks: 6, horns: 0, hornPct: 0.6, curl: 0.6, detail: 0.25 };   // no horns unless asked; their length goes with the ball's size
+let gp = null;                                    // placing a new growth: the next click says where
+function startGrowth() {
+  endCrack(false); endBurst(false); endReliefPlace(false); endGrowPlace();
+  setTimeout(syncGizmo); gp = { size: selected ? Math.max(2, Math.round(Math.max(...exactBox(selected).getSize(V()).toArray()) * 0.12)) : 8 };
+  toast('Click where the growth goes (on any part: it goes with that part). Then move it and size it like any part.');
+}
+function endGrowPlace() { if (!gp) return; gp = null; syncGizmo(); }
+async function growClick(hit) {
+  if (!hit) { toast('Click a spot on a part.'); return; }
+  const on = hit.object, at = hit.point.clone(), q = { ...GROW_DEFAULT, r: gp.size, seed: (Math.random() * 2 ** 31) | 0, draft: true };
+  endGrowPlace(); pushUndo();
+  // an outline first: quick to move and size; it's made and pushes the parts only when you say Grow it
+  const m = addPart(liveParts().some(x => /^Growth( \d+)?$/.test(x.name)) ? nextName('Growth') : 'Growth', draftGeom(q.r), { color: '#9b4a5a' });
+  m.position.copy(world.worldToLocal(at)); m.userData.part.grower = q; styleDraft(m, true);
+  m.updateMatrixWorld(true); on.attach(m);                            // it goes where that part goes
+  afterHierarchyChange(); select(m); setTool('move');
+  toast(`An outline of where the growth goes, on ${on.name}: drag it into place, size it ([ and ] or in Properties), then Grow it.`, 'ok');
+}
+async function growBallGeometry(q) {
+  const r = await solidJob({ growball: { r: q.r, lumps: q.lumps, ridges: q.ridges, pustules: q.pustules, pocks: q.pocks, horns: q.horns ?? 0, hornPct: q.hornPct ?? (q.hornLen ? q.hornLen / q.r : 0.6), curl: q.curl, detail: q.detail, seed: q.seed } });
+  return geomFromSoup(r.positions);
+}
+/** Turn a part into a growth (its own mesh stays: its room is the ellipsoid that fits it). Starts as an outline too. */
+function makeGrower(m) {
+  pushUndo(); m.userData.part.grower = { ...GROW_DEFAULT, kind: 'shape', seed: (Math.random() * 2 ** 31) | 0, draft: true }; styleDraft(m, true);
+  afterHierarchyChange(); toast(`${m.name} is a growth, as an outline for now: put it in place, then Grow it to push the parts round it aside.`, 'ok');
+}
+/** The outline's mesh: a plain ball, cheap to remake as it's sized. */
+function draftGeom(r) { const g = new THREE.IcosahedronGeometry(r * 0.85, 3); g.deleteAttribute('normal'); g.deleteAttribute('uv'); return g; }
+/**
+ * A growth as an outline: see-through, with its room drawn as a wire ball (an ellipsoid for a shape) and its
+ * reach as a fainter one, so you can see what it will push and how far. Off: back to solid, the outlines gone.
+ */
+function styleDraft(m, on) {
+  const mat = m.material, q = m.userData.part.grower;
+  for (const c of [...m.children]) if (c.userData.growOutline) { m.remove(c); c.geometry.dispose(); c.material.dispose(); }
+  mat.transparent = on; mat.opacity = on ? 0.3 : 1; mat.depthWrite = !on; mat.needsUpdate = true;
+  if (!on || !q) return;
+  m.updateMatrixWorld(true);
+  const room = growRoom(m), local = m.matrixWorld.clone().invert().multiply(room);          // the unit ball, in the part's own frame
+  const wire = (rr, op) => { const l = new THREE.LineSegments(new THREE.WireframeGeometry(new THREE.SphereGeometry(rr, 24, 14)), new THREE.LineBasicMaterial({ color: 0xd6a24a, transparent: true, opacity: op, depthTest: false }));
+    l.applyMatrix4(local); l.userData.growOutline = true; l.renderOrder = 6; l.raycast = () => {}; m.add(l); };
+  wire(1, 0.9); wire(q.reach || 2.6, 0.18);
+}
+/** Make it for real: the growth made, and the parts round it pushed aside. */
+async function growIt(m) {
+  const q = m.userData.part.grower; if (!q?.draft) return;
+  pushUndo(); toast(q.kind === 'ball' ? 'Growing it and pushing the parts aside…' : 'Pushing the parts aside…');
+  if (q.kind === 'ball') { const g = await growBallGeometry(q), pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m); }
+  q.draft = false; styleDraft(m, false); afterHierarchyChange();
+}
+/** Back to an outline, to move and size it quickly again (the parts go back as they were until it's grown again). */
+function toDraft(m) {
+  const q = m.userData.part.grower; if (!q || q.draft) return;
+  pushUndo(); q.draft = true;
+  if (q.kind === 'ball') { const g = weldGeometry(draftGeom(q.r)), pt = m.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; }
+  styleDraft(m, true); afterHierarchyChange();
+}
+/** Size an outline (or a grown ball, made again) by a factor. */
+async function resizeGrowth(m, k) {
+  const q = m.userData.part.grower; if (!q || q.kind !== 'ball') return;
+  pushUndo(); q.r = Math.max(0.5, Math.min(200, +(q.r * k).toFixed(2)));
+  if (q.draft) { const g = weldGeometry(draftGeom(q.r)), pt = m.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.tris = g.index.count / 3; styleDraft(m, true); }
+  else { const g = await growBallGeometry(q), pt = m.userData.part; m.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(m); }
+  afterHierarchyChange();
+}
+function stopGrower(m) {
+  pushUndo(); delete m.userData.part.grower;
+  for (const o of liveParts()) { const pt = o.userData.part; if (pt.mods?.some(x => x.type === 'grow' && x.grower === m.uuid)) { pt.mods = pt.mods.filter(x => !(x.type === 'grow' && x.grower === m.uuid)); evalStack(o); } }
+  afterHierarchyChange();
+}
+/** A growth's room: the unit ball of this frame (its own frame, moved to the room's middle and scaled to it). */
+function growRoom(gr) {
+  const q = gr.userData.part.grower; gr.updateMatrixWorld(true);
+  if (q.kind === 'ball') { const r = q.r * 0.85; return gr.matrixWorld.clone().multiply(new THREE.Matrix4().makeScale(r, r, r)); }
+  const bb = gr.geometry.boundingBox || (gr.geometry.computeBoundingBox(), gr.geometry.boundingBox), c = bb.getCenter(V()), h = bb.getSize(V()).multiplyScalar(0.5 * (q.fit ?? 0.8));
+  return gr.matrixWorld.clone().multiply(new THREE.Matrix4().makeTranslation(c.x, c.y, c.z)).multiply(new THREE.Matrix4().makeScale(Math.max(h.x, 0.05), Math.max(h.y, 0.05), Math.max(h.z, 0.05)));
+}
+function growToQ(m, gr) { m.updateMatrixWorld(true); return growRoom(gr).invert().multiply(m.matrixWorld); }
+function growKey(m, mod) {
+  const gr = partById(mod.grower); if (!gr || !gr.userData.part.grower || gr.userData.part.grower.draft || !isVisibleChain(gr)) return 'none';
+  const q = gr.userData.part.grower;
+  return JSON.stringify([q.kind, q.mode, q.r, q.reach, q.sink, q.strength, q.noise, q.fit, q.seed]) + growToQ(m, gr).elements.map(x => Math.round(x * 1e4)).join(',');
+}
+async function growWarpGeometry(m, g, mod) {
+  const gr = partById(mod.grower); if (!gr || !gr.userData.part.grower || gr.userData.part.grower.draft || !isVisibleChain(gr)) return g;
+  const q = gr.userData.part.grower, toQ = growToQ(m, gr), fromQ = toQ.clone().invert();
+  const S = V().setFromMatrixScale(growRoom(gr)), unit = Math.min(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) || 1;
+  const r = await solidJob({ warp: { soup: soupOfGeom(g, new THREE.Matrix4()), toQ: toQ.elements, fromQ: fromQ.elements, reach: q.reach, sink: q.sink, strength: q.strength, noise: q.noise, mode: q.mode || 'away', L: Math.max(0.12, unit / 22) / unit, seed: q.seed } });
+  mod.moved = r.moved;
+  return r.moved ? geomFromSoup(r.positions) : g;
+}
+/** Bring every part's "Pushed by" modifiers up to date: add them where a growth now reaches, take them off where none does. */
+let growTimer = 0;
+function refreshGrowers() { clearTimeout(growTimer); growTimer = setTimeout(refreshGrowersNow, 120); }
+function refreshGrowersNow() {
+  const all = liveParts(), growers = all.filter(o => o.userData.part.grower && !o.userData.part.grower.draft && isVisibleChain(o));
+  const reachOf = gr => { const M4 = growRoom(gr), c = V().setFromMatrixPosition(M4), S = V().setFromMatrixScale(M4); return { c, r: Math.max(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) * gr.userData.part.grower.reach }; };
+  const zones = growers.map(gr => ({ gr, ...reachOf(gr) }));
+  for (const m of all) {
+    const pt = m.userData.part; if (pt.grower || !isVisibleChain(m)) continue;
+    const box = exactBox(m), want = zones.filter(z => !(pt.noGrow || []).includes(z.gr.uuid) && box.distanceToPoint(z.c) < z.r).map(z => z.gr.uuid);
+    const have = (pt.mods || []).filter(x => x.type === 'grow');
+    let changed = false;
+    for (const x of have) if (!want.includes(x.grower)) { pt.mods = pt.mods.filter(y => y !== x); changed = true; }
+    for (const id of want) if (!have.some(x => x.grower === id)) { ensureStack(m).push({ id: newModId(), type: 'grow', grower: id, name: `Pushed by ${partById(id)?.name || 'a growth'}`, on: true }); changed = true; }
+    // worked out again only if something it depends on changed (else nothing happens, so this never loops)
+    const sig = (pt.mods || []).filter(x => x.type === 'grow' && x.on).map(x => growKey(m, x)).join('|');
+    if (changed || sig !== pt.growSig) { pt.growSig = sig; if (pt.mods) evalStack(m); }
+  }
+}
+/** The parts within a growth's reach (whether or not they're left alone). */
+function growReachParts(gr) {
+  const q = gr.userData.part.grower, room = growRoom(gr), c = V().setFromMatrixPosition(room), S = V().setFromMatrixScale(room), rr = Math.max(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) * (q.reach || 2.6);
+  return liveParts().filter(o => o !== gr && !o.userData.part.grower && isVisibleChain(o) && exactBox(o).distanceToPoint(c) < rr);
+}
+/** Ticks for the parts a growth reaches: untick a part and the growth leaves it alone (only the door bends, say). */
+function growTargetRows(gr, box) {
+  const list = growReachParts(gr), wrap = document.createElement('div'); wrap.className = 'grow-targets'; box.append(wrap);
+  const head = document.createElement('div'); head.className = 'gt-head'; wrap.append(head);
+  const on = o => !(o.userData.part.noGrow || []).includes(gr.uuid);
+  const n = list.filter(on).length;
+  const t = document.createElement('span'); t.textContent = list.length ? `Bends ${n} of ${list.length} part${list.length === 1 ? '' : 's'} in reach` : 'Nothing in reach yet: move it into or against a part.'; head.append(t);
+  if (!list.length) return;
+  const set = (parts, want) => { pushUndo(); for (const o of parts) { const pt = o.userData.part, ids = new Set(pt.noGrow || []); if (want) ids.delete(gr.uuid); else ids.add(gr.uuid); if (ids.size) pt.noGrow = [...ids]; else delete pt.noGrow; } refreshGrowersNow(); markDirty(); renderPartPanel(); };
+  const mini = (txt, fn, title) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'linkbtn'; b.textContent = txt; b.title = title; b.addEventListener('click', fn); head.append(b); };
+  mini('All', () => set(list, true), 'Bend every part in reach'); mini('None', () => set(list, false), 'Leave them all alone, then tick just the ones to bend');
+  const ul = document.createElement('div'); ul.className = 'gt-list'; wrap.append(ul);
+  for (const o of list) {
+    const l = document.createElement('label'); l.className = 'check gt-row';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = on(o); cb.addEventListener('change', () => set([o], cb.checked));
+    const nm = document.createElement('span'); nm.textContent = o.name;
+    l.append(cb, nm);
+    l.addEventListener('mouseenter', () => { paintSelection(); o.material.emissive?.set('#3d2c0f'); }); l.addEventListener('mouseleave', () => paintSelection()); ul.append(l);
+  }
+}
+function growerRows(p, el) {
+  const q = p.userData.part.grower; if (!q) return;
+  const box = document.createElement('div'); box.className = 'mods grower'; el.append(box);
+  const h = document.createElement('div'); h.className = 'mod-h'; h.textContent = 'Growth'; box.append(h);
+  const note = document.createElement('p'); note.className = 'note';
+  note.textContent = q.draft ? `Outline: drag it into place (Move, G) and size it${q.kind === 'ball' ? ' ([ and ], or Size)' : ''}; the faint ball is how far it will bend things. Untick any part below it should leave alone, then Grow it.`
+    : 'Back to outline to move it about quickly. Untick any part below it should leave alone.';
+  box.append(note);
+  growTargetRows(p, box);
+  const grid = document.createElement('div'); grid.className = 'mod-grid'; box.append(grid);
+  const row = (label, ctl, title = '') => { const l = document.createElement('label'); l.textContent = label; if (title) l.title = title; grid.append(l, ctl); };
+  const regrow = async () => { if (q.kind !== 'ball') return; if (q.draft) { const g = weldGeometry(draftGeom(q.r)), pt = p.userData.part; g.computeBoundingBox(); g.computeBoundsTree(); p.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.tris = g.index.count / 3; styleDraft(p, true); return; } const g = await growBallGeometry(q); const pt = p.userData.part; p.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; refreshPaint(p); };
+  const num = (label, key, step, min, max, scale = 1, title = '', shape = false) => {
+    const n = document.createElement('input'); n.type = 'number'; n.className = 'num'; n.step = step; n.min = min; n.max = max; n.value = +(q[key] * scale).toFixed(3);
+    n.addEventListener('change', async () => { let v = +n.value; if (!isFinite(v)) return; v = Math.min(max, Math.max(min, v)); pushUndo(); q[key] = ['pustules', 'pocks', 'horns'].includes(key) ? Math.round(v) : v / scale; if (shape) await regrow(); if (q.draft) styleDraft(p, true); afterHierarchyChange(); });
+    row(label, n, title);
+  };
+  if (q.kind === 'ball') num('Size mm', 'r', 0.5, 0.5, 200, 1, 'Its radius', true);
+  else num('Room %', 'fit', 5, 20, 150, 100, "How much of the shape's box pushes the parts away (it's an ellipsoid fitting the shape)");
+  { const sel = document.createElement('select'); sel.className = 'num osel'; for (const [v, t] of [['away', 'Shoved aside'], ['around', 'Bulging round it']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.append(o); }
+    sel.value = q.mode || 'away'; sel.addEventListener('change', () => { pushUndo(); q.mode = sel.value; afterHierarchyChange(); });
+    row('Parts are', sel, 'Shoved aside: each part round it is pushed away from it and bends out of the way, so it takes their place (at a corner, the corner opens up). Bulging round it: they swell out over it'); }
+  num('Reach %', 'reach', 10, 110, 600, 100, 'How far round it the push spreads, as a share of its size: further, and the parts bend more gently');
+  num('Push %', 'strength', 5, 0, 150, 100, 'How far the parts round it are shoved out, as a share of its size: they clear out of its way and bend out round it');
+  if (!q.draft) {
+  num('Sink in %', 'sink', 2, 0, 50, 100, 'How far into its skin the parts may stay, so they bed into it rather than just touching');
+  num('Lumpy push %', 'noise', 5, 0, 100, 100, 'An uneven push, so the plates look forced out of shape rather than blown up');
+  }
+  if (q.kind === 'ball' && !q.draft) {
+    num('Lumpy %', 'lumps', 5, 0, 100, 100, '', true); num('Rings %', 'ridges', 5, 0, 100, 100, '', true); num('Pustules', 'pustules', 1, 0, 200, 1, '', true); num('Pock holes', 'pocks', 1, 0, 100, 1, '', true);
+    num('Horns', 'horns', 1, 0, 60, 1, 'None to start with: how many horns grow out of it', true);
+    if ((q.horns ?? 0) > 0) { q.hornPct ??= q.hornLen ? q.hornLen / q.r : 0.6; num('Horn length %', 'hornPct', 5, 5, 300, 100, "As a share of the growth's size, so they stay in proportion as you size it", true); num('Curl %', 'curl', 5, 0, 100, 100, '', true); }
+    num('Detail mm', 'detail', 0.02, 0.08, 2, 1, '', true);
+  }
+  const btns = document.createElement('div'); btns.className = 'btnrow'; box.append(btns);
+  const bt = (t, title, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = t; b.title = title; b.addEventListener('click', fn); btns.append(b); };
+  if (growthSpots(liveParts()).length >= 2) bt('Connect with ooze', 'String ooze from this growth to the others and the bursts there are, nearest to nearest', () => connectWithOoze([p, ...liveParts().filter(o => o !== p)]));   // starting from this one
+  if (q.draft) { bt('Grow it', 'Make the growth and push the parts round it aside (the slow part)', () => growIt(p)); btns.lastChild.classList.add('primary'); }
+  else bt('Back to outline', 'Quick to move and size again; the parts go back as they were until you Grow it again', () => toDraft(p));
+  if (q.kind === 'ball' && !q.draft) bt('Shuffle', 'New lumps, rings and horns', async () => { pushUndo(); q.seed = (Math.random() * 2 ** 31) | 0; await regrow(); afterHierarchyChange(); });
+  bt('Not a growth', 'It stops pushing the parts round it (they go back to how they were)', () => stopGrower(p));
+}
+
+// ---- ooze between growths and bursts
+/*
+ * Growths (placed or grown) and bursts can be joined up with ooze: each one becomes a spot on the ooze, on its
+ * surface facing the next one along, strung nearest to nearest. It's the same ooze as clicking spots by hand, so
+ * its looks, Shuffle and Done all work as usual, and the spots move with the parts they're on.
+ */
+/** The growths and bursts among these parts (and the bursts on them): { m, c (world middle), r (its size), anchorTo(dir) }. */
+function growthSpots(ms) {
+  const out = [];
+  for (const m of ms) {
+    if (!m?.parent || !isVisibleChain(m)) continue;
+    const pt = m.userData.part;
+    if (pt.grower) {
+      const room = growRoom(m), c = V().setFromMatrixPosition(room), S = V().setFromMatrixScale(room), r = Math.max(S.x, S.y, S.z);
+      // which way it's out in the open (not buried in the parts round it): the ooze leaves from that side
+      const others = liveParts().filter(o => o !== m && !o.userData.part.grower && isVisibleChain(o)), open = V(), rc0 = new THREE.Raycaster();
+      for (let i = 0; i < 26; i++) { const z = 1 - 2 * (i + 0.5) / 26, a = i * 2.399963, sr = Math.sqrt(1 - z * z), d = V(sr * Math.cos(a), sr * Math.sin(a), z);
+        rc0.set(c, d); rc0.far = r * 1.6; if (!rc0.intersectObjects(others, false).length) open.add(d); }
+      if (open.lengthSq() > 1e-6) open.normalize();
+      out.push({ m, c, r, anchorTo: dir0 => {                     // where a line from the middle that way leaves it
+        const dir = dir0.clone().add(open.clone().multiplyScalar(1.4)).normalize();
+        m.updateMatrixWorld(true); const rc = new THREE.Raycaster(c.clone().addScaledVector(dir, r * 4), dir.clone().negate(), 0, r * 8);
+        const h = rc.intersectObject(m, false)[0], P = h ? h.point : c.clone().addScaledVector(dir, r), N = h ? hitNormal(h) : dir.clone();
+        if (N.dot(dir) < 0) N.negate();
+        const inv = m.matrixWorld.clone().invert(); return { part: m.uuid, pL: P.clone().applyMatrix4(inv).toArray(), nL: N.clone().transformDirection(inv).toArray() }; } });
+    }
+    for (const mod of pt.mods || []) {
+      if (mod.type !== 'burst' || !mod.on) continue;
+      m.updateMatrixWorld(true);
+      const q = mod.p, P = V().fromArray(mod.hit.pL).applyMatrix4(m.matrixWorld), N = V().fromArray(mod.hit.nL).transformDirection(m.matrixWorld).normalize();
+      const sph = q.from === 'sphere', r = sph ? q.sr : q.radius, up = sph ? Math.max(0, (q.sr - q.depth) * 0.5) : (q.grow > 0 ? q.height * 0.45 : 0);
+      const c = P.clone().addScaledVector(N, up);
+      out.push({ m, c, r, anchorTo: dir => {                      // in the middle of the growth, leaning towards the next one
+        const at = c.clone().addScaledVector(dir.clone().projectOnPlane(N), r * 0.35), inv = m.matrixWorld.clone().invert(), n = N.clone().add(dir.clone().multiplyScalar(0.5)).normalize();
+        return { part: m.uuid, pL: at.applyMatrix4(inv).toArray(), nL: n.transformDirection(inv).toArray() }; } });
+    }
+  }
+  return out;
+}
+/** The spots strung nearest to nearest, starting from the first (or from the end of what's there). */
+function chainSpots(spots, from = null) {
+  const left = [...spots], order = []; let at = from || (left.length ? left[0].c : null);
+  while (left.length) { let bi = 0, bd = Infinity; left.forEach((s, i) => { const d = s.c.distanceTo(at); if (d < bd) { bd = d; bi = i; } }); const s = left.splice(bi, 1)[0]; order.push(s); at = s.c; }
+  return order;
+}
+/** Anchors for a chain: each on its spot's surface, facing along the chain. */
+function chainAnchors(order, prevC = null) {
+  return order.map((s, i) => {
+    const next = order[i + 1]?.c, prev = i ? order[i - 1].c : prevC;
+    const dir = (next && prev ? next.clone().sub(s.c).normalize().add(prev.clone().sub(s.c).normalize()) : (next || prev || s.c.clone().add(V(0, 0, 1))).clone().sub(s.c));
+    if (dir.lengthSq() < 1e-9) dir.copy(next ? next.clone().sub(s.c) : V(0, 0, 1)); dir.normalize();
+    return s.anchorTo(dir);
+  });
+}
+/** Ooze joining these growths and bursts (two or more). */
+function connectWithOoze(ms) {
+  const spots = growthSpots(ms);
+  if (spots.length < 2) { toast('Pick two or more growths or parts with bursts on them (Ctrl-click), then Connect with ooze.', 'bad'); return; }
+  startOoze(); oz.anchors = chainAnchors(chainSpots(spots));
+  if (+$('oz-sag').value > 10) $('oz-sag').value = 10;               // strands between growths across a plate hang less, or they'd sag into it
+  oozeMarks(); $('oz-done').disabled = false; oozeRedo();
+  $('oz-note').textContent = `Ooze strung between ${spots.length} growths and bursts. Click more spots to carry it on; change how it looks below; then Done.`;
+}
+/** In the ooze card: string it on through every growth and burst there is, after the spots already clicked. */
+function oozeJoinGrowths() {
+  if (!oz) return;
+  const have = new Set(oz.anchors.map(a => a.part)), spots = growthSpots(liveParts()).filter(s => !(s.m.userData.part.grower && have.has(s.m.uuid)));
+  if (!spots.length) { toast('There are no growths or bursts to join up (or they all are already).'); return; }
+  const w = oozeWorld(), last = w.length ? V().fromArray(w[w.length - 1].p) : null;
+  oz.anchors.push(...chainAnchors(chainSpots(spots, last), last));
+  oozeMarks(); $('oz-done').disabled = oz.anchors.length < 2; if (oz.anchors.length >= 2) oozeRedo();
+}
+
+// ---- scattering parts over a face
+/*
+ * The same placing as a relief (click a face; carry on round corners; Shift-click faces in or out), but what goes on
+ * it is copies of other parts: skulls on a shield, rivets on a plate. Each copy stands straight out of the surface
+ * where it lands (or leans a little), sits its base just into it, is turned at random or lined up, sized at random
+ * in a range, kept clear of its neighbours and inside the face's edges. Copies share their part's mesh, and are fixed
+ * to the part they're on.
+ */
+function startScatter(sources) {
+  const src = (sources || selectionRoots()).filter(m => m?.parent && isPart(m));
+  if (!src.length) { toast('Select the parts to scatter first (one or several, picked at random), then Scatter on a face.', 'bad'); return; }
+  endReliefPlace(false);
+  rp = { kind: 'scatter', src, m: null, copies: [], target: null, before: snapshot(), off: [0, 0], rep: 'once', added: [], removed: new Set(), regionVer: 0, seed: (Math.random() * 2 ** 31) | 0 };
+  rp.turn = document.querySelector('#sc-turn [aria-pressed="true"]')?.dataset.v || 'random';
+  $('rlplace').dataset.kind = 'scatter'; $('rp-title').textContent = 'Scatter on a face';
+  $('rlplace').hidden = false; $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = true; rpStatus('');
+  const names = src.length === 1 ? src[0].name : `${src.length} parts (${src.map(m => m.name).slice(0, 3).join(', ')}${src.length > 3 ? '…' : ''})`;
+  $('rp-note').textContent = `Click the face to scatter ${names} over.`;
+  setRpOff(0, 0); syncRpRows();
+}
+function rpOwns(o) { return !!rp && ((rp.m && (o === rp.m || subtreeParts(rp.m).includes(o))) || rp.copies?.includes(o) || (rp.kind === 'scatter' && rp.src.includes(o))); }
+/** How a part sits for scattering: which of its axes faces out, its middle, its base along that axis, its reach round it. */
+function scatterShape(m, axisKey) {
+  m.updateMatrixWorld(true);
+  const S = V().setFromMatrixScale(m.matrixWorld), pos = m.geometry.attributes.position, b = m.geometry.boundingBox || (m.geometry.computeBoundingBox(), m.geometry.boundingBox);
+  const size = b.getSize(V()).multiply(S);
+  let key = axisKey;
+  if (key === 'auto') { const k = size.x <= size.y && size.x <= size.z ? 'x' : size.y <= size.z ? 'y' : 'z'; key = (k === 'y' ? '-' : '+') + k; }  // its thinnest way; a flat bit faces up (front for Y)
+  const a = V(); a[key[1]] = key[0] === '-' ? -1 : 1;
+  const c = b.getCenter(V()).multiply(S), v = V(); let lo = Infinity, R = 0;
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i).multiply(S).sub(c); const h = v.dot(a); if (h < lo) lo = h;
+    const r = Math.sqrt(Math.max(0, v.lengthSq() - h * h)); if (r > R) R = r;
+  }
+  const ref = Math.abs(a.z) > 0.5 ? V(0, 1, 0) : V(0, 0, 1);             // the way that counts as "up" on the surface
+  return { a, ref, S, base: c.clone().addScaledVector(a, lo), R, key };
+}
+function mulberry(seed) { let s = seed >>> 0; return () => { s = (s + 0x6D2B79F5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+/** Lay the copies out afresh: random spots on the flat layout of the faces, kept apart, then stood on the surface. */
+async function applyScatter() {
+  const me = rp, t = me.target; if (!t) return;
+  for (const c of me.copies) c.parent?.remove(c); me.copies = [];
+  if (!me.face) { rpStatus("Couldn't find the face there to scatter over: click nearer its middle."); afterHierarchyChange(); return; }
+  const n = Math.max(1, Math.min(500, Math.round(+$('sc-n').value || 1))), gap = +$('sc-gap').value || 0;
+  let s0 = Math.max(0.05, (+$('sc-smin').value || 100) / 100), s1 = Math.max(0.05, (+$('sc-smax').value || 100) / 100); if (s1 < s0) [s0, s1] = [s1, s0];
+  const turnMode = me.turn || 'random', jit = Math.max(0, +$('sc-jit').value || 0), tilt = Math.max(0, +$('sc-tilt').value || 0), sink = Math.max(0, +$('rp-sink').value || 0);
+  const inside = $('sc-inside').checked, margin = inside ? Math.max(0, +$('sc-margin').value || 0) : 0;
+  const through = $('sc-through').checked, poke = Math.max(0, +$('sc-poke').value || 0);
+  const shapes = me.src.map(m => scatterShape(m, $('sc-axis').value));
+  // the faces laid flat: a grid of their triangles, to tell whether a spot is on them
+  const { tris, box } = faceTris2D(), nt = tris.length / 6;
+  const cs = Math.max(1e-3, Math.sqrt((box[1] - box[0]) * (box[3] - box[2]) / Math.max(1, nt)) * 1.5), cells = new Map();
+  for (let k = 0; k < nt; k++) {
+    const o = 6 * k, xs = [tris[o], tris[o + 2], tris[o + 4]], ys = [tris[o + 1], tris[o + 3], tris[o + 5]];
+    for (let i = Math.floor((Math.min(...xs) - box[0]) / cs); i <= Math.floor((Math.max(...xs) - box[0]) / cs); i++)
+      for (let j = Math.floor((Math.min(...ys) - box[2]) / cs); j <= Math.floor((Math.max(...ys) - box[2]) / cs); j++) { const key = i * 100003 + j; (cells.get(key) || cells.set(key, []).get(key)).push(o); }
+  }
+  const on = (u, v) => {
+    for (const o of cells.get(Math.floor((u - box[0]) / cs) * 100003 + Math.floor((v - box[2]) / cs)) || []) {
+      const ax = tris[o], ay = tris[o + 1], bx = tris[o + 2], by = tris[o + 3], cx = tris[o + 4], cy = tris[o + 5];
+      const d1 = (bx - ax) * (v - ay) - (by - ay) * (u - ax), d2 = (cx - bx) * (v - by) - (cy - by) * (u - bx), d3 = (ax - cx) * (v - cy) - (ay - cy) * (u - cx);
+      if ((d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0)) return true;
+    }
+    return false;
+  };
+  const fits = (u, v, r) => { if (!on(u, v)) return false; if (!inside) return true;
+    for (let k = 0; k < 12; k++) { const a = k * Math.PI / 6; if (!on(u + r * Math.cos(a), v + r * Math.sin(a))) return false; } return true; };
+  // spots: darts thrown at random, each kept if it lands on the faces and clear of the ones before
+  const rnd = mulberry(me.seed), placed = [];
+  for (let i = 0, tries = 0; placed.length < n && tries < n * 200; tries++) {
+    const which = Math.floor(rnd() * shapes.length), sc = s0 + (s1 - s0) * rnd(), r = shapes[which].R * sc;
+    const u = box[0] + (box[1] - box[0]) * rnd(), v = box[2] + (box[3] - box[2]) * rnd();
+    if (!fits(u, v, r + margin)) continue;
+    if (placed.some(q => Math.hypot(q.u - u, q.v - v) < q.r + r + gap)) continue;
+    placed.push({ u, v, r, which, sc, spin: rnd(), wob: rnd() * 2 - 1, tiltA: rnd() * Math.PI * 2, tiltB: rnd() });
+  }
+  // each one onto the surface: the spot and its normal, then stood up and turned
+  const { P, N, X0, Y0 } = rpFrame(), rc = new THREE.Raycaster(); rc.firstHitOnly = true;
+  const unfold = !!(me.unfolded && me.grid);
+  let k = 0, thin = 0;
+  for (const q of placed) {
+    let p, nrm;
+    if (unfold) { const r = rpUnflatten(q.u, q.v); if (!r) continue; p = r.p; nrm = r.n.clone().normalize(); }
+    else {
+      const base = P.clone().addScaledVector(X0, q.u).addScaledVector(Y0, q.v); rc.far = 1e4;
+      rc.set(base.clone().addScaledVector(N, 500), N.clone().negate()); const h = rc.intersectObject(t, false)[0]; if (!h) continue;
+      p = h.point.clone(); nrm = smoothNormalAt(t, h); if (nrm.dot(N) < 0) nrm.negate();
+    }
+    const sh = shapes[q.which], src = me.src[q.which];
+    // which way is "up" along the surface here: the way up the face looked from where you clicked
+    let up = Y0.clone().projectOnPlane(nrm); if (up.lengthSq() < 1e-8) up = X0.clone().projectOnPlane(nrm); up.normalize();
+    const ang = turnMode === 'random' ? q.spin * Math.PI * 2 : q.wob * jit * Math.PI / 180;
+    up.applyAxisAngle(nrm, ang);
+    let out = nrm.clone();
+    if (tilt > 0) { const side = up.clone().applyAxisAngle(nrm, q.tiltA); out.applyAxisAngle(side.cross(nrm).normalize(), q.tiltB * tilt * Math.PI / 180); up.projectOnPlane(out).normalize(); }
+    // its own (out, up, side) → the surface's
+    const L = new THREE.Matrix4().makeBasis(sh.a, sh.ref, sh.a.clone().cross(sh.ref)), Wb = new THREE.Matrix4().makeBasis(out, up, out.clone().cross(up));
+    const R = Wb.multiply(L.transpose()), q4 = new THREE.Quaternion().setFromRotationMatrix(R);
+    const S = sh.S.clone().multiplyScalar(q.sc), baseW = sh.base.clone().multiplyScalar(q.sc).applyQuaternion(q4);
+    // pushed through: as deep as the part is thick there (straight in, to its back face), and out the other side
+    let dep = sink;
+    if (through) {
+      rc.far = 1e4; rc.set(p.clone().addScaledVector(nrm, -1e-3), nrm.clone().negate()); const hb = rc.intersectObject(t, false)[0];
+      if (hb) dep = hb.distance + 1e-3 + poke; else thin++;
+    }
+    const T = p.clone().addScaledVector(nrm, -dep).sub(baseW);
+    const c = clonePartAlone(src, `${src.name.replace(/ \d+$/, '')} ${++k}`); c.visible = true;
+    c.position.copy(T); c.quaternion.copy(q4); c.scale.copy(S); c.updateMatrixWorld(true);
+    t.attach(c); me.copies.push(c);
+  }
+  afterHierarchyChange();
+  const msg = `${me.copies.length} of ${n} placed` + (me.copies.length < n ? ': no room for more, so make the spacing or sizes smaller, or add faces' : '') + (unfold ? ' · unfolded round the corners' : me.unfoldFailed ? ' · these faces won\'t unfold flat, so spots are seen straight on' : '');
+  rpStatus(msg + (thin ? ` · ${thin} found no back to push through to` : ''));
+}
+/** A part's triangles as a soup (9 numbers each), moved by M. */
+function soupOf(m, M) {
+  const g = m.geometry, pos = g.attributes.position, ix = g.index ? g.index.array : null, n = ix ? ix.length : pos.count, out = new Float32Array(n * 3), v = V();
+  for (let i = 0; i < n; i++) { v.fromBufferAttribute(pos, ix ? ix[i] : i).applyMatrix4(M); out[3 * i] = v.x; out[3 * i + 1] = v.y; out[3 * i + 2] = v.z; }
+  return out;
+}
+/**
+ * Make placed pieces part of the target's own mesh for good: joined on as one solid (add), or taken away from it (cut),
+ * with Manifold, in the background. The pieces go; Undo brings everything back as it was.
+ */
+async function bakeInto(t, items, mode) {
+  items = items.filter(m => m?.parent); if (!items.length) return;
+  t.updateMatrixWorld(true); const inv = t.matrixWorld.clone().invert(), tSoup = soupOf(t, new THREE.Matrix4());
+  const iSoups = items.map(m => { m.updateMatrixWorld(true); return soupOf(m, inv.clone().multiply(m.matrixWorld)); });
+  loading.show(mode === 'add' ? `Merging into ${t.name}` : `Cutting into ${t.name}`);
+  loading.set(0.3, `${items.length} piece${items.length === 1 ? '' : 's'}, ${Math.round(tSoup.length / 9 / 1000)}k triangles in ${t.name}…`); await nextFrame();
+  let r;
+  try { [r] = await mergeJobs([mode === 'add' ? { soups: [tSoup, ...iSoups], subtract: [] } : { soups: [tSoup], subtract: iSoups }], { fillHollows: false, loose: 'keep' }); }
+  catch (e) { console.warn(e); toast(`Couldn't make them part of ${t.name} (${e.message || e}). They're left as separate parts.`, 'bad'); return; }
+  finally { loading.hide(); }
+  if (!r?.positions?.length) { toast(`That left nothing of ${t.name}, so nothing was changed.`, 'bad'); return; }
+  const g0 = new THREE.BufferGeometry(); g0.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
+  const g = weldGeometry(g0, 1e-9); g.computeBoundingBox(); g.computeBoundsTree();
+  const pt = t.userData.part, hadPaint = !!pt.paint;
+  t.geometry = g; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = g.index.count / 3; pt.paint = null; pt.paintVer = (pt.paintVer || 0) + 1;
+  for (const m of items) { if (selection.includes(m)) selection = selection.filter(x => x !== m); m.parent.remove(m); }
+  refreshPaint(t); afterHierarchyChange(); select(t);
+  const cutN = mode === 'cut' ? r.cut : items.length, skipped = mode === 'cut' ? items.length - r.cut : r.unmerged;
+  toast(`${mode === 'add' ? 'Merged' : 'Cut'} ${cutN} piece${cutN === 1 ? '' : 's'} ${mode === 'add' ? 'into' : 'into'} ${t.name}: it's one mesh now${hadPaint ? ' (its brushed paint is cleared, as the mesh changed)' : ''}.` +
+    (skipped > 0 ? ` ${skipped} ${mode === 'add' ? "weren't closed solids, so they're joined on as they are" : "weren't closed solids, so they couldn't be cut and were left out"}.` : '') + ' Undo puts it all back.', skipped > 0 ? 'bad' : 'ok');
+}
+/**
+ * The surface's normal at a ray hit, blended smoothly across the faces round it (so a relief wrapped over a faceted
+ * curve doesn't kink at every facet), but never across a crease: each corner of the hit triangle averages only the
+ * faces round it within 50° of that triangle (angle-weighted), so a panel's edge keeps its own face's normal.
+ */
+function smoothNormalAt(m, h) {
+  const topo = topoOf(m), { idx, pos, fn, vtOff, vtList } = topo, f = h.faceIndex, cos = Math.cos(50 * Math.PI / 180);
+  const cache = m.geometry.userData.cornerN ||= new Map();
+  const n0 = V(fn[3 * f], fn[3 * f + 1], fn[3 * f + 2]), out = V();
+  const P = k => V(pos[3 * k], pos[3 * k + 1], pos[3 * k + 2]);
+  const local = h.point.clone().applyMatrix4(m.matrixWorld.clone().invert());
+  const a = idx[3 * f], b = idx[3 * f + 1], c = idx[3 * f + 2], bc = new THREE.Triangle(P(a), P(b), P(c)).getBarycoord(local, V());
+  [a, b, c].forEach((k, i) => {
+    const key = f * 3 + i; let cn = cache.get(key);
+    if (!cn) {
+      cn = V();
+      for (let j = vtOff[k]; j < vtOff[k + 1]; j++) {
+        const t = vtList[j], nt = V(fn[3 * t], fn[3 * t + 1], fn[3 * t + 2]); if (nt.dot(n0) < cos) continue;
+        const o = [idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]].indexOf(k); if (o < 0) continue;
+        const p0 = P(k), ang = P(idx[3 * t + (o + 1) % 3]).sub(p0).angleTo(P(idx[3 * t + (o + 2) % 3]).sub(p0));
+        if (isFinite(ang)) cn.addScaledVector(nt, ang);
+      }
+      if (cn.lengthSq() < 1e-12) cn.copy(n0); cn.normalize(); cache.set(key, cn);
+    }
+    out.addScaledVector(cn, bc.getComponent(i));
+  });
+  if (out.lengthSq() < 1e-10) out.copy(n0);
+  return out.transformDirection(m.matrixWorld).normalize();
+}
+/**
+ * Put the relief on the target: lying on the surface, turned, sized, sunk in, wrapped or not. Once and untrimmed it's
+ * the flat original as it is; as copies, or trimmed to the face, it's laid out again first (in the background, in 2D:
+ * the copies on a lattice, cut to the face's outline seen straight on, then built as one solid).
+ */
+async function applyReliefPlace() {
+  const me = rp, { m, target: t } = me, info = m.userData.part.relief; if (!t || !info) return;
+  const F = rpFrame(), { N, C, X, Y } = F;
+  const k = Math.max(0.05, (+$('rp-size').value || 100) / 100), sink = Math.max(0, +$('rp-sink').value || 0), unfold = !!(me.unfolded && me.grid), wrap = unfold || $('rp-wrap').checked;
+  const spin = +$('rp-spin').value || 0, ca = Math.cos(spin * Math.PI / 180), sa = Math.sin(spin * Math.PI / 180);
+  const rep = me.rep, trim = $('rp-trim').checked && !!me.face;
+  let src = info.flat, sc = k;
+  if (rep !== 'once' || trim || unfold) {
+    const p0 = info.params;
+    if (!p0) { toast('This relief was made in an earlier session, so it can only go on once, on one face: make it again from the picture to repeat, trim or fold it.', 'bad'); me.rep = 'once'; $('rp-trim').checked = false; $('rp-corners').checked = false; syncRpRows(); rpRegion(); return applyReliefPlace(); }
+    else {
+      const pw = p0.width * k, ph = p0.width * p0.h / p0.w * k, gap = Math.max(-0.9 * Math.min(pw, ph), +$('rp-gap').value || 0), px = pw + gap, py = ph + gap;
+      const face = me.face ? (unfold && me.domFill ? faceTris2D(me.off, spin, me.domFill, me.uvFill) : faceTris2D(me.off, spin)) : null;
+      let at = [[0, 0]];
+      if (rep === 'grid') {
+        const cols = Math.max(1, Math.min(50, Math.round(+$('rp-cols').value || 1))), rows = Math.max(1, Math.min(50, Math.round(+$('rp-rows').value || 1)));
+        at = []; for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) at.push([(i - (cols - 1) / 2) * px, (j - (rows - 1) / 2) * py]);
+      } else if (rep === 'fill' && face) {                       // every copy that reaches the face; the pattern runs through the centre
+        const [u0, u1, v0, v1] = face.box, i0 = Math.ceil((u0 - pw / 2) / px), i1 = Math.floor((u1 + pw / 2) / px), j0 = Math.ceil((v0 - ph / 2) / py), j1 = Math.floor((v1 + ph / 2) / py);
+        const n = (i1 - i0 + 1) * (j1 - j0 + 1);
+        if (n > 3000) { rpStatus(`That would be ${n} copies: make it bigger, or the gap wider.`); return; }
+        at = []; for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) at.push([i * px, j * py]);
+      }
+      const margin = trim ? Math.max(0, +$('rp-margin').value || 0) : 0;
+      // fine enough to follow a curve and to print, but no finer than a few hundred thousand triangles in all
+      const pieces = unfold && me.groups ? me.groups.map(l => faceTris2D(me.off, spin, l).tris) : null;
+      const curved = (unfold && !pieces) || (!unfold && wrap && me.face?.kind !== 'flat'), slopes = p0.mode !== 'flat' || p0.bevel > 0;
+      const area = trim ? Math.min(at.length * pw * ph, (face.box[1] - face.box[0]) * (face.box[3] - face.box[2])) : at.length * pw * ph;
+      let cell = slopes || curved ? Math.max(p0.cell, 0.03, Math.sqrt(4 * area / 400000)) : 1e4;
+      const r4 = v => Math.round(v * 1e4) / 1e4;
+      const key = JSON.stringify([k, gap, at.length, at[0], cell, (trim || unfold) && [margin, t.uuid, me.regionVer, ...me.off.map(r4), r4(spin)]]);
+      if (me.cacheKey !== key) {
+        rpStatus(`Laying out ${at.length} cop${at.length === 1 ? 'y' : 'ies'}${trim ? ', trimmed to the face' : ''}…`);
+        // (size changes how big it is across, not how high it stands)
+        let r;
+        for (let tries = 0; ; tries++) {
+          r = await solidJob({ relief: { ...p0, field: Float32Array.from(p0.field), width: pw, cell,
+            tiles: { at, pitch: rep === 'once' ? [Infinity, Infinity] : [px, py] }, clip: trim ? face.tris : null, margin, pieces } });
+          if (rp !== me) return;
+          if (r.positions.length / 9 <= 400000 || cell >= 1e4 || tries >= 3) break;
+          cell *= 1.8; rpStatus(`That came out heavy; laying it out again a little coarser…`);     // a fine outline refines into a lot of triangles
+        }
+        if (!r.positions.length) { rpStatus('Nothing of it lands on the faces there: slide it onto them, or make the margin smaller.'); return; }
+        const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(r.positions, 3));
+        me.cache = weldGeometry(g, 1e-9); me.cacheKey = key; me.cacheN = at.length;     // welded exactly: corners are shared already, near ones must stay apart
+      }
+      src = me.cache; sc = 1;
+      rpStatus(`${me.cacheN} cop${me.cacheN === 1 ? 'y' : 'ies'}${trim ? ', trimmed to the face' : ''} · ${(src.index.count / 3 / 1000).toFixed(0)}k triangles` +
+        (me.unfoldFailed ? ' · these faces won\'t unfold flat (too curved or too much detail), so it\'s laid on seen straight on: lower "Up to", or Shift-click faces out' : unfold ? ' · unfolded round the corners' : ''));
+    }
+  } else rpStatus('');
+  t.updateMatrixWorld(true);
+  const pos = src.attributes.position, idx = src.index, n = pos.count, out = new Float32Array(n * 3);
+  src.computeBoundingBox(); const bb = src.boundingBox;
+  const R = Math.hypot(bb.max.x - bb.min.x, bb.max.y - bb.min.y) * sc * 0.5 + Math.hypot(...me.off) + 2;
+  const rc = new THREE.Raycaster(); rc.firstHitOnly = true; rc.far = 3 * R;
+  const inv = t.matrixWorld.clone().invert(), v = V(), base = V(), w = V();
+  let missed = 0;
+  // the back of the relief is z = 0; every corner at the same spot on the back lands on the same point of the surface
+  const memo = new Map();
+  for (let i = 0; i < n; i++) {
+    v.fromBufferAttribute(pos, i); const x = v.x * sc, y = v.y * sc, z = v.z;            // size is across; the height stays
+    base.copy(C).addScaledVector(X, x).addScaledVector(Y, y);
+    if (unfold) {                                                   // laid flat round the corners: back onto the faces
+      const key = x + ',' + y; let q = memo.get(key);
+      if (!q) {
+        const r = rpUnflatten(me.off[0] + x * ca - y * sa, me.off[1] + x * sa + y * ca);
+        if (!r) { missed++; q = [base.clone(), N.clone()]; } else { if (r.out) missed++; q = [r.p, r.n]; }
+        memo.set(key, q);
+      }
+      w.copy(q[0]).addScaledVector(q[1], z - sink);
+    } else if (wrap) {
+      const key = x + ',' + y; let q = memo.get(key);
+      if (!q) {
+        rc.set(base.clone().addScaledVector(N, R), N.clone().negate()); const h = rc.intersectObject(t, false)[0];
+        let hh = h;
+        if (!hh) {                                                  // just past an edge (a trimmed outline's own corner): the nearest spot
+          const c = t.geometry.boundsTree.closestPointToPoint(base.clone().applyMatrix4(inv));
+          if (c && c.distance < 0.05) hh = { point: c.point.clone().applyMatrix4(t.matrixWorld), faceIndex: c.faceIndex };
+        }
+        if (hh) { const fn = smoothNormalAt(t, hh); if (fn.dot(N) < 0) fn.negate(); q = [hh.point.clone(), fn]; }
+        else { missed++; q = [base.clone(), N.clone()]; }
+        memo.set(key, q);
+      }
+      w.copy(q[0]).addScaledVector(q[1], z - sink);
+    } else w.copy(base).addScaledVector(N, z - sink);
+    w.applyMatrix4(inv); out[3 * i] = w.x; out[3 * i + 1] = w.y; out[3 * i + 2] = w.z;
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(out, 3)); g.setIndex(idx.clone());
+  g.computeBoundingBox(); g.computeBoundsTree();
+  // it rides on the target, fixed, in the target's own frame
+  detach(m); t.add(m); m.position.set(0, 0, 0); m.quaternion.identity(); m.scale.set(1, 1, 1);
+  m.geometry = g; const pt = m.userData.part; pt.geomKey = THREE.MathUtils.generateUUID(); pt.topo = null; pt.tris = idx.count / 3;
+  afterHierarchyChange();
+  if (missed && !(unfold && trim)) toast(unfold ? `${missed} spots ran past the outlined faces and carry on flat there. Trim to the faces' edges, raise "Up to", or Shift-click more faces in.` : `${missed} spots ran off the edge of ${t.name} and stayed flat there. Make it smaller, move it in, or Trim to the face's edges.`, 'bad');
+}
+function bindRelief() {
+  $('rl-file').addEventListener('click', () => $('rl-input').click());
+  $('rl-input').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) reliefPicture(f, f.name); });
+  $('rl-close').addEventListener('click', closeRelief); $('rl-cancel').addEventListener('click', closeRelief);
+  document.querySelectorAll('#rl-mode button').forEach(b => b.addEventListener('click', () => { rl.mode = b.dataset.v; syncReliefSegs(); reliefPreview(); }));
+  document.querySelectorAll('#rl-raise button').forEach(b => b.addEventListener('click', () => { rl.raise = b.dataset.v; rl.tAuto = true; syncReliefSegs(); reliefField(); }));
+  $('rl-t').addEventListener('input', () => { rl.t = +$('rl-t').value / 100; rl.tAuto = false; reliefPreview(); });
+  $('rl-tauto').addEventListener('click', () => { rl.tAuto = true; rl.t = rl.autoT; $('rl-t').value = Math.round(rl.t * 100); reliefPreview(); });
+  $('rl-blur').addEventListener('input', () => { $('rl-blur-n').textContent = $('rl-blur').value; reliefField(); });
+  $('rl-detail').addEventListener('change', reliefField);
+  $('rl-w').addEventListener('input', reliefPreview);
+  $('rl-make').addEventListener('click', () => makeRelief(false)); $('rl-place').addEventListener('click', () => makeRelief(true));
+  const re = () => reliefReplace();
+  $('rp-spin').addEventListener('input', () => { $('rp-spin-n').value = $('rp-spin').value; re(); });
+  $('rp-spin-n').addEventListener('change', () => { $('rp-spin').value = $('rp-spin-n').value; re(); });
+  ['rp-size', 'rp-sink'].forEach(id => $(id).addEventListener('change', re)); $('rp-wrap').addEventListener('change', re);
+  for (const ax of ['x', 'y']) {
+    const sl = $('rp-' + ax), nb = $('rp-' + ax + '-n'), set = v => { if (!rp) return; const o = [...rp.off]; o[ax === 'x' ? 0 : 1] = v; setRpOff(...o); re(); };
+    sl.addEventListener('input', () => set(+sl.value)); nb.addEventListener('change', () => set(+nb.value || 0));
+  }
+  $('rp-centre').addEventListener('click', rpCentre); $('rp-square').addEventListener('click', rpSquare);
+  document.querySelectorAll('#rp-rep button').forEach(b => b.addEventListener('click', () => {
+    if (!rp) return; rp.rep = b.dataset.v; if (rp.rep === 'fill' && rp.face) $('rp-trim').checked = true;      // a pattern stops at the face's edges
+    syncRpRows(); re(); }));
+  ['rp-cols', 'rp-rows', 'rp-gap', 'rp-margin'].forEach(id => $(id).addEventListener('change', re));
+  $('rp-trim').addEventListener('change', () => { syncRpRows(); re(); });
+  $('rp-corners').addEventListener('change', () => { if (!rp) return; syncRpRows(); if (rp.target) { rpRegion(); re(); } });
+  $('rp-turn').addEventListener('change', () => { if (rp?.target && $('rp-corners').checked) { rpRegion(); re(); } });
+  $('rp-again').addEventListener('click', () => { if (!rp) return; restore(rp.before); afterHierarchyChange(); rpOutline(true); rp.target = null; rp.face = null; rp.cacheKey = null; rpStatus(''); $('rp-ctl').hidden = $('rp-again').hidden = $('rp-done').hidden = true; $('rp-note').textContent = rp.kind === 'scatter' ? 'Click the face to scatter them over.' : `Click where ${rp.m.name} goes on a part.`; if (rp.copies) rp.copies = []; });
+  // Done: the relief or scatter goes on its part as a modifier (Separate, Merge or Cut), to change, turn off or apply later
+  const finish = how => { if (!rp) return; const t = rp.target, kind = rp.kind, kids = kind === 'scatter' ? (rp.copies || []) : [rp.m], mode = { keep: 'join', add: 'merge', cut: 'cut' }[how];
+    $('rp-bake').hidden = true; $('rp-btns').hidden = false;
+    const place = rpSettings();
+    let mod = rp.mod;
+    if (mod && !t.userData.part.mods?.includes(mod)) mod = null;          // started over on another part
+    if (mod) { Object.assign(mod, { mode, place, kids: kids.map(k => k.uuid) }); if (kind === 'scatter') mod.sources = rp.src.map(x => x.uuid); }
+    else { mod = { id: newModId(), type: kind, name: MOD_NAMES[kind], on: true, mode, place, kids: kids.map(k => k.uuid), sources: kind === 'scatter' ? rp.src.map(x => x.uuid) : undefined }; ensureStack(t).push(mod); }
+    for (const k of kids) k.userData.part.owner = { part: t.uuid, mod: mod.id };
+    const editing = !!rp.mod; pushUndo(rp.before); endReliefPlace(true); select(t); evalStack(t);
+    const what = kind === 'scatter' ? `${kids.length} cop${kids.length === 1 ? 'y' : 'ies'}` : kids[0].name;
+    toast(`${editing ? 'Changed' : 'Added'} ${what} on ${t.name} as a ${MOD_NAMES[kind]} modifier (${{ join: 'separate parts', merge: 'merged in', cut: 'cut in' }[mode]}): turn it off, change it or Apply it in Properties › Modifiers.`, 'ok'); };
+  $('rp-done').addEventListener('click', () => { if (!rp?.target || rp.running) return;
+    const what = rp.kind === 'scatter' ? `these ${rp.copies.length} copies` : rp.m.name;
+    $('rp-bake-q').textContent = `How should ${what} go on ${rp.target.name}? As separate parts fixed to it, merged into its mesh, or cut into it (as deep as they sink in). It's a modifier either way: you can switch, turn it off or apply it later.`;
+    $('rp-merge').textContent = `Merge into ${rp.target.name}`; $('rp-cut').textContent = `Cut into ${rp.target.name}`;
+    $('rp-btns').hidden = true; $('rp-bake').hidden = false; });
+  $('rp-keep').addEventListener('click', () => finish('keep'));
+  $('rp-merge').addEventListener('click', () => finish('add'));
+  $('rp-cut').addEventListener('click', () => finish('cut'));
+  $('rp-back').addEventListener('click', () => { $('rp-bake').hidden = true; $('rp-btns').hidden = false; });
+  $('rp-cancel').addEventListener('click', () => { const kind = rp?.kind; endReliefPlace(false); toast(kind === 'scatter' ? 'Scattered nothing.' : 'Left the relief where it was.'); });
+  // scattering
+  ['sc-n', 'sc-gap', 'sc-smin', 'sc-smax', 'sc-jit', 'sc-tilt', 'sc-axis', 'sc-margin'].forEach(id => $(id).addEventListener('change', re));
+  $('sc-inside').addEventListener('change', re); $('sc-through').addEventListener('change', re); $('sc-poke').addEventListener('change', re);
+  $('sc-shuffle').addEventListener('click', () => { if (!rp) return; rp.seed = (Math.random() * 2 ** 31) | 0; re(); });
+  document.querySelectorAll('#sc-turn button').forEach(b => b.addEventListener('click', () => { if (!rp) return; rp.turn = b.dataset.v;
+    document.querySelectorAll('#sc-turn button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); re(); }));
+}
+
+// skeleton: joint to joint lines, drawn every frame
+const linkLines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: '#7fd3c4', depthTest: false, transparent: true, opacity: .95 }));
+linkLines.renderOrder = 999; linkLines.frustumCulled = false; scene.add(linkLines);
+function updateSkeleton() {
+  const show = $('set-joints').checked, pts = [];
+  if (show) for (const j of joints) {
+    if (!j.parent || !isVisibleChain(j)) continue;
+    const a = V().setFromMatrixPosition(j.matrixWorld);
+    const fixedPart = j.parent, up = jointOf(fixedPart);
+    const b = up ? V().setFromMatrixPosition(up.matrixWorld) : worldBox(fixedPart).getCenter(V());
+    pts.push(b, a);
+  }
+  skeleton.geometry.setFromPoints(pts);
+  const lp = [];
+  if (show) for (const l of links) {
+    const a = partByUuid(l.a), b = partByUuid(l.b); if (!a || !b || !isVisibleChain(a) || !isVisibleChain(b)) continue;
+    const pa = V(...l.pa).applyMatrix4(a.matrixWorld), pb = V(...l.pb).applyMatrix4(b.matrixWorld), s2 = markerSize() * 1.2;
+    for (const d of [V(s2, 0, 0), V(0, s2, 0), V(0, 0, s2)]) lp.push(pa.clone().sub(d), pa.clone().add(d));
+    if (l.kind === 'rail') { const ax = railAxisLocal(l).transformDirection(b.matrixWorld), lo = l.min ?? -s2 * 8, hi = l.max ?? s2 * 8; lp.push(pb.clone().addScaledVector(ax, lo), pb.clone().addScaledVector(ax, hi)); }
+    else if (pa.distanceTo(pb) > 1e-3) lp.push(pa, pb);
+  }
+  linkLines.geometry.setFromPoints(lp);
+  updateConnMark();
+}
+
+// ---------------------------------------------------------------------------
+// Camera framing, layout, import, sample
+// ---------------------------------------------------------------------------
+function frame(box) {
+  if (box.isEmpty()) return;
+  const c = box.getCenter(V()), r = Math.max(box.getSize(V()).length() / 2, 5);
+  const dir = camera.position.clone().sub(orbit.target).normalize();
+  if (camera.isOrthographicCamera) {                     // no perspective: back off well clear, and zoom so it fits
+    orbit.target.copy(c); camera.position.copy(c).addScaledVector(dir, r * 4);
+    camera.zoom = ORTHO_H * Math.min(1, (camera.right - camera.left) / (camera.top - camera.bottom)) / (r * 1.05);
+    camera.near = r / 100; camera.far = r * 200; camera.updateProjectionMatrix(); orbit.update(); markViewMoved(); return;
+  }
+  orbit.target.copy(c); camera.position.copy(c).addScaledVector(dir, r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05);
+  camera.near = r / 100; camera.far = r * 200; camera.updateProjectionMatrix();
+}
+function placeBeside(mesh) {
+  const others = liveParts().filter(p => p !== mesh);
+  if (!others.length) return;
+  const sb = sceneBox(others), mb = worldBox(mesh);
+  applyWorld(mesh, Tr(V(sb.max.x + 8 - mb.min.x, (sb.min.y + sb.max.y) / 2 - (mb.min.y + mb.max.y) / 2, -mb.min.z)));
+}
+/** New imports side by side as a screen-shaped block (golden ratio), beside whatever is already on the bench. */
+function placeNew(list) {
+  const ms = list.filter(m => m.parent === world); if (!ms.length) return;
+  if (ms.length === 1) { placeBeside(ms[0]); return; }
+  const others = liveParts().filter(p => !ms.includes(p) && !ms.some(m => isDescendant(p, m)));
+  const boxes = ms.map(p => ({ p, b: worldBox(p) }))
+    .sort((a, c) => (c.b.max.y - c.b.min.y) - (a.b.max.y - a.b.min.y) || a.p.name.localeCompare(c.p.name, undefined, { numeric: true }));
+  const { pos, w, h } = goldenPack(boxes.map(({ b }) => ({ w: b.max.x - b.min.x, h: b.max.y - b.min.y })), 8);
+  const sb = others.length ? sceneBox(others) : null, x0 = sb ? sb.max.x + 15 : -w / 2, yc = sb ? (sb.min.y + sb.max.y) / 2 : 0;
+  boxes.forEach(({ p, b }, i) => applyWorld(p, Tr(V(x0 + pos[i].x - b.min.x, yc + h / 2 - pos[i].y - b.max.y, -b.min.z))));
+}
+function layOut() {
+  const roots = liveParts().filter(p => p.parent === world);
+  if (!roots.length) return;
+  pushUndo(); lastOp = null;
+  // rows of parts in a block about as wide as a screen (golden ratio), tallest first, copies side by side
+  const boxes = roots.map(p => ({ p, b: worldBox(p) }))
+    .sort((a, c) => (c.b.max.y - c.b.min.y) - (a.b.max.y - a.b.min.y) || a.p.name.localeCompare(c.p.name, undefined, { numeric: true }));
+  const { pos, w, h } = goldenPack(boxes.map(({ b }) => ({ w: b.max.x - b.min.x, h: b.max.y - b.min.y })), 8);
+  boxes.forEach(({ p, b }, i) => applyWorld(p, Tr(V(pos[i].x - w / 2 - b.min.x, h / 2 - pos[i].y - b.max.y, -b.min.z))));
+  afterHierarchyChange(); fitMat(true); frame(sceneBox());
+}
+function applyAll(T, list) { list.forEach(p => applyWorld(p, T)); }
+
+async function importFiles(files) {
+  const list = [...files].filter(f => /\.stl$/i.test(f.name));
+  if (!list.length) { toast("Only .stl files can be imported.", 'bad'); return; }
+  await loadBatch(list.map(f => ({ file: f, path: f.name, name: f.name.replace(/\.stl$/i, ''), size: f.size })), null, project.name || 'Kit');
+}
+/** Load files with the loading popup for anything more than a couple; onto sprues with no box yet, they arrive sealed in a plain one. */
+const LOAD_MODE_WORDS = { kit: 'as a model kit, on sprues', spread: 'spread out', asis: 'where the files put them', auto: 'automatically' };
+async function loadBatch(entries, src, name, chosen = null) {
+  const mode = entries.length > 1 ? chosen || await askLoadMode(entries.length, src ? name : '', entries) : 'auto';
+  if (!mode) { toast('Nothing loaded.'); return; }
+  const kitMode = mode === 'kit', big = entries.length > 2 || kitMode;
+  if (big) loading.show(kitMode ? `Packing ${name}` : `Loading ${entries.length} files`);
+  if (kitMode) matHold++;
+  try {
+    const hadSprues = !!sprues;
+    await loadGroup(entries, src, big ? { mode, progress: (f, t) => loading.set(f * 0.85, t) } : { mode });
+    if (kitMode && sprues && (!kit || (kit.state !== 'open' && !hadSprues))) {
+      loading.set(0.9, kit ? 'Packing the box…' : 'Printing the box…'); await nextFrame();
+      if (kit) { kit.state = 'sealed'; kit.noBox = false; await buildKit(); }      // into the box: it comes back out if it was put away else await makeKit(name, [], liveParts().length, { always: true, state: 'sealed' });
+      fitMat(true); markDirty(); loading.hide(); await unboxNow(); loading.depth++;
+    }
+  } finally { if (big) loading.hide(); if (matHold) { matHold = 0; fitMat(true); } }
+}
+function frameBox() { const o = kitFx.getObjectByName('kit-box'); if (!o) return; o.updateMatrixWorld(true); const b = new THREE.Box3().setFromObject(o); b.expandByScalar(b.getSize(V()).length() * 0.45); frame(b); }
+const nextFrame = () => new Promise(r => { let done = false; const go = () => { if (!done) { done = true; r(); } };
+  requestAnimationFrame(() => setTimeout(go, 0)); setTimeout(go, 60); });   // keeps going in a background tab
+
+/**
+ * Load STL entries. A single file goes beside what's on the bench. Several files keep their own
+ * coordinates if they look exported in their assembled places (then Link in place opens);
+ * if they're all piled at the origin they're laid out side by side instead.
+ */
+async function loadGroup(entries, src, opts = {}) {
+  pushUndo(); lastOp = null; closeAutorig(false);
+  const progress = opts.progress || (() => {});
+  const loader = new STLLoader(), added = [], failed = [], counted = [], mirrored = []; let copies = 0;
+  for (const [k, e] of entries.entries()) {
+    e.state = 'loading'; renderFolderStatus();
+    toast(`Loading ${k + 1} of ${entries.length}: ${e.name}`); progress(k / entries.length, `Reading ${e.name} (${k + 1} of ${entries.length})`);
+    await nextFrame();
+    try {
+      const geom = loader.parse(await e.file.arrayBuffer());
+      if (!geom.attributes.position || geom.attributes.position.count < 3) throw new Error('empty');
+      const q = $('set-qty').checked ? parseQuantity(e.name) : { base: e.name, count: 1 };
+      const mi = $('set-mirror').checked ? parseMirror(q.base) : { mirror: false };      // "Arm (mirror for right)": one as it is, one mirrored
+      if (mi.mirror) q.base = mi.base;
+      const m = addPart(q.count > 1 ? `${q.base} 1-${q.count}` : mi.mirror ? q.base : e.name, geom);
+      m.userData.part.source = src ? { folder: src.id, path: e.path } : null;
+      if (src?.offset) applyWorld(m, Tr(src.offset));
+      e.partId = m.uuid; e.state = 'loaded'; added.push(m);
+      for (let i = 2; i <= q.count; i++) {                 // "Leg x8": the kit needs 8 of these
+        const c = addPart(`${q.base} ${i}-${q.count}`, m.geometry, { welded: true, geomKey: m.userData.part.geomKey, color: m.userData.part.color });
+        c.userData.part.source = m.userData.part.source; c.matrix.copy(m.matrix); c.matrix.decompose(c.position, c.quaternion, c.scale);
+        added.push(c); copies++;
+      }
+      if (q.count > 1) counted.push(`${q.base} ×${q.count}`);
+      if (mi.mirror) {                                     // each copy gets a mirrored twin, sharing one flipped mesh
+        const mg = mirroredGeometry(m.geometry, $('set-mirror-axis').value), key = THREE.MathUtils.generateUUID(), twins = added.slice(-q.count);
+        for (const o of twins) {
+          const c = addPart(mirrorCopyName(o.name, mi.forName), mg, { welded: true, geomKey: key, color: o.userData.part.color });
+          c.userData.part.source = o.userData.part.source; c.matrix.copy(o.matrix); c.matrix.decompose(c.position, c.quaternion, c.scale);
+          added.push(c); copies++;
+        }
+        mirrored.push(mi.forName ? `${q.base} (for ${mi.forName})` : q.base);
+      }
+    } catch (err) { e.state = 'failed'; failed.push(e.name); }
+    renderFolderStatus();
+  }
+  if (!added.length) { afterHierarchyChange(); toast(`Couldn't read ${failed.join(', ')}. Check they're valid STL files.`, 'bad'); return; }
+  const copyNote = (counted.length ? ` Made copies from the file names: ${counted.join(', ')}.` : '') + (mirrored.length ? ` Mirrored copies, as the file names ask: ${mirrored.join(', ')}.` : '');
+  const mode = opts.mode || 'auto';
+  // a kit on sprues: every new piece goes on the plastic
+  if (mode === 'kit') {
+    progress(1, 'Moulding the sprues…'); await nextFrame();
+    layOnSprues(added);
+    finishLoad(added, failed, `${added.length} piece${added.length > 1 ? 's' : ''} on ${sprues?.frames.length || 0} sprue${sprues?.frames.length === 1 ? '' : 's'}.${copyNote} Move or snap a piece to clip it off.`);
+    return;
+  }
+  // which parts share a coordinate system with the new ones: everything loose from the same folder
+  const group = src ? liveParts().filter(m => m.userData.part.source?.folder === src.id && !parentPart(m)) : added;
+  const others = liveParts().filter(m => !group.includes(m));
+  if (mode === 'spread' || (mode === 'auto' && (group.length < 2 || copies))) {     // copies sit on top of each other: spread them out
+    placeNew(added);
+    finishLoad(added, failed, (added.length > 1 ? `Loaded ${added.length} parts.` : `Loaded ${added[0].name}.`) + copyNote);
+    return;
+  }
+  if (looksStacked(group)) {
+    if (mode === 'asis') { finishLoad(added, failed, `Left where the files put them. They're each centred on the origin, so they overlap: Kit › Lay out parts spreads them.${copyNote}`); return; }
+    placeNew(added);
+    finishLoad(added, failed, `These files are each centred on the origin rather than placed where they fit, so they're laid out side by side. Snap them together by hand.`);
+    return;
+  }
+  // assembled: keep their positions, but move the whole group clear of anything else on the bench
+  if (others.length && !(src && src.offset)) {
+    const gb = sceneBox(group), sb = sceneBox(others);
+    const off = V(sb.max.x + 12 - gb.min.x, (sb.min.y + sb.max.y) / 2 - (gb.min.y + gb.max.y) / 2, sb.min.z - gb.min.z);
+    group.forEach(m => applyWorld(m, Tr(off)));
+    if (src) src.offset = off;
+  } else if (src && !src.offset) src.offset = V();
+  // only treat them as assembled if they actually touch: most loose kits are just scattered about
+  const pairs = await findAllContacts(group);
+  if (!pairs.length) {
+    if (mode === 'asis') { finishLoad(added, failed, `Left where the files put them.${copyNote}`); return; }
+    placeNew(added);
+    finishLoad(added, failed, added.length > 1 ? 'None of these parts touch where they were exported, so they\'re laid out side by side. Snap them together by hand.' : `Loaded ${added[0].name}.`);
+    return;
+  }
+  finishLoad(added, failed, null);
+  Object.assign(ar, { meshes: group, pairs, root: null }); ar.plan = planRig(group, pairs);
+  openAutorig({ auto: true });
+}
+function finishLoad(added, failed, msg) {
+  afterHierarchyChange(); fitMat();
+  select(added[added.length - 1]); frame(sceneBox());
+  if (failed.length) toast(`Couldn't read ${failed.join(', ')}. Check they're valid STL files.`, 'bad');
+  else if (msg) toast(msg, 'ok');
+}
+
+// ---------------------------------------------------------------------------
+// Folder browser
+// ---------------------------------------------------------------------------
+const folder = { id: null, name: '', entries: [], offset: null };
+const fmtSize = b => b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
+
+async function readDropped(entries) {          // walk dropped folders (readEntries returns batches)
+  const out = [];
+  const walk = async (en, prefix) => {
+    if (en.isFile) { const file = await new Promise((res, rej) => en.file(res, rej)); out.push({ file, path: prefix + en.name }); return; }
+    const reader = en.createReader();
+    for (;;) { const batch = await new Promise((res, rej) => reader.readEntries(res, rej)); if (!batch.length) break;
+      for (const c of batch) await walk(c, prefix + en.name + '/'); }
+  };
+  for (const en of entries) await walk(en, '');
+  return out;
+}
+async function openFolder(list, name) {
+  const depth = x => x.path.split('/').length;                 // the folder's own files first, then subfolders
+  const stls = list.filter(x => /\.stl$/i.test(x.file.name))
+    .sort((a, b) => (depth(a) > 2) - (depth(b) > 2) || a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' }));
+  if (!stls.length) { toast(`No STL files in ${name}.`, 'bad'); return; }
+  // a fresh bench that only shows the untouched sample kit becomes this folder's project
+  if (project.pristine) await newProject(name, true);
+  const base = stls.map(x => x.file.name.replace(/\.stl$/i, ''));
+  Object.assign(folder, { id: THREE.MathUtils.generateUUID(), name, offset: null });
+  folder.entries = stls.map((x, k) => {
+    const rel = x.path.split('/').slice(1).join('/') || x.file.name;          // path inside the folder
+    const dup = base.filter(b => b === base[k]).length > 1;
+    return { file: x.file, path: rel, dir: rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '', name: dup ? rel.replace(/\.stl$/i, '') : base[k],
+             size: x.file.size, selected: true, state: null, partId: null, thumb: null };
+  });
+  // how to set them out comes first, before the file list: a big folder then loads what you tick that way
+  const total = folder.entries.reduce((a, e) => a + e.size, 0);
+  const mode = folder.entries.length > 1 ? await askLoadMode(folder.entries.length, name, folder.entries) : 'auto';
+  folder.mode = mode || null;
+  // then which parts: every one ticked unless the folder is big, when you tick what you want
+  const small = folder.entries.length <= 40 && total <= 200 * 1048576;
+  const go = mode && (folder.entries.length < 2 || await pickParts(name, folder.entries, mode, small));
+  $('tab-files').hidden = false; $('folder-name').textContent = name; $('folder-filter').value = '';
+  if (!go) {                                       // cancelled: the files are listed, nothing is loaded
+    folder.entries.forEach(e => { e.selected = false; }); renderFolder(); showDockTab('tab-files');
+    $('folder-note').textContent = 'Nothing loaded yet. Tick the files you want, then Load selected.'; toast(`Opened ${name}. Nothing loaded.`); return;
+  }
+  renderFolder();
+  if (folder.entries.some(e => e.selected)) {
+    $('folder-note').textContent = folder.entries.every(e => e.selected) ? 'Loaded every file.' : 'Loaded the ones you picked. Tick more and Load selected to add them.';
+    const onSprues = mode === 'kit'; if (onSprues) matHold++;
+    loading.show(onSprues ? `Packing ${name}` : `Opening ${name}`);
+    try {
+      await loadGroup(folder.entries.filter(e => e.selected), folder, { mode, progress: (f, t) => loading.set(f * 0.8, t) });
+      const seal = onSprues && !!sprues && !kit;
+      loading.set(0.85, seal ? 'Printing the box…' : 'Setting out the bench…'); await nextFrame();
+      await makeKit(name, list, liveParts().length, seal ? { always: true, state: 'sealed' } : {}); fitMat(true);
+      if (seal) { loading.set(1, 'Opening the box…'); loading.hide(); await unboxNow(); loading.depth++; }
+      else if (onSprues) { matHold = 0; fitMat(true); }
+      else if (kit) { frame(benchBox()); toast(`Opened the ${name} kit${kit.image ? ' box' : ''}${kit.pdf ? ' with its instructions. Click the booklet to read them' : ''}.`, 'ok'); }
+      loading.set(1, 'Ready');
+    } finally { loading.hide(); if (matHold) { matHold = 0; fitMat(true); } }
+  } else {
+    await makeKit(name, list, 0);
+    renderFolder(); showDockTab('tab-files');
+    $('folder-note').textContent = `${folder.entries.length} files, ${fmtSize(total)} in all. Tick the ones you want, then Load selected. They'll be set out ${LOAD_MODE_WORDS[mode] || 'as you chose'}.`;
+    toast(`Opened ${name}. Pick the files to load.`);
+  }
+  // later loads from the list are new picks: start them unticked
+  folder.entries.forEach(e => { if (e.state === 'loaded') e.selected = false; }); renderFolder();
+}
+/**
+ * After the layout: a screen of the folder's parts, each with a picture, to tick the ones to load.
+ * Sets each entry's `selected`; resolves true to load them, false if cancelled.
+ */
+function pickParts(name, entries, mode, all = true) {
+  entries.forEach(e => { e.selected = all; });
+  $('pp-sub').textContent = `${entries.length} files in ${name} · ${{ kit: 'Model kit', spread: 'Spread out', asis: 'Where the files put them', auto: 'Set out for you' }[mode] || ''}`;
+  $('pp-note').textContent = all ? '' : 'A big folder: tick just the parts you want.';
+  $('pp-filter').value = '';
+  const box = $('pickparts'), grid = $('pp-grid');
+  const count = () => { const n = entries.filter(e => e.selected).length, sz = entries.filter(e => e.selected).reduce((a, e) => a + e.size, 0);
+    $('pp-count').textContent = `${n} of ${entries.length} ticked` + (n ? ` · ${fmtSize(sz)}` : ''); $('pp-load').textContent = n ? `Load ${n} part${n > 1 ? 's' : ''}` : 'Load'; $('pp-load').disabled = !n; };
+  const draw = () => {
+    const q = $('pp-filter').value.trim().toLowerCase(); grid.innerHTML = ''; let lastDir = null, shown = 0;
+    for (const e of entries) {
+      if (q && !e.path.toLowerCase().includes(q)) continue; shown++;
+      if (e.dir !== lastDir) { lastDir = e.dir; if (e.dir) { const g = document.createElement('div'); g.className = 'pp-dir'; g.textContent = e.dir + '/'; grid.append(g); } }
+      const it = document.createElement('label'); it.className = 'pp-item' + (e.selected ? ' on' : ''); it.setAttribute('role', 'listitem'); it.title = e.path;
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = e.selected; cb.setAttribute('aria-label', `Load ${e.name}`);
+      cb.addEventListener('change', () => { e.selected = cb.checked; it.classList.toggle('on', cb.checked); count(); });
+      const big = e.size > 30 * 1048576, th = document.createElement(big ? 'div' : 'img'); th.className = 'thumb' + (big ? ' big' : ''); th.alt = '';
+      if (big) th.textContent = 'large file'; else if (e.thumb) th.src = e.thumb; else queueThumb(e, th);
+      const fn = document.createElement('span'); fn.className = 'fn'; fn.textContent = e.name;
+      const fs = document.createElement('span'); fs.className = 'fs'; fs.textContent = fmtSize(e.size);
+      it.append(cb, th, fn, fs); grid.append(it);
+    }
+    if (!shown) grid.innerHTML = '<div class="empty">No parts match.</div>';
+    count();
+  };
+  const shownEntries = () => { const q = $('pp-filter').value.trim().toLowerCase(); return entries.filter(e => !q || e.path.toLowerCase().includes(q)); };
+  return new Promise(res => {
+    const on = [];
+    const bind = (el, ev, fn) => { el.addEventListener(ev, fn); on.push(() => el.removeEventListener(ev, fn)); };
+    const done = v => { box.hidden = true; on.forEach(f => f()); grid.innerHTML = ''; res(v); };
+    bind($('pp-filter'), 'input', draw);
+    bind($('pp-all'), 'click', () => { shownEntries().forEach(e => { e.selected = true; }); draw(); });
+    bind($('pp-none'), 'click', () => { shownEntries().forEach(e => { e.selected = false; }); draw(); });
+    bind($('pp-load'), 'click', () => done(true));
+    bind($('pp-cancel'), 'click', () => done(false));
+    bind(box, 'keydown', e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); done(false); } else if (e.key === 'Enter' && !e.target.matches('button') && !$('pp-load').disabled) { e.preventDefault(); done(true); } });
+    box.hidden = false; draw(); $('pp-load').focus();
+  });
+}
+function renderFolder() {
+  const box = $('folder-list'), q = $('folder-filter').value.trim().toLowerCase();
+  box.innerHTML = '';
+  let lastDir = null, shown = 0;
+  for (const e of folder.entries) {
+    if (q && !e.path.toLowerCase().includes(q)) continue;
+    shown++;
+    if (e.dir !== lastDir) { lastDir = e.dir; if (e.dir) { const g = document.createElement('div'); g.className = 'fgroup'; g.textContent = e.dir + '/'; box.append(g); } }
+    const row = document.createElement('label'); row.className = 'frow'; row.setAttribute('role', 'listitem');
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = e.selected; cb.setAttribute('aria-label', `Select ${e.name}`);
+    cb.addEventListener('change', () => { e.selected = cb.checked; updateFolderButtons(); });
+    const th = document.createElement(e.size > 30 * 1048576 ? 'div' : 'img');
+    th.className = 'thumb' + (e.size > 30 * 1048576 ? ' big' : ''); th.alt = '';
+    if (e.size > 30 * 1048576) th.textContent = 'large file'; else { if (e.thumb) th.src = e.thumb; else queueThumb(e, th); }
+    const fn = document.createElement('span'); fn.className = 'fn'; fn.textContent = e.name;
+    const fs = document.createElement('span'); fs.className = 'fs'; fs.textContent = fmtSize(e.size);
+    const fp = document.createElement('span'); fp.className = 'fp'; fp.textContent = e.path;
+    const chip = document.createElement('span'); chip.className = 'chip'; chip.hidden = true; e.chip = chip;
+    chip.addEventListener('click', ev => { const m = liveParts().find(p => p.uuid === e.partId); if (m) { ev.preventDefault(); select(m); frame(sceneBox(subtreeParts(m))); } });
+    row.append(cb, th, fn, fs, fp, chip); box.append(row);
+  }
+  if (!shown) box.innerHTML = '<div class="empty">No files match.</div>';
+  renderFolderStatus(); updateFolderButtons();
+}
+function renderFolderStatus() {
+  if ($('tab-files').hidden) return;
+  const live = new Set(liveParts().map(m => m.uuid));
+  let onBench = 0;
+  for (const e of folder.entries) {
+    if (e.state === 'loaded' && !live.has(e.partId)) e.state = null;     // deleted from the bench
+    if (e.state === 'loaded') onBench++;
+    if (!e.chip) continue;
+    e.chip.hidden = !e.state;
+    e.chip.className = 'chip' + (e.state === 'loading' ? ' busy' : e.state === 'failed' ? ' bad' : '');
+    e.chip.textContent = e.state === 'loading' ? 'loading' : e.state === 'failed' ? "couldn't read" : 'on bench';
+    e.chip.title = e.state === 'loaded' ? 'Click to select it on the bench' : '';
+  }
+  $('folder-count').textContent = `${onBench}/${folder.entries.length} on bench`;
+  updateFolderButtons();
+}
+function updateFolderButtons() {
+  const n = folder.entries.filter(e => e.selected && e.state !== 'loaded').length;
+  $('folder-load').textContent = n ? `Load ${n} file${n > 1 ? 's' : ''}` : 'Load selected';
+  $('folder-load').disabled = !n;
+}
+
+// thumbnails: rendered lazily, one at a time, with a small second renderer
+let thumbR = null; const thumbQ = []; let thumbBusy = false;
+const thumbIO = 'IntersectionObserver' in window ? new IntersectionObserver(list => {
+  for (const it of list) if (it.isIntersecting) { thumbIO.unobserve(it.target); thumbQ.push(it.target._job); pumpThumbs(); }
+}, { rootMargin: '80px' }) : null;
+function queueThumb(e, img) { img._job = { e, img }; if (thumbIO) thumbIO.observe(img); else { thumbQ.push(img._job); pumpThumbs(); } }
+async function pumpThumbs() {
+  if (thumbBusy) return; thumbBusy = true;
+  while (thumbQ.length) {
+    const { e, img } = thumbQ.shift();
+    if (!e.thumb) { try { e.thumb = await renderThumb(e.file); } catch (err) { e.thumb = ''; } }
+    if (e.thumb && img.isConnected) img.src = e.thumb;
+    await nextFrame();
+  }
+  thumbBusy = false;
+}
+async function renderThumb(file) {
+  if (!thumbR) {
+    thumbR = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    thumbR.setSize(88, 88, false); thumbR.setPixelRatio(1);
+  }
+  const g = new STLLoader().parse(await file.arrayBuffer()); g.computeBoundingBox();
+  const sc = new THREE.Scene(), b = g.boundingBox, c = b.getCenter(V()), r = Math.max(b.getSize(V()).length() / 2, 1e-3);
+  sc.add(new THREE.HemisphereLight('#e8edf2', '#3a332c', 2.2));
+  const d = new THREE.DirectionalLight('#ffffff', 1.4); d.position.set(1, -1.5, 2); sc.add(d);
+  sc.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: '#b9b3a6', roughness: .7, flatShading: true })));
+  const cam = new THREE.PerspectiveCamera(30, 1, r / 50, r * 20); cam.up.set(0, 0, 1);
+  cam.position.copy(c).add(V(1, -1.3, 0.9).normalize().multiplyScalar(r / Math.sin(THREE.MathUtils.degToRad(15)) * 1.02)); cam.lookAt(c);
+  thumbR.render(sc, cam);
+  const url = thumbR.domElement.toDataURL('image/png');
+  g.dispose(); return url;
+}
+
+// ---------------------------------------------------------------------------
+// Link in place: contacts -> joints and parent links
+// ---------------------------------------------------------------------------
+const ar = { meshes: [], pairs: [], plan: null, root: null, busy: false };
+const rigPreview = new THREE.Group(); scene.add(rigPreview);
+const KIND_LABEL = { ball: 'ball joint', socket: 'peg / socket', flat: 'flat contact' };
+
+async function runAutorig(meshes, opts = {}) {
+  if (ar.busy) return;
+  if (meshes.length < 2) { toast('Link in place needs at least two loose parts on the bench.'); return; }
+  if (looksStacked(meshes)) {
+    toast("These parts are piled on top of each other, each centred on the origin, so their positions don't say how they fit. Lay them out and snap them by hand.", 'bad');
+    return;
+  }
+  ar.busy = true; ar.meshes = meshes; ar.root = null;
+  ar.pairs = await findAllContacts(meshes); ar.busy = false;
+  ar.plan = planRig(meshes, ar.pairs);
+  openAutorig(opts);
+}
+async function findAllContacts(meshes) {
+  const tol = Math.max(+$('ar-tol').value || 0.3, 0.01);
+  const ctx = contactContext(meshes), pairs = [];
+  const total = meshes.length * (meshes.length - 1) / 2; let done = 0, t0 = performance.now();
+  for (let i = 0; i < meshes.length; i++) for (let j = i + 1; j < meshes.length; j++) {
+    done++;
+    if (performance.now() - t0 > 120) { toast(`Finding where parts touch… ${done} of ${total} pairs`); await nextFrame(); t0 = performance.now(); }
+    try { const c = contactBetween(ctx, i, j, tol); if (c) pairs.push(c); } catch (err) { console.warn('contact check failed', err); }
+  }
+  return pairs;
+}
+function openAutorig(opts = {}) {
+  const { meshes, plan, pairs } = ar;
+  $('autorig').hidden = false;
+  const sel = $('ar-root'); sel.innerHTML = '';
+  meshes.forEach((m, k) => { const o = document.createElement('option'); o.value = k; o.textContent = m.name; sel.append(o); });
+  sel.value = plan.root;
+  $('ar-sum').textContent = `${meshes.length} parts · ${pairs.length} contact${pairs.length === 1 ? '' : 's'}`;
+  $('ar-note').textContent = !pairs.length
+    ? `The files kept their own positions, but no two parts are within ${(+$('ar-tol').value).toFixed(2)} mm of each other. If they should fit together, raise the contact tolerance and detect again.`
+    : `${opts.auto ? 'These files are already in their assembled places, so they kept their positions. ' : ''}Each part hangs off the neighbour it touches most. Change what anything hangs off, or make parts options of each other (heads, weapons that swap in the same spot): use the menus, or drag a part by its ⋮⋮ onto another part's name to attach it, or onto its right end to make it an option. Then build the rig.`;
+  rowsFromPlan(); renderAutorigList();
+  showRigPreview();
+  if (opts.auto && pairs.length) toast(`Found ${pairs.length} contact${pairs.length === 1 ? '' : 's'} between ${meshes.length} parts. Review them in Link in place.`, 'ok');
+}
+/* The review is a tree the user can rearrange before anything is built: per part, what it connects to (and how),
+   or which part it's an option of. ar.rows[k] = { parent: index | -1, how: 'joint' | 'plain', optionOf: index | -1, edge } */
+function rowsFromPlan() {
+  ar.rows = ar.meshes.map(() => ({ parent: -1, how: 'joint', optionOf: -1, edge: null }));
+  for (const e of ar.plan.edges) ar.rows[e.child] = { parent: e.parent, how: e.how === 'skip' ? 'joint' : e.how, optionOf: -1, edge: e };
+}
+/** The contact between two parts as a joint (point, axis pointing from parent to child), or null if they don't touch. */
+function edgeBetween(child, parent) {
+  const p = ar.pairs.find(q => (q.i === child && q.j === parent) || (q.j === child && q.i === parent)); if (!p) return null;
+  const pl = planRig([ar.meshes[parent], ar.meshes[child]], [{ ...p, i: p.i === parent ? 0 : 1, j: p.j === parent ? 0 : 1,
+    nOut: { 0: p.nOut[parent], 1: p.nOut[child] }, nCnt: { 0: p.nCnt[parent], 1: p.nCnt[child] } }], 0);
+  const e = pl.edges[0]; return e ? { pair: p, joint: e.joint, axis: e.axis, kind: e.kind, how: e.how } : null;
+}
+const arTarget = k => { let t = k, n = 0; while (ar.rows[t].optionOf >= 0 && n++ < 64) t = ar.rows[t].optionOf; return t; };     // the part an option stands in for
+/** Where a part really hangs: an option hangs wherever the part it stands in for does. */
+const arParent = k => ar.rows[arTarget(k)].parent;
+function arBelow(k, anc) { let p = arParent(k), n = 0; while (p >= 0 && n++ < 64) { if (p === anc) return true; p = arParent(p); } return false; }
+function arCan(src, dst, zone) {
+  if (src === dst) return false;
+  if (zone === 'loose') return ar.rows[src].parent >= 0 || ar.rows[src].optionOf >= 0;
+  if (dst < 0 || arBelow(dst, src)) return false;                      // never under its own branch
+  if (zone === 'attach') return !(ar.rows[src].parent === dst && ar.rows[src].optionOf < 0) && arTarget(dst) !== src;
+  return arTarget(dst) !== arTarget(src) || ar.rows[src].optionOf < 0 && arTarget(dst) !== src;
+}
+function arSet(src, dst, zone) {
+  const r = ar.rows[src];
+  if (zone === 'loose') Object.assign(r, { parent: -1, optionOf: -1, edge: null });
+  else if (zone === 'attach') { const e = edgeBetween(src, dst); Object.assign(r, { parent: dst, optionOf: -1, edge: e, how: e ? e.how : 'plain' }); }
+  else { r.optionOf = arTarget(dst); for (const o of ar.rows) if (o.optionOf === src) o.optionOf = r.optionOf; }   // its own options join the same group
+  renderAutorigList(); showRigPreview();
+}
+/** The links the review will build, for the preview and for Build. */
+function arEdges() {
+  return ar.rows.map((r, k) => {
+    if (r.optionOf >= 0 || r.parent < 0) return null;
+    const e = r.edge || edgeBetween(k, r.parent);
+    return { child: k, parent: r.parent, how: e ? r.how : 'plain', joint: e ? e.joint : partBox(ar.meshes[k]).getCenter(V()), axis: e ? e.axis : V(0, 0, 1), kind: e ? e.kind : 'none', pair: e?.pair || null };
+  }).filter(Boolean);
+}
+function renderAutorigList() {
+  const { meshes, rows } = ar, box = $('ar-list'); box.innerHTML = '';
+  const names = meshes.map(m => m.name);
+  const pick = (label, value, opts, onChange, title) => {
+    const s = document.createElement('select'); s.className = 'num ar-pick'; s.setAttribute('aria-label', label); s.title = title;
+    for (const [v, t, dis] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; o.disabled = !!dis; s.append(o); }
+    s.value = String(value); s.addEventListener('change', () => onChange(+s.value)); return s;
+  };
+  const draw = (k, depth, asOption) => {
+    const r = rows[k], m = meshes[k], e = r.optionOf < 0 && r.parent >= 0 ? (r.edge || edgeBetween(k, r.parent)) : null;
+    const row = document.createElement('div'); row.className = 'ar-row dnd-row' + (asOption ? ' is-option' : '') + (r.parent < 0 && r.optionOf < 0 ? ' is-root' : '');
+    row.setAttribute('role', 'treeitem'); row.setAttribute('aria-level', String(depth + 1)); row.draggable = true; row._key = k; row.style.paddingLeft = (6 + depth * 14) + 'px';
+    const who = document.createElement('div'); who.className = 'who';
+    const grip = document.createElement('span'); grip.className = 'grip'; grip.textContent = '⋮⋮'; grip.title = 'Drag onto another part: on its name to attach, on its right end to make it an option';
+    const nm = document.createElement('b'); nm.textContent = m.name;
+    who.append(grip, ...(asOption ? [Object.assign(document.createElement('span'), { className: 'opt-mark', textContent: '⇄', title: `An alternate for ${names[r.optionOf]}` })] : depth ? [Object.assign(document.createElement('span'), { className: 'arrow', textContent: e && r.how === 'joint' ? '◆' : '└' })] : []), nm);
+    row.append(who);
+    if (!asOption && r.parent >= 0) {           // how it attaches
+      const seg = document.createElement('div'); seg.className = 'seg'; seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', `How ${m.name} attaches`);
+      for (const [v, t, tip] of [['joint', 'Pinned', 'Turns any way about where they touch (set Hinge or Roller in Properties after building)'], ['plain', 'Fixed', 'Follows its parent, no joint']]) {
+        const b = document.createElement('button'); b.type = 'button'; b.textContent = t; b.title = v === 'joint' && !e ? `${m.name} doesn't touch ${names[r.parent]}, so there's nowhere to put a joint` : tip;
+        b.disabled = v === 'joint' && !e; b.setAttribute('aria-pressed', (e ? r.how : 'plain') === v ? 'true' : 'false');
+        b.addEventListener('click', () => { r.how = v; renderAutorigList(); showRigPreview(); }); seg.append(b);
+      }
+      row.append(seg);
+    }
+    const meta = document.createElement('div'); meta.className = 'meta';
+    if (asOption) {
+      meta.append('alternate for', pick(`What ${m.name} is an alternate for`, r.optionOf, [[-1, '— not an alternate'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => arSet(k, v, v < 0 ? 'loose' : 'option'), 'Options swap for each other in the same spot'));
+    } else {
+      meta.append(depth ? 'on' : 'base', pick(`What ${m.name} attaches to`, r.parent, [[-1, depth ? '— nothing (leave loose)' : '— nothing'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'attach') && r.parent !== j])], v => arSet(k, v, v < 0 ? 'loose' : 'attach'), 'The part it hangs off'));
+      meta.append(pick(`Make ${m.name} an alternate for another part`, -1, [[-1, '⇄ alternate for…'], ...names.map((n, j) => [j, n, j === k || !arCan(k, j, 'option')])], v => { if (v >= 0) arSet(k, v, 'option'); }, 'Make it an alternative for another part in the same spot (a head, a weapon…)'));
+      if (r.parent >= 0) { const kd = document.createElement('span'); kd.className = 'kind ' + (e ? e.kind : 'none');
+        kd.textContent = e ? (KIND_LABEL[e.kind] || e.kind) + (e.kind === 'ball' && e.pair.radius ? ` ⌀${(e.pair.radius * 2).toFixed(2)}` : ` ≈${e.pair.area.toFixed(e.pair.area < 10 ? 1 : 0)} mm²`) : 'not touching'; meta.append(kd); }
+    }
+    row.append(meta);
+    row.addEventListener('mouseenter', () => showRigPreview(k)); row.addEventListener('mouseleave', () => showRigPreview());
+    row.addEventListener('dblclick', ev => { if (ev.target.closest('select, button')) return; frame(sceneBox([m, ...(r.parent >= 0 ? [meshes[r.parent]] : [])])); });
+    box.append(row);
+    rows.forEach((o, j) => { if (o.optionOf === k) draw(j, depth + 1, true); });
+    rows.forEach((o, j) => { if (o.optionOf < 0 && o.parent === k) draw(j, depth + 1, false); });
+  };
+  rows.forEach((r, k) => { if (r.parent < 0 && r.optionOf < 0) draw(k, 0, false); });
+  const edges = arEdges(), nOpt = rows.filter(r => r.optionOf >= 0).length, roots = rows.filter(r => r.parent < 0 && r.optionOf < 0).length;
+  const extra = [];
+  if (roots > 1) extra.push(`${roots} separate bases: drag one onto another part to join them up.`);
+  $('ar-extra').textContent = extra.join(' ');
+  // contacts the tree leaves out (each part has one parent): a piston's far end, a linkage. Tick to pin them too.
+  const used = new Set(edges.map(e => e.pair).filter(Boolean)), isOpt = k => rows[k].optionOf >= 0 || rows.some(o => o.optionOf === k);
+  const loops = ar.pairs.filter(q => !used.has(q) && !isOpt(q.i) && !isOpt(q.j));
+  ar.loopOn ||= new Set(); for (const q of [...ar.loopOn]) if (!loops.includes(q)) ar.loopOn.delete(q);
+  if (loops.length) {
+    const hd = document.createElement('div'); hd.className = 'ar-loops-h'; hd.textContent = 'Also connect (pistons, linkages)';
+    hd.title = 'These parts touch, but each part has only one parent, so the tree leaves the contact out. Tick it to pin them together as well: posing then moves the pistons to keep it connected.';
+    box.append(hd);
+    for (const q of loops) {
+      const lab = document.createElement('label'); lab.className = 'ar-loop';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = ar.loopOn.has(q);
+      cb.addEventListener('change', () => { if (cb.checked) ar.loopOn.add(q); else ar.loopOn.delete(q); renderAutorigList(); });
+      lab.append(cb, ` ${meshes[q.i].name} ↔ ${meshes[q.j].name}`, Object.assign(document.createElement('small'), { textContent: ` · ${KIND_LABEL[q.kind] || q.kind} ≈${q.area.toFixed(q.area < 10 ? 1 : 0)} mm²` }));
+      lab.addEventListener('mouseenter', () => { paintSelection(); meshes[q.i].material.emissive.set('#0d2f3d'); meshes[q.j].material.emissive.set('#3d200f'); });
+      lab.addEventListener('mouseleave', () => paintSelection());
+      box.append(lab);
+    }
+  }
+  const n = edges.length;
+  $('ar-build').textContent = n || nOpt ? `Build rig (${[n ? `${n} link${n > 1 ? 's' : ''}` : '', nOpt ? `${nOpt} option${nOpt > 1 ? 's' : ''}` : ''].filter(Boolean).join(', ')})` : 'Build rig';
+  $('ar-build').disabled = !n && !nOpt;
+}
+function showRigPreview(hot = -1) {
+  while (rigPreview.children.length) { const c = rigPreview.children.pop(); c.geometry?.dispose(); }
+  if ($('autorig').hidden || !ar.rows) return;
+  const { meshes } = ar, sz = markerSize() * 1.6, pts = [], hotPts = [], optPts = [];
+  for (const e of arEdges()) {
+    const pc = partBox(meshes[e.parent]).getCenter(V()), cc = partBox(meshes[e.child]).getCenter(V()), isHot = e.child === hot || e.parent === hot && false;
+    (isHot ? hotPts : pts).push(pc, e.joint, e.joint, cc);
+    if (e.kind === 'none') continue;
+    const m = new THREE.Mesh(new THREE.SphereGeometry(sz * (isHot ? 1.6 : 1), 16, 10),
+      new THREE.MeshBasicMaterial({ color: e.how === 'plain' ? '#8d969e' : '#d6a24a', depthTest: false, transparent: true, opacity: .95 }));
+    m.position.copy(e.joint); m.renderOrder = 999; rigPreview.add(m);
+    const ax = new THREE.Line(new THREE.BufferGeometry().setFromPoints([e.joint, e.joint.clone().addScaledVector(e.axis, sz * 6)]),
+      new THREE.LineBasicMaterial({ color: '#f1d08f', depthTest: false })); ax.renderOrder = 999; rigPreview.add(ax);
+  }
+  ar.rows.forEach((r, k) => { if (r.optionOf >= 0) optPts.push(partBox(meshes[k]).getCenter(V()), partBox(meshes[r.optionOf]).getCenter(V())); });
+  for (const [list, color, op] of [[pts, '#d6a24a', .55], [hotPts, '#ffe066', 1], [optPts, '#7fb6d6', .9]]) {
+    if (!list.length) continue;
+    const l = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(list), new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: op }));
+    l.renderOrder = 998; rigPreview.add(l);
+  }
+  paintSelection();
+  if (hot >= 0) { meshes[hot].material.emissive.set('#0d2f3d'); const r = ar.rows[hot], p = r.optionOf >= 0 ? r.optionOf : r.parent; if (p >= 0) meshes[p].material.emissive.set('#3d200f'); }
+}
+function closeAutorig(clear = true) {
+  $('autorig').hidden = true; showRigPreview();
+  paintSelection();
+  if (clear) { ar.plan = null; ar.meshes = []; ar.pairs = []; ar.rows = null; ar.loopOn = null; }
+}
+function buildRig() {
+  const { meshes, rows } = ar; if (!rows) return;
+  pushUndo(); lastOp = null;
+  let joints = 0, fixed = 0, nOpt = 0; const warns = [];
+  for (const e of arEdges()) {
+    const w = attach(meshes[e.child], meshes[e.parent], e.how, e.joint, e.axis);
+    if (w) warns.push(w); else if (e.how === 'joint') joints++; else fixed++;
+  }
+  // options: each part an option stands in for, with its alternatives, becomes a slot; they share its joint
+  const groups = new Map(); rows.forEach((r, k) => { if (r.optionOf >= 0) { const t = arTarget(k); if (!groups.has(t)) groups.set(t, []); groups.get(t).push(k); } });
+  for (const [t, ks] of groups) {
+    const main = meshes[t], alts = ks.map(k => meshes[k]);
+    for (const sl of options.slots) sl.members = sl.members.filter(id => !alts.some(m => m.uuid === id));
+    let sl = slotOf(main);
+    if (!sl) { const cn = commonName([main.name, ...alts.map(m => m.name)]); sl = { id: uid(), name: /^Spot \d+$/.test(cn) ? `${main.name} alternates` : cn, members: [main.uuid], active: main.uuid }; options.slots.push(sl); }
+    sl.members.push(...alts.map(m => m.uuid)); nOpt += alts.length;
+    shareSlotJoint(sl, main);
+  }
+  if (groups.size) applyOptions();
+  let nLinks = 0;
+  for (const q of ar.loopOn || []) {                   // extra pins where the tree left a contact out
+    const a = meshes[q.i], b2 = meshes[q.j], pt = V().copy(q.centre || q.joint); a.updateMatrixWorld(true); b2.updateMatrixWorld(true);
+    links.push({ id: uid(), a: a.uuid, b: b2.uuid, pa: pt.clone().applyMatrix4(a.matrixWorld.clone().invert()).toArray(), pb: pt.clone().applyMatrix4(b2.matrixWorld.clone().invert()).toArray(), kind: 'pin', axis: 'z', min: null, max: null });
+    nLinks++;
+  }
+  const base = meshes[rows.findIndex(r => r.parent < 0 && r.optionOf < 0)] || meshes[0];
+  closeAutorig(); afterHierarchyChange(); select(base);
+  if (warns.length) toast(warns[0], 'bad');
+  else toast(`Built the rig from ${base.name}: ${joints} joint${joints === 1 ? '' : 's'}${fixed ? `, ${fixed} fixed` : ''}${nOpt ? `, ${groups.size} set${groups.size === 1 ? '' : 's'} of alternates${groups.size > 1 ? 's' : ''}` : ''}${nLinks ? `, ${nLinks} extra pin${nLinks > 1 ? 's' : ''}` : ''}. Press P to pose.`, 'ok');
+}
+function bindAutorig() {
+  $('ar-root').addEventListener('change', () => {
+    const opts = ar.rows.map(r => r.optionOf);                     // keep the options; re-plan the links from the new base
+    ar.plan = planRig(ar.meshes, ar.pairs, +$('ar-root').value); rowsFromPlan();
+    opts.forEach((o, k) => { if (o >= 0) ar.rows[k].optionOf = o; });
+    renderAutorigList(); showRigPreview();
+  });
+  $('ar-detect').addEventListener('click', () => runAutorig(ar.meshes.filter(m => m.parent)));
+  $('ar-build').addEventListener('click', buildRig);
+  $('ar-cancel').addEventListener('click', () => { closeAutorig(); toast('Left the parts where they are, unattached.'); });
+  $('ar-close').addEventListener('click', () => closeAutorig());
+  $('btn-autorig').addEventListener('click', () => {
+    // several parts selected: just those; otherwise every loose part on the bench
+    const list = selection.length > 1 ? [...selection] : liveParts().filter(m => !parentPart(m) && isVisibleChain(m));
+    runAutorig(list);
+  });
+  // folder
+  const fi = $('folder-input');
+  if (!('webkitdirectory' in fi)) { $('btn-folder').hidden = true; }
+  $('btn-folder').addEventListener('click', () => fi.click());
+  fi.addEventListener('change', () => {
+    const files = [...fi.files]; fi.value = '';
+    if (!files.length) return;
+    const name = (files[0].webkitRelativePath || '').split('/')[0] || 'Folder';
+    openFolder(files.map(f => ({ file: f, path: f.webkitRelativePath || f.name })), name);
+  });
+  $('folder-filter').addEventListener('input', renderFolder);
+  $('folder-all').addEventListener('click', () => { folder.entries.forEach(e => { e.selected = true; }); renderFolder(); });
+  $('folder-none').addEventListener('click', () => { folder.entries.forEach(e => { e.selected = false; }); renderFolder(); });
+  $('folder-load').addEventListener('click', () => {
+    const list = folder.entries.filter(e => e.selected && e.state !== 'loaded');
+    if (list.length) loadBatch(list, folder, folder.name, folder.mode);
+  });
+}
+function loadSample() {
+  pushUndo(); lastOp = null;
+  for (const s of sampleKit()) addPart(s.name, s.geom, { at: s.at, rot: s.rot });
+  afterHierarchyChange(); fitMat(true); frame(sceneBox());
+  toast("Sample kit loaded. Try Ball: click the arm's ball, then the cup on the body's shoulder.", 'ok');
+}
+
+// ---------------------------------------------------------------------------
+// Export (zip of binary STLs through the viewer's save dialog)
+// ---------------------------------------------------------------------------
+const safe = s => s.replace(/[^\w\- .]+/g, '_').trim() || 'part';
+async function deliver(files, zipName) {
+  const inViewer = !!(window.claude && window.claude.use);
+  const dl = inViewer ? await window.claude.use('downloads').catch(() => null) : null;
+  if (!inViewer && files.length === 1) return saveViaLink(new Blob([files[0].data], { type: 'model/stl' }), files[0].name);
+  if (typeof JSZip === 'undefined') { toast("The zip library didn't load. Check your connection and reload.", 'bad'); return; }
+  const zip = new JSZip(); files.forEach(f => zip.file(f.name, f.data));
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  if (dl) {
+    try { await dl.save({ filename: zipName, data: blob }); toast(`Saved ${zipName}`, 'ok'); }
+    catch (e) { if (e?.code !== 'declined') toast(`Couldn't save: ${e?.message || e?.code || 'unknown error'}`, 'bad'); }
+    return;
+  }
+  if (inViewer) { toast("Saving files isn't available in this view. Open the artifact in claude.ai to export.", 'bad'); return; }
+  saveViaLink(blob, zipName);
+}
+function saveViaLink(blob, name) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); toast(`Saved ${name}`, 'ok');
+}
+function exportMeshes() { scene.updateMatrixWorld(true); return liveParts().filter(p => isVisibleChain(p) && !p.userData.part.grower?.draft); }   // a growth still an outline isn't there yet
+const fillOpts = () => ({ maxGap: Math.max(+$('exp-gap').value || 0.5, 0.01), overlap: Math.max(+$('exp-overlap').value || 0, 0) });
+/** A stand-in mesh holding a part's filled corners in world space (same triangles; mirrored parts keep their winding). */
+function filledMesh(m, positions) {
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const ix = Uint32Array.from(m.geometry.index.array);
+  if (m.matrixWorld.determinant() < 0) for (let t = 0; t < ix.length; t += 3) { const k = ix[t+1]; ix[t+1] = ix[t+2]; ix[t+2] = k; }
+  g.setIndex(new THREE.BufferAttribute(ix, 1)); const out = new THREE.Mesh(g); out.updateMatrixWorld(true); return out;
+}
+/*
+ * Solid merge: every closed shell in the file is unioned into one clean solid (Manifold, exact booleans, in a
+ * background worker), so no surface is left inside the model: no overlapping walls, nothing for a slicer to read as
+ * a void. With "Fill hollow pockets" on, hollows sealed inside the result are filled too.
+ */
+let solidWorker = null, solidSeq = 0;
+const solidWaits = new Map();
+function mergeJobs(jobs, opts) { return solidJob({ jobs, opts }); }
+function solidJob(msg) {
+  if (!solidWorker) {
+    solidWorker = new Worker(new URL('./solid-worker.js', import.meta.url), { type: 'module' });
+    solidWorker.onmessage = e => { const w = solidWaits.get(e.data.id); solidWaits.delete(e.data.id); if (!w) return; e.data.error ? w.no(new Error(e.data.error)) : w.ok(e.data.out); };
+    solidWorker.onerror = e => { for (const w of solidWaits.values()) w.no(new Error(e.message || 'The merge helper failed to start')); solidWaits.clear(); solidWorker = null; };
+  }
+  const id = ++solidSeq;
+  return new Promise((ok, no) => { solidWaits.set(id, { ok, no }); solidWorker.postMessage({ id, ...msg }); });
+}
+/** Merge each STL (ArrayBuffer) into one solid. Returns { files: [ArrayBuffer], note } — the originals if merging is off or fails. */
+async function mergeSTLs(bufs, title = 'Merging into one solid', holes = []) {
+  if (!$('exp-merge').checked) return { files: bufs, note: '' };
+  loading.show(title); loading.set(0.15, 'Removing the surfaces inside the model…'); await nextFrame();
+  try {
+    const out = await mergeJobs(bufs.map((b, i) => ({ soups: [soupFromSTL(b)], subtract: holes[i] || [] })), { fillHollows: true, loose: $('exp-loose').value });
+    const s = out.reduce((a, r) => ({ inS: a.inS + r.inputShells, outS: a.outS + r.shells, h: a.h + r.hollows, hv: a.hv + r.hollowVolume, hl: a.hl + r.hollowsLeft, hlv: a.hlv + r.hollowLeftVolume, rep: a.rep + r.repaired, un: a.un + r.unmerged, mend: a.mend + (r.mended || 0) }), { inS: 0, outS: 0, h: 0, hv: 0, hl: 0, hlv: 0, rep: 0, un: 0, mend: 0 });
+    const mm3 = v => v < 1 ? v.toFixed(2) : v.toFixed(0);
+    // a file with open or broken bits left in it can't be watertight as it is: rebuilt as one solid (if that's on)
+    let rebuilt = 0, rdetail = 0;
+    if ($('exp-rebuild').checked) for (let i = 0; i < out.length; i++) {          // (broken shells were already mended exactly in the merge: this is for what's still open)
+      const r = out[i]; if (!r.strays?.length || r.strays.length / 9 < 20) continue;
+      loading.set(0.5 + 0.4 * i / out.length, 'Shrink-wrapping what is still open…'); await nextFrame();
+      try { const q = await solidJob({ remesh: { soup: r.positions, detail: Math.max(0.04, +$('exp-rebuild-detail').value || 0.12) } }); out[i] = { ...r, positions: q.positions, unmerged: 0, rebuiltAt: q.stats.detail }; rebuilt++; rdetail = q.stats.detail; }
+      catch (e) { console.warn(e); }
+    }
+    const files = out.map(r => stlFromSoup(r.positions));
+    let note = s.inS > s.outS ? `Merged ${s.inS} shell${s.inS === 1 ? '' : 's'} into ${s.outS} solid${s.outS === 1 ? '' : 's'}, with no surfaces left inside.` : 'No surfaces left inside.';
+    if (s.h) note += ` Filled ${s.h} sealed hollow${s.h === 1 ? '' : 's'} (${mm3(s.hv)} mm³).`;
+    if (rebuilt) note += ` ${rebuilt === 1 && out.length === 1 ? 'It' : rebuilt + ' file' + (rebuilt === 1 ? '' : 's')} had open or broken surfaces, so ${rebuilt === 1 ? 'it was' : 'they were'} shrink-wrapped as one watertight solid at ${rdetail} mm detail (a new surface).`;
+    else if (s.un && !$('exp-rebuild').checked) note += ' Some of it is open sheets with nothing behind them (not a closed solid even mended), so the file won\'t be watertight: Shrink-wrap would fix that, at the cost of re-meshing it.';
+    if (s.mend) note += ` Mended ${s.mend} broken spot${s.mend === 1 ? '' : 's'} (small holes, flaps, pinches) exactly, leaving the rest of the surface as it was.`;
+    if (s.hl) note += ` ${s.hl} sealed hollow${s.hl === 1 ? ' is' : 's are'} left inside (${mm3(s.hlv)} mm³): tick "Fill hollow pockets" to fill ${s.hl === 1 ? 'it' : 'them'}.`;
+    const bits = out.flatMap(r => r.loose), nb = bits.length, gapMax = Math.max(0, ...bits.map(b => b.gap)), joined = out.reduce((a, r) => a + r.bridged, 0), droppedN = out.reduce((a, r) => a + r.dropped, 0);
+    const bitWord = n => `${n} loose bit${n === 1 ? '' : 's'}`;
+    if (nb) note += $('exp-loose').value === 'connect' ? ` Joined ${bitWord(joined)} that didn't touch the rest (up to ${gapMax.toFixed(2)} mm away) with small bridges.` + (joined < nb ? ` ${nb - joined} couldn't be bridged.` : '')
+      : $('exp-loose').value === 'drop' ? ` Left out ${bitWord(droppedN)} that didn't touch the rest.`
+      : ` ${bitWord(nb)} ${nb === 1 ? "doesn't" : "don't"} touch the rest (up to ${gapMax.toFixed(2)} mm away) and will print as separate pieces.`;
+    const cutN = out.reduce((a, r) => a + r.cut, 0); if (cutN) note += ` Cut ${cutN} magnet hole${cutN === 1 ? '' : 's'}.`;
+    if (s.rep && !s.mend) note += ` Closed small holes in ${s.rep} piece${s.rep === 1 ? '' : 's'} first.`;
+    if (s.un && !rebuilt) note += ` ${s.un} piece${s.un === 1 ? ' has' : 's have'} holes too big to close and went in as they were.`;
+    if (rebuilt && rebuilt === out.filter(r => r.rebuiltAt).length && out.every(r => r.rebuiltAt))       // all rebuilt: the merge's own tally no longer applies
+      note = `${rebuilt === 1 ? 'It' : 'Every file'} had open sheets that couldn't be mended, so ${rebuilt === 1 ? 'it was' : 'they were'} shrink-wrapped as one watertight solid at ${rdetail} mm detail (a new surface).` + (cutN ? ` Cut ${cutN} magnet hole${cutN === 1 ? '' : 's'}.` : '');
+    return { files, note: note + ' ' };
+  } catch (e) {
+    console.warn(e); toast(`Couldn't merge into one solid (${e.message || e}). Exported the parts as they are.`, 'bad');
+    return { files: bufs, note: '' };
+  } finally { loading.hide(); }
+}
+/** One STL of these parts, with the seams filled if that option is on, merged into one solid if that's on. */
+async function oneSTL(ms) {
+  const r = await oneSTLRaw(ms), m = await mergeSTLs([r.data], undefined, [r.holes]);
+  return { data: m.files[0], note: m.note + r.note };
+}
+async function oneSTLRaw(ms) {
+  // hollow pockets first, on the parts as they are: the filler goes in as one more solid
+  let extra = [], pnote = '';
+  if ($('exp-pockets').checked) {
+    const r = await runPockets('Filling hollow pockets', ms);
+    if (r?.geometry) { const f = new THREE.Mesh(r.geometry); f.updateMatrixWorld(true); extra = [f]; }
+    if (r) pnote = (r.pockets ? `Filled ${pocketSummary(r).replace(/^\d+ sealed/, m => m.toLowerCase())}.` : 'No sealed pockets to fill.') + ' ';
+  }
+  if (!$('exp-fill').checked || ms.length < 2) { const cut = await cutMagnetHoles(ms, ms); return { data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note, holes: cut.holes }; }
+  toast('Filling seams…'); await nextFrame();
+  const { out, stats } = fillSeamsAll(ms, fillOpts());
+  const left = gapsLeft(ms, out, fillOpts().maxGap * 2);
+  const note = stats.moved ? `Filled ${stats.seams} seam${stats.seams === 1 ? '' : 's'}: pushed ${stats.moved.toLocaleString()} corners by up to ${stats.largest.toFixed(2)} mm.` : 'No seams within reach to fill.';
+  const cut = await cutMagnetHoles(ms.map((m, k) => filledMesh(m, out[k].positions)), ms);
+  return { holes: cut.holes, data: writeSTL([...cut.meshes, ...extra]), note: pnote + cut.note + note + (left.open ? ` ${left.open} spot${left.open > 1 ? 's' : ''} have gaps wider than ${fillOpts().maxGap} mm; raise "Close gaps up to" to fill them.` : '') };
+}
+$('exp-all').addEventListener('click', async () => {
+  const ms = exportMeshes(); if (!ms.length) return;
+  const glue = $('exp-glue').checked ? glueOns(ms) : null;
+  if (glue?.list.length) { await exportWithGlue(ms, glue, 'model'); return; }
+  const { data, note } = await oneSTL(ms); if (note) $('exp-note').textContent = note;
+  deliver([{ name: 'model.stl', data }], 'model-stl.zip');
+});
+/** The selected parts to export: with what hangs off them if that's ticked. */
+function exportSelection() {
+  scene.updateMatrixWorld(true);
+  const sel = selection.length ? selection : selected ? [selected] : [];
+  const list = $('exp-attached').checked ? (selection.length ? selectionRoots() : [selected]).flatMap(subtreeParts) : sel;
+  const ok = new Set(exportMeshes());
+  return [...new Set(list)].filter(m => isVisibleChain(m) && ok.has(m));
+}
+const expPick = { what: 'all', as: 'one' };
+function syncExportPick() {
+  const hasSel = !!(selected || selection.length);
+  if (!hasSel && expPick.what === 'sel') expPick.what = 'all';
+  document.querySelectorAll('#exp-what button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === expPick.what)); if (b.dataset.v === 'sel') b.disabled = !hasSel; });
+  document.querySelectorAll('#exp-as button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === expPick.as)));
+  $('exp-attached-l').hidden = expPick.what !== 'sel';
+  const ms = expPick.what === 'sel' ? exportSelection() : exportMeshes(), n = ms.length;
+  $('exp-sum').textContent = !n ? 'Nothing to export.' : expPick.as === 'one'
+    ? `${n} part${n === 1 ? '' : 's'} into one STL${$('exp-merge').checked && n > 1 ? ', joined into one solid' : ''}.`
+    : `${n} STL${n === 1 ? '' : 's'}, one per part, each saved where it sits now so they line up again when opened together.`;
+  $('exp-go').disabled = !n; $('exp-go').textContent = !n ? 'Export' : expPick.as === 'one' ? 'Export 1 STL' : `Export ${n} STLs`;
+}
+document.querySelectorAll('#exp-what button').forEach(b => b.addEventListener('click', () => { expPick.what = b.dataset.v; syncExportPick(); }));
+document.querySelectorAll('#exp-as button').forEach(b => b.addEventListener('click', () => { expPick.as = b.dataset.v; syncExportPick(); }));
+['exp-attached', 'exp-merge'].forEach(id => $(id).addEventListener('change', syncExportPick));
+$('exp-go').addEventListener('click', () => {
+  if (expPick.what === 'all') { if (expPick.as === 'one') $('exp-all').click(); else exportSeparate(exportMeshes(), 'parts'); }
+  else if (expPick.as === 'one') $('exp-sel').click();
+  else exportSeparate(exportSelection(), selection.length > 1 ? 'selection' : safe(selected?.name || 'selection'));
+});
+$('exp-sel').addEventListener('click', async () => {
+  if (!selected) return; scene.updateMatrixWorld(true);
+  const ms = exportSelection(), roots = selection.length ? selectionRoots() : [selected];
+  const name = roots.length > 1 ? 'selection' : safe(selected.name);
+  const glue = $('exp-glue').checked ? glueOns(ms) : null;
+  if (glue?.list.length) { await exportWithGlue(ms, glue, name); return; }
+  const { data, note } = await oneSTL(ms); if (note) $('exp-note').textContent = note;
+  deliver([{ name: name + '.stl', data }], name + '-stl.zip');
+});
+
+// ---------------------------------------------------------------------------
+// Glue-on pieces: ooze, reliefs and scatters exported as pieces of their own, to print and glue onto a model you
+// already have (or have printed). The model goes out without them; each piece goes out with the model cut out of
+// it (grown by a glue gap if set), so its back sits flush on the surface it was made on.
+// ---------------------------------------------------------------------------
+const glueKinds = () => ({ ooze: $('exp-glue-ooze').checked, relief: $('exp-glue-relief').checked, scatter: $('exp-glue-scatter').checked });
+/**
+ * The glue-ons among (or riding on) these parts: { list: [{ mesh, hosts, name, kind }], skipMesh: Set (left out of
+ * the model), hostMods: Map(host → Set of modifier ids to leave out of its stack) }.
+ */
+function glueOns(ms) {
+  const kinds = glueKinds(), inSet = new Set(ms), list = [], skipMesh = new Set(), hostMods = new Map();
+  for (const m of ms) {
+    const pt = m.userData.part;
+    if (pt.ooze && kinds.ooze) {
+      const hosts = [...new Set(pt.ooze.anchors.map(a => partById(a.part)).filter(h => h && h !== m && inSet.has(h)))];
+      list.push({ mesh: m, hosts, name: m.name, kind: 'ooze' }); skipMesh.add(m);
+    }
+    for (const mod of pt.mods || []) {
+      if (!mod.on || (mod.type !== 'relief' && mod.type !== 'scatter') || mod.mode === 'cut' || !kinds[mod.type]) continue;
+      const kids = modKids(m, mod); if (!kids.length) continue;
+      if (mod.mode === 'merge') { if (!hostMods.has(m)) hostMods.set(m, new Set()); hostMods.get(m).add(mod.id); }
+      kids.forEach((k, i) => { list.push({ mesh: k, hosts: [m], name: kids.length > 1 ? `${m.name} - ${mod.name || MOD_NAMES[mod.type]} ${i + 1}` : `${m.name} - ${mod.name || MOD_NAMES[mod.type]}`, kind: mod.type }); skipMesh.add(k); });
+    }
+  }
+  // scatters merged on per piece: one file each is a lot; the pieces of one scatter stay separate files all the same (each is glued on its own)
+  return { list, skipMesh, hostMods };
+}
+/** A host's mesh without the glue-ons merged into it: its stack run again leaving those modifiers out. */
+async function hostWithout(m, skipIds) {
+  const pt = m.userData.part; let g = pt.base.geometry;
+  for (const mod of pt.mods) { if (!mod.on || skipIds.has(mod.id)) continue; g = await evalMod(m, mod, g); }
+  return g;
+}
+/** Swap the hosts' meshes for their glue-free ones while fn runs (the scene shows them only for that moment). */
+async function withHostsBare(glue, fn) {
+  const swapped = [];
+  try {
+    for (const [m, ids] of glue.hostMods) { const g = await hostWithout(m, ids); swapped.push([m, m.geometry]); m.geometry = g; }
+    scene.updateMatrixWorld(true);
+    return await fn();
+  } finally { for (const [m, g] of swapped) m.geometry = g; }
+}
+/** The glue-on pieces as STL files (the hosts must be bare while this runs). */
+async function glueFiles(glue, names = new Set()) {
+  const fit = $('exp-glue-fit').checked, gap = Math.max(0, +$('exp-glue-gap').value || 0), files = [], notes = [];
+  loading.show('Making the glue-on pieces');
+  try {
+    for (const [k, it] of glue.list.entries()) {
+      loading.set(k / glue.list.length, it.name); await nextFrame();
+      it.mesh.updateMatrixWorld(true);
+      const soup = soupOfGeom(it.mesh.geometry, it.mesh.matrixWorld);
+      let cut = [];
+      if (fit) for (const h of it.hosts) { h.updateMatrixWorld(true); cut.push(gap > 0 ? grownSoup(h, gap) : soupOfGeom(h.geometry, h.matrixWorld)); }
+      let positions = soup;
+      try {
+        const [r] = await mergeJobs([{ soups: [soup], subtract: cut }], { fillHollows: true, loose: 'keep' });
+        if (r?.positions?.length) positions = r.positions; else notes.push(`${it.name} sits wholly inside the model, so it was left as it is`);
+      } catch (e) { console.warn(e); notes.push(`${it.name} couldn't be shaped to the model (its mesh may not be closed), so it's as it is`); }
+      let n = safe(it.name), j = 2; while (names.has(n)) n = `${safe(it.name)}_${j++}`; names.add(n);
+      files.push({ name: n + '.stl', data: stlFromSoup(positions) });
+    }
+  } finally { loading.hide(); }
+  return { files, note: `${files.length} glue-on piece${files.length === 1 ? '' : 's'}` + (fit ? `, each shaped to the model${gap ? ` with a ${gap} mm glue gap` : ''}` : '') + '.' + (notes.length ? ' ' + notes.join('; ') + '.' : '') };
+}
+/** A part's world mesh pushed out along its corner normals by d (a slightly bigger copy, for the glue gap). */
+function grownSoup(m, d) {
+  const g = m.geometry, pos = g.attributes.position, ix = g.index, nrm = new Float32Array(pos.count * 3), a = V(), b = V(), c = V(), n = V();
+  m.updateMatrixWorld(true); const W = m.matrixWorld, flip = W.determinant() < 0 ? -1 : 1, wp = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) { a.fromBufferAttribute(pos, i).applyMatrix4(W); wp.set([a.x, a.y, a.z], 3 * i); }
+  for (let t = 0; t < ix.count; t += 3) {
+    const i0 = ix.getX(t), i1 = ix.getX(t + 1), i2 = ix.getX(t + 2);
+    a.fromArray(wp, 3 * i0); b.fromArray(wp, 3 * i1); c.fromArray(wp, 3 * i2); n.subVectors(b, a).cross(c.sub(a)).multiplyScalar(flip);
+    for (const i of [i0, i1, i2]) { nrm[3 * i] += n.x; nrm[3 * i + 1] += n.y; nrm[3 * i + 2] += n.z; }
+  }
+  for (let i = 0; i < pos.count; i++) { n.fromArray(nrm, 3 * i).normalize(); wp[3 * i] += n.x * d; wp[3 * i + 1] += n.y * d; wp[3 * i + 2] += n.z * d; }
+  const out = new Float32Array(ix.count * 3);
+  for (let t = 0; t < ix.count; t += 3) { const o = [ix.getX(t), flip < 0 ? ix.getX(t + 2) : ix.getX(t + 1), flip < 0 ? ix.getX(t + 1) : ix.getX(t + 2)]; for (let e = 0; e < 3; e++) out.set(wp.subarray(3 * o[e], 3 * o[e] + 3), 3 * (t + e)); }
+  return out;
+}
+/** Whole model or selection with glue-ons: the model without them, and each piece on its own. */
+async function exportWithGlue(ms, glue, name) {
+  const model = ms.filter(m => !glue.skipMesh.has(m));
+  await withHostsBare(glue, async () => {
+    const files = [], notes = [];
+    if (model.length) { const { data, note } = await oneSTL(model); files.push({ name: name + '.stl', data }); if (note) notes.push(note); }
+    const g = await glueFiles(glue, new Set([name])); files.push(...g.files); notes.push(g.note);
+    $('exp-note').textContent = notes.join(' ');
+    deliver(files, name + '-with-glue-ons.zip');
+  });
+}
+function syncGlueNote() {
+  const ms = exportMeshes(), g = glueOns(ms), by = k => g.list.filter(x => x.kind === k).length;
+  const parts = [['ooze', 'ooze'], ['relief', 'relief'], ['scatter', 'scattered piece']].map(([k, w]) => { const n = by(k); return n ? `${n} ${w}${n === 1 ? '' : 's'}` : ''; }).filter(Boolean);
+  $('exp-glue-only').disabled = !g.list.length;
+  $('exp-glue-only').textContent = g.list.length ? `Glue-on pieces only (${g.list.length})` : 'Glue-on pieces only';
+  $('exp-glue-only').title = parts.length ? 'Just these, one STL each: ' + parts.join(', ') : 'Nothing to export as glue-ons: add ooze, a relief or a scatter (and tick its kind above)';
+}
+$('exp-glue').addEventListener('change', () => { $('exp-glue-f').hidden = !$('exp-glue').checked; syncGlueNote(); markDirty(); });
+['exp-glue-ooze', 'exp-glue-relief', 'exp-glue-scatter', 'exp-glue-fit', 'exp-glue-gap'].forEach(id => $(id).addEventListener('change', () => { syncGlueNote(); markDirty(); }));
+$('exp-glue-only').addEventListener('click', async () => {
+  const ms = exportMeshes(), glue = glueOns(ms); if (!glue.list.length) { toast('No ooze, reliefs or scatters to export as glue-ons.'); return; }
+  await withHostsBare(glue, async () => { const g = await glueFiles(glue); $('exp-note').textContent = g.note; deliver(g.files, 'glue-ons-stl.zip'); });
+});
+
+// ---------------------------------------------------------------------------
+// Hollow pockets: air sealed inside the model. Found on a voxel grid of all the parts together (inside where
+// two of three ray directions agree), the outside air flooded in from the edges; whatever air it can't reach
+// is a pocket. The filler fills each pocket and overlaps one cell into the parts round it. Parts don't change.
+// ---------------------------------------------------------------------------
+async function findPockets(ms, h, progress = () => {}, opts = {}) {
+  scene.updateMatrixWorld(true);
+  const bb = new THREE.Box3(); ms.forEach(m => bb.union(exactBox(m))); if (bb.isEmpty()) return null;
+  let size = bb.getSize(V());
+  while ((size.x / h + 5) * (size.y / h + 5) * (size.z / h + 5) > 30e6) h *= 1.25;          // keep the grid in memory
+  bb.expandByScalar(2 * h); size = bb.getSize(V());
+  const n = [Math.ceil(size.x / h) + 1, Math.ceil(size.y / h) + 1, Math.ceil(size.z / h) + 1], [nx, ny, nz] = n, N = nx * ny * nz;
+  const at = (i, j, k) => i + nx * (j + ny * k), o = bb.min, votes = new Uint8Array(N), stamp = new Uint8Array(N);
+  const parts = ms.map(m => ({ m, inv: m.matrixWorld.clone().invert(), box: exactBox(m) }));
+  const ray = new THREE.Ray(), wp = V(); let done = 0, lastYield = performance.now(); const total = 3;
+  for (let ax = 0; ax < 3; ax++) {                       // columns along x, then y, then z
+    const u = (ax + 1) % 3, w = (ax + 2) % 3, dir = V(); dir.setComponent(ax, 1);
+    for (const P of parts) {
+      const u0 = Math.max(0, Math.floor((P.box.min.getComponent(u) - o.getComponent(u)) / h)), u1 = Math.min(n[u] - 1, Math.ceil((P.box.max.getComponent(u) - o.getComponent(u)) / h));
+      const w0 = Math.max(0, Math.floor((P.box.min.getComponent(w) - o.getComponent(w)) / h)), w1 = Math.min(n[w] - 1, Math.ceil((P.box.max.getComponent(w) - o.getComponent(w)) / h));
+      const bvh = P.m.geometry.boundsTree, ldir = dir.clone().transformDirection(P.inv), flip = P.m.matrixWorld.determinant() < 0 ? -1 : 1;
+      const eps = 1e-5 * Math.max(1, size.length());
+      for (let a = u0; a <= u1; a++) {
+        for (let c = w0; c <= w1; c++) {
+          // a hair off the grid lines, so rays don't run exactly along the edges of square-cut models
+          const org = V(); org.setComponent(ax, o.getComponent(ax) - h); org.setComponent(u, o.getComponent(u) + a * h + 0.0173 * h); org.setComponent(w, o.getComponent(w) + c * h + 0.0291 * h);
+          ray.origin.copy(org).applyMatrix4(P.inv); ray.direction.copy(ldir);
+          const hits = bvh.raycast(ray, THREE.DoubleSide); if (hits.length < 2) continue;
+          // inside is where more surfaces have been entered than left (by which way each one faces), so a part made of
+          // overlapping pieces counts as solid all the way through; a corner hit twice counts once
+          const ev = hits.map(x => ({ t: wp.copy(x.point).applyMatrix4(P.m.matrixWorld).getComponent(ax), s: x.face.normal.dot(ldir) * flip < 0 ? 1 : -1 })).sort((p, q) => p.t - q.t);
+          const seq = []; for (const e of ev) { const l = seq[seq.length - 1]; if (l && Math.abs(e.t - l.t) < eps && e.s === l.s) continue; seq.push(e); }
+          let wind = 0; const spans = [];
+          for (let k = 0; k < seq.length; k++) { const was = wind; wind += seq[k].s; if (was <= 0 && wind > 0) spans.push(seq[k].t); else if (was > 0 && wind <= 0) spans.push(seq[k].t); }
+          if (wind !== 0 || spans.length % 2) continue;                    // open or torn here: no say
+          for (let k = 0; k + 1 < spans.length; k += 2) {
+            const i0 = Math.max(0, Math.ceil((spans[k] - o.getComponent(ax)) / h)), i1 = Math.min(n[ax] - 1, Math.floor((spans[k + 1] - o.getComponent(ax)) / h));
+            for (let t = i0; t <= i1; t++) { const idx = [0, 0, 0]; idx[ax] = t; idx[u] = a; idx[w] = c; const v = at(idx[0], idx[1], idx[2]);
+              if (stamp[v] !== ax + 1) { stamp[v] = ax + 1; votes[v]++; } }
+          }
+        }
+        if (performance.now() - lastYield > 120) { progress((done + (a - u0) / Math.max(1, u1 - u0) / parts.length) / total * 0.8, 'Measuring the solid…'); await nextFrame(); lastYield = performance.now(); }
+      }
+    }
+    done++;
+  }
+  const solid = new Uint8Array(N); for (let v = 0; v < N; v++) solid[v] = votes[v] >= 2 ? 1 : 0;
+  // flood the outside air in from the edges of the grid. Resin can't drain through a crack, so the flood only
+  // passes where the opening is at least `drain` mm wide; then it spreads back that far into the narrow bits it skipped.
+  progress(0.85, 'Letting the air out…'); await nextFrame();
+  const outside = new Uint8Array(N), q = new Int32Array(N); let qh = 0, qt = 0;
+  const sx0 = 1, sy0 = nx, sz0 = nx * ny, R = Math.max(0, Math.round((opts.drain ?? 1) / 2 / h));
+  const near = new Uint8Array(N);                      // air within R cells of the solid: too tight for the flood to pass
+  if (R > 0) {
+    const d = new Uint8Array(N).fill(255); for (let v = 0; v < N; v++) if (solid[v]) { d[v] = 0; q[qt++] = v; }
+    while (qh < qt) { const v = q[qh++], dv = d[v]; if (dv >= R) continue; near[v] = 1;
+      const i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz0);
+      for (const [ok, w] of [[i > 0, v - sx0], [i < nx - 1, v + sx0], [j > 0, v - sy0], [j < ny - 1, v + sy0], [k > 0, v - sz0], [k < nz - 1, v + sz0]])
+        if (ok && d[w] > dv + 1) { d[w] = dv + 1; q[qt++] = w; } }
+    qh = qt = 0;
+  }
+  const seed = v => { if (!solid[v] && !outside[v] && !near[v]) { outside[v] = 1; q[qt++] = v; } };
+  for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) { seed(at(i, j, 0)); seed(at(i, j, nz - 1)); }
+  for (let i = 0; i < nx; i++) for (let k = 0; k < nz; k++) { seed(at(i, 0, k)); seed(at(i, ny - 1, k)); }
+  for (let j = 0; j < ny; j++) for (let k = 0; k < nz; k++) { seed(at(0, j, k)); seed(at(nx - 1, j, k)); }
+  const sx = 1, sy = nx, sz = nx * ny;
+  while (qh < qt) { const v = q[qh++], i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
+    if (i > 0) seed(v - sx); if (i < nx - 1) seed(v + sx); if (j > 0) seed(v - sy); if (j < ny - 1) seed(v + sy); if (k > 0) seed(v - sz); if (k < nz - 1) seed(v + sz); }
+  if (R > 0) {                                          // spread back R cells into the tight air next to the outside
+    const depth = new Uint8Array(N); qh = 0; qt = 0; for (let v = 0; v < N; v++) if (outside[v]) q[qt++] = v;
+    while (qh < qt) { const v = q[qh++]; if (depth[v] >= R) continue; const i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
+      for (const [ok, w] of [[i > 0, v - sx], [i < nx - 1, v + sx], [j > 0, v - sy], [j < ny - 1, v + sy], [k > 0, v - sz], [k < nz - 1, v + sz]])
+        if (ok && !solid[w] && !outside[w]) { outside[w] = 1; depth[w] = depth[v] + 1; q[qt++] = w; } }
+  }
+  // pockets: air the outside can't reach. Count them, and fill each plus one cell into the parts around it.
+  progress(0.92, 'Filling the pockets…'); await nextFrame();
+  const fill = new Uint8Array(N), label = new Int32Array(N); let cells = 0, pockets = 0, biggest = 0;
+  for (let v = 0; v < N; v++) {
+    if (solid[v] || outside[v] || label[v]) continue;
+    pockets++; let c = 0; qh = qt = 0; q[qt++] = v; label[v] = pockets;
+    while (qh < qt) { const x = q[qh++]; c++; fill[x] = 1; const i = x % nx, j = Math.floor(x / nx) % ny, k = Math.floor(x / sz);
+      for (const [ok, y] of [[i > 0, x - sx], [i < nx - 1, x + sx], [j > 0, x - sy], [j < ny - 1, x + sy], [k > 0, x - sz], [k < nz - 1, x + sz]])
+        if (ok && !solid[y] && !outside[y] && !label[y]) { label[y] = pockets; q[qt++] = y; } }
+    if (c < 8 || c * h ** 3 < 1) { for (let y = 0; y < qt; y++) fill[q[y]] = 0; pockets--; continue; }      // a speck (under 1 mm³): ray directions disagreeing in a wall, or too small to matter
+    cells += c; biggest = Math.max(biggest, c);
+  }
+  if (!pockets) return { pockets: 0, volume: 0, biggest: 0, h, geometry: null };
+  const grow = new Uint8Array(fill);
+  const nearOutside = y => [y - sx, y + sx, y - sy, y + sy, y - sz, y + sz].some(z => z >= 0 && z < N && outside[z]);
+  for (let v = 0; v < N; v++) if (fill[v]) { for (const y of [v - sx, v + sx, v - sy, v + sy, v - sz, v + sz]) if (y >= 0 && y < N && solid[y] && !nearOutside(y)) grow[y] = 1; }   // into the walls, never through to the outside
+  // the filler's skin: a square face wherever a filled cell meets an unfilled one
+  const pos = []; const cube = (i, j, k, d) => {
+    const x0 = o.x + (i - 0.5) * h, y0 = o.y + (j - 0.5) * h, z0 = o.z + (k - 0.5) * h, x1 = x0 + h, y1 = y0 + h, z1 = z0 + h;
+    const F = [[[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
+               [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]], [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]], [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]][d];
+    pos.push(...F[0], ...F[1], ...F[2], ...F[0], ...F[2], ...F[3]); };
+  const skin = mask => {
+    pos.length = 0;
+    for (let v = 0; v < N; v++) { if (!mask[v]) continue; const i = v % nx, j = Math.floor(v / nx) % ny, k = Math.floor(v / sz);
+      [[i > 0 ? v - sx : -1, 0], [i < nx - 1 ? v + sx : -1, 1], [j > 0 ? v - sy : -1, 2], [j < ny - 1 ? v + sy : -1, 3], [k > 0 ? v - sz : -1, 4], [k < nz - 1 ? v + sz : -1, 5]]
+        .forEach(([y, d]) => { if (y < 0 || !mask[y]) cube(i, j, k, d); }); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(Array.from({ length: pos.length / 3 }, (_, i) => i)); return g;
+  };
+  // geometry: the filler (the air plus a cell into the walls, so it overlaps them); air: just the trapped air, for showing
+  return { pockets, volume: cells * h ** 3, biggest: biggest * h ** 3, h, geometry: skin(grow), air: skin(fill) };
+}
+const pocketFx = new THREE.Group(); scene.add(pocketFx);
+function clearPocketPreview() { while (pocketFx.children.length) { const c = pocketFx.children.pop(); c.geometry?.dispose(); if (c.isLineSegments2) c.material.dispose(); } $('exp-pocket-show').setAttribute('aria-pressed', 'false'); $('exp-pocket-show').textContent = 'Show pockets'; }
+/** A bold outline of a shape's corners (the edges where its faces fold, not the flat seams between them), drawn through the model. */
+function outlineOf(geom, color, width = 2.5) {
+  const welded = mergeVertices(geom.index ? geom.toNonIndexed() : geom, 1e-4);
+  const edges = new THREE.EdgesGeometry(welded, 30); welded.dispose();
+  const lg = new LineSegmentsGeometry().setPositions(edges.attributes.position.array); edges.dispose();
+  const mat = new LineMaterial({ color, linewidth: width, transparent: true, depthTest: false, depthWrite: false });
+  const line = new LineSegments2(lg, mat); line.renderOrder = 999;
+  line.onBeforeRender = r => { r.getSize(mat.resolution); };
+  return line;
+}
+const pocketSummary = r => r.pockets ? `${r.pockets} sealed pocket${r.pockets > 1 ? 's' : ''}, ${r.volume < 1 ? r.volume.toFixed(2) : r.volume.toFixed(0)} mm³ in all (largest ${r.biggest < 1 ? r.biggest.toFixed(2) : r.biggest.toFixed(0)} mm³)` : 'No sealed pockets';
+async function runPockets(title, ms = exportMeshes()) {
+  if (!ms.length) return null;
+  loading.show(title);
+  try { return await findPockets(ms, +$('exp-pocket-res').value, (f, t) => loading.set(f, t), { drain: Math.max(0, +$('exp-pocket-drain').value || 0) }); }
+  finally { loading.hide(); }
+}
+async function showPocketPreview() {
+  clearPocketPreview();
+  const r = await runPockets('Looking for hollow pockets'); if (!r) return;
+  $('exp-pocket-note').textContent = `${pocketSummary(r)}, checked at ${r.h.toFixed(2)} mm.` + (r.pockets ? ' Shown in red through the model; exports with this option on fill them solid.' : ' Nothing to fill.');
+  toast(pocketSummary(r) + '.', r.pockets ? 'bad' : 'ok');
+  if (!r.geometry) return;
+  r.geometry.dispose();
+  const m = new THREE.Mesh(r.air, new THREE.MeshBasicMaterial({ color: '#e36b6b', transparent: true, opacity: 0.5, depthTest: false, depthWrite: false }));
+  m.renderOrder = 998; pocketFx.add(m);
+  pocketFx.add(outlineOf(r.air, '#ff2a2a'));
+  $('exp-pocket-show').setAttribute('aria-pressed', 'true'); $('exp-pocket-show').textContent = 'Hide pockets';
+}
+
+// ---------------------------------------------------------------------------
+// Magnets: a pair of round holes, one in each part, facing each other across where they meet. Each hole is
+// kept in its own part's frame, so it moves and poses with the part; holes are cut only when exporting.
+// ---------------------------------------------------------------------------
+let magnets = [];       // [{ id, d, t, cd, ct, sides: [{ part, o: local point, n: local outward normal, pole: 'N'|'S' }] }]
+const magnetFx = new THREE.Group(); scene.add(magnetFx);
+const magSize = () => ({ d: Math.max(0.5, +$('mag-d').value || 3), t: Math.max(0.3, +$('mag-t').value || 2), cd: Math.max(0, +$('mag-cd').value || 0), ct: Math.max(0, +$('mag-ct').value || 0) });
+const magLabel = mg => `${+mg.d.toFixed(2)} × ${+mg.t.toFixed(2)} mm`;
+let magPending = null, magShift = false;
+function toLocal(part, p, n) { part.updateMatrixWorld(true); const inv = part.matrixWorld.clone().invert(); return { o: p.clone().applyMatrix4(inv).toArray(), n: n.clone().transformDirection(inv).toArray() }; }
+function sideWorld(sd) { const m = partById(sd.part); if (!m) return null; m.updateMatrixWorld(true); return { m, o: V(...sd.o).applyMatrix4(m.matrixWorld), n: V(...sd.n).transformDirection(m.matrixWorld).normalize() }; }
+const hitNormal = hit => hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize();
+/** How much part is left behind a hole of this depth (the wall to the far side). */
+function wallBehind(m, o, n, depth) {
+  const rc = new THREE.Raycaster(o.clone().addScaledVector(n, -0.01), n.clone().negate(), 0, depth + 5); rc.firstHitOnly = true;
+  const h = rc.intersectObject(m, false)[0]; return h ? h.distance + 0.01 : Infinity;
+}
+function addMagnet(sides) {
+  const sz = magSize(); pushUndo();
+  const mg = { id: uid(), ...sz, sides: sides.map((sd, k) => ({ part: sd.m.uuid, ...toLocal(sd.m, sd.o, sd.n), pole: k ? 'S' : 'N' })) };
+  magnets.push(mg); markDirty(); rebuildMagnets(); renderPartPanel();
+  const depth = sz.t + sz.ct, thin = sides.filter(sd => wallBehind(sd.m, sd.o, sd.n, depth) < depth + 0.6).map(sd => sd.m.name);
+  const what = sides.length > 1 ? `between ${sides[0].m.name} and ${sides[1].m.name}` : `in ${sides[0].m.name}`;
+  toast(thin.length ? `Magnet ${magLabel(mg)} ${what}, but ${thin.join(' and ')} ${thin.length > 1 ? 'are' : 'is'} too thin there: the hole would break through or leave under 0.6 mm. Try a thinner magnet or another spot.`
+                    : `Magnet ${magLabel(mg)} ${what}: holes ${(sz.d + sz.cd).toFixed(2)} mm wide, ${depth.toFixed(2)} mm deep.`, thin.length ? 'bad' : 'ok');
+}
+/*
+ * Lining the pair up: by default the two holes share one axis, square to the seam where the parts meet, so the
+ * magnets go in straight and meet face to face. The seam's direction is the average of each part's surface around
+ * the spot (area-weighted, over a patch a bit wider than the magnet), not one triangle's tilt. A hole already in
+ * either part close by (another option for the same spot) is reused, so every option lines up with the same hole.
+ */
+const magAlign = () => $('mag-align')?.value || 'seam';
+/** The average outward direction of a part's surface within r of a point (only faces turned toward `toward`). */
+function surfNormalNear(m, pW, r, toward) {
+  const bvh = m.geometry.boundsTree; if (!bvh) return null;
+  m.updateMatrixWorld(true);
+  const inv = m.matrixWorld.clone().invert(), flip = m.matrixWorld.determinant() < 0 ? -1 : 1, S = V().setFromMatrixScale(m.matrixWorld), sc = Math.max(Math.abs(S.x), Math.abs(S.y), Math.abs(S.z)) || 1;
+  const pl = pW.clone().applyMatrix4(inv), rl = r / sc, nm = new THREE.Matrix3().getNormalMatrix(m.matrixWorld);
+  const gl = toward ? toward.clone().applyMatrix3(new THREE.Matrix3().copy(nm).invert()).normalize().multiplyScalar(flip) : null;
+  const box = new THREE.Box3(pl.clone().subScalar(rl), pl.clone().addScalar(rl)), acc = V(), n = V(), q = V();
+  bvh.shapecast({
+    intersectsBounds: b => b.intersectsBox(box) ? INTERSECTED : NOT_INTERSECTED,
+    intersectsTriangle: tri => {
+      if (tri.closestPointToPoint(pl, q).distanceTo(pl) > rl) return false;
+      tri.getNormal(n); if (gl && n.dot(gl) < 0.25) return false;
+      acc.addScaledVector(n, tri.getArea()); return false;
+    },
+  });
+  if (acc.lengthSq() < 1e-12) return null;
+  return acc.multiplyScalar(flip).applyMatrix3(nm).normalize();
+}
+/** Where a line meets a part: the crossing nearest `c` whose face turns toward `facing`. */
+function lineHit(m, c, ax, facing, R) {
+  const rc = new THREE.Raycaster(c.clone().addScaledVector(ax, -R), ax, 0, 2 * R), hs = rc.intersectObject(m, false);
+  let best = null, bd = Infinity;
+  for (const h of hs) { if (hitNormal(h).dot(facing) < 0.05) continue; const d = h.point.distanceTo(c); if (d < bd) { bd = d; best = h.point.clone(); } }
+  return best;
+}
+/** An existing hole in this part within reach of p (to share with another option), in world terms. */
+function holeNear(m, p, reach, skip = null) {
+  let best = null, bd = reach;
+  for (const mg of magnets) { if (mg === skip) continue; for (const sd of mg.sides) { if (sd.part !== m.uuid) continue; const w = sideWorld(sd); if (!w) continue; const d = w.o.distanceTo(p); if (d < bd) { bd = d; best = w; } } }
+  return best;
+}
+/**
+ * Two rough sides ({ m, o, n }: n out of that part, toward the other) → the pair on one shared axis, square to the
+ * seam: [{ m: A, o, n: ax }, { m: B, o, n: -ax }]. Null if the line can't be made to meet both parts.
+ */
+function alignedPair(a, b, sz = magSize(), skip = null) {
+  const r = Math.max(1.5, (sz.d + sz.cd) * 1.25), reach = Math.max(1, (sz.d + sz.cd) * 0.9);
+  let g = a.n.clone().sub(b.n); if (g.lengthSq() < 1e-8) g = b.o.clone().sub(a.o); if (g.lengthSq() < 1e-12) return null; g.normalize();   // from A toward B
+  let ax = null, centres = null;
+  // another option already has a hole here: use that very hole and its axis
+  const ha = holeNear(a.m, a.o, reach, skip), hb = holeNear(b.m, b.o, reach, skip);
+  if (ha) { ax = ha.n.clone(); centres = [ha.o]; }
+  else if (hb) { ax = hb.n.clone().negate(); centres = [hb.o]; }
+  else {
+    const na = surfNormalNear(a.m, a.o, r, g), nb = surfNormalNear(b.m, b.o, r, g.clone().negate());
+    ax = (na || g.clone()).sub(nb || g.clone().negate()); if (ax.lengthSq() < 1e-8 || ax.normalize().dot(g) < 0.2) ax = g.clone();
+    centres = [a.o, a.o.clone().add(b.o).multiplyScalar(0.5), b.o];
+  }
+  const R = Math.max(4, a.o.distanceTo(b.o) * 2 + 4, (sz.t + sz.ct) * 3);
+  for (const c of centres) {
+    const pa = ha ? ha.o.clone() : lineHit(a.m, c, ax, ax, R), pb = hb && !ha ? hb.o.clone() : lineHit(b.m, c, ax, ax.clone().negate(), R);
+    if (pa && pb && pa.distanceTo(pb) < a.o.distanceTo(b.o) + 3 * r) return [{ m: a.m, o: pa, n: ax.clone() }, { m: b.m, o: pb, n: ax.clone().negate() }];
+  }
+  return null;
+}
+/** Line a pair up again (square to the seam, or onto a hole close by). */
+function realignMagnet(mg) {
+  if (mg.sides.length < 2) return false;
+  const w = mg.sides.map(sideWorld); if (w.some(x => !x)) return false;
+  if (mg.conn) { const ci = connInfo(mg.conn); if (ci) { const dirB = seamDirAtConn(ci, mg.shift || [0, 0], mg.dir); if (dirB) { mg.dir = dirB; placeConnMagnets(mg.conn); return true; } } }
+  const pr = alignedPair({ m: w[0].m, o: w[0].o, n: w[0].n }, { m: w[1].m, o: w[1].o, n: w[1].n }, mg, mg); if (!pr) return false;
+  mg.sides = pr.map((sd, k) => ({ part: sd.m.uuid, ...toLocal(sd.m, sd.o, sd.n), pole: mg.sides[k].pole }));
+  return true;
+}
+/** At a connection: the direction square to the seam there (b → a, in b's frame), from the surfaces either side. */
+function seamDirAtConn(ci, shift, dirB) {
+  const sides = connMagnetSides(ci, shift, dirB), dir = sides[1].n.clone(), sz = magSize(), r = Math.max(1.5, (sz.d + sz.cd) * 1.25);
+  const ra = surfNormalNear(ci.a, sides[0].o, r, dir.clone().negate()), rb = surfNormalNear(ci.b, sides[1].o, r, dir);
+  if (!ra && !rb) return null;
+  let d = (rb || dir.clone()).sub(ra || dir.clone().negate()); if (d.lengthSq() < 1e-8) return null; d.normalize(); if (d.dot(dir) < 0.2) d = dir;
+  return d.transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray();
+}
+/*
+ * A magnet at a connection: the pair goes where the two parts meet along the connection's axis, one hole in each,
+ * found by looking from the connection point along its axis for each part's facing surface. It remembers the
+ * connection (mg.conn) and a shift across it (mg.shift, mm), and is placed again whenever the connection changes.
+ */
+function connMagnetSides(ci, shift = [0, 0], dirB = null) {
+  // which way the holes go: across where the parts meet (kept with the magnet, in the second part's frame), else the connection's axis
+  const ax = (dirB ? V(...dirB).transformDirection(ci.b.matrixWorld) : ci.axis.clone()).normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(V(0, 0, 1), ax), e1 = V(1, 0, 0).applyQuaternion(q), e2 = V(0, 1, 0).applyQuaternion(q);
+  const at = ci.point.clone().addScaledVector(e1, shift[0] || 0).addScaledVector(e2, shift[1] || 0);
+  const R = Math.max(3, 0.6 * Math.min(worldBox(ci.a).getSize(V()).length(), worldBox(ci.b).getSize(V()).length()));
+  const hit = (m, from, d) => { const rc = new THREE.Raycaster(from, d, 0, 2 * R); const hs = rc.intersectObject(m, false); return hs.length ? hs[0].point : null; };
+  // the first part sits on the +axis side, the second on the -axis side: each one's face toward the other
+  const pa = hit(ci.a, at.clone().addScaledVector(ax, -R), ax) || at.clone(), pb = hit(ci.b, at.clone().addScaledVector(ax, R), ax.clone().negate()) || at.clone();
+  return [{ m: ci.a, o: pa, n: ax.clone().negate() }, { m: ci.b, o: pb, n: ax.clone() }];
+}
+function addConnMagnet(c, shift = [0, 0]) {
+  const ci = connInfo(c); if (!ci) return null;
+  // the direction across their contact, from the second part toward the first (a hinge's or roller's own axis is
+  // the way it moves, not the way the faces meet)
+  let dir = null;
+  try { const cc = contactBetween(contactContext([ci.b, ci.a]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); if (cc?.nOut?.[0]?.lengthSq() > 1e-9) dir = cc.nOut[0].clone().normalize(); } catch (e) {}
+  if (!dir) dir = ci.axis.clone();
+  if (dir.dot(worldBox(ci.a).getCenter(V()).sub(ci.point)) < 0 && dir.dot(worldBox(ci.b).getCenter(V()).sub(ci.point)) > 0) dir.negate();
+  let dirB = dir.clone().transformDirection(ci.b.matrixWorld.clone().invert()).normalize().toArray();
+  if (magAlign() === 'seam') dirB = seamDirAtConn(ci, shift, dirB) || dirB;
+  const sides = connMagnetSides(ci, shift, dirB); addMagnet(sides);
+  const mg = magnets[magnets.length - 1]; mg.conn = { ...c }; mg.shift = shift.slice(); mg.dir = dirB; markDirty(); renderPartPanel(); return mg;
+}
+function placeConnMagnets(c) {
+  const ci = connInfo(c); if (!ci) return;
+  for (const mg of magnets) {
+    if (!sameConn(mg.conn, c)) continue;
+    const sides = connMagnetSides(ci, mg.shift || [0, 0], mg.dir || null);
+    mg.sides = sides.map((sd, k) => ({ part: sd.m.uuid, ...toLocal(sd.m, sd.o, sd.n), pole: mg.sides[k]?.pole || (k ? 'S' : 'N') }));
+  }
+  rebuildMagnets();
+}
+/** The connections between two parts (their joint either way, or an extra link). */
+function connsBetween(m1, m2) { return allConns().filter(ci => (ci.a === m1 && ci.b === m2) || (ci.a === m2 && ci.b === m1)).map(ci => ci.c); }
+function handleMagnetClick(hit) {
+  if (!hit) { toast('Missed. Click on a part where it meets another.'); return; }
+  const m = hit.object, p = hit.point.clone(), n = hitNormal(hit);
+  if (magPending) {                               // second click: the part it fits against
+    if (m === magPending.m) { toast(`That's ${m.name} again. Click the part it fits against.`, 'bad'); return; }
+    const a = magPending; magPending = null; updateStep();
+    if (!magShift) { const cs = connsBetween(a.m, m); if (cs.length) { addConnMagnet(cs[0]); toast(`Magnet placed at the connection between ${a.m.name} and ${m.name}.`, 'ok'); return; } }
+    // touching? then the pair goes where they really meet (that face is usually hidden once assembled), nearest the first click
+    let c = null; try { c = contactBetween(contactContext([a.m, m]), 0, 1, Math.max(+$('ar-tol').value || 0.3, 0.05)); } catch (e) { c = null; }
+    if (c) {
+      const at = V().copy(c.centre || c.joint), dir = (c.nOut?.[0]?.lengthSq() > 1e-9 ? c.nOut[0].clone() : V(0, 0, 1)).normalize();      // out of the first part, toward the second
+      if (worldBox(m).getCenter(V()).sub(worldBox(a.m).getCenter(V())).dot(dir) < 0) dir.negate();       // from the first part toward the second
+      const surf = (part, from, d) => { const rc = new THREE.Raycaster(from, d, 0, 8); rc.firstHitOnly = true; return rc.intersectObject(part, false)[0]?.point || null; };
+      const pa = surf(a.m, at.clone().addScaledVector(dir, 3), dir.clone().negate()) || at, pb = surf(m, at.clone().addScaledVector(dir, -3), dir) || at;
+      const rough = [{ m: a.m, o: pa, n: dir.clone() }, { m, o: pb, n: dir.clone().negate() }];
+      addMagnet(magAlign() === 'seam' ? alignedPair(...rough) || rough : rough); return;
+    }
+    if (magAlign() === 'seam') {
+      const pr = alignedPair(a, { m, o: p, n });
+      if (pr) { addMagnet(pr); return; }
+      toast(`Couldn't line the two holes up on one axis (the spots don't face each other), so they go where you clicked.`, 'bad');
+    }
+    addMagnet([a, { m, o: p, n }]); return;
+  }
+  // where it meets another part: look across the surface for the other part's face, within 2 mm (or a little overlap)
+  const others = liveParts().filter(x => x !== m && isVisibleChain(x) && !boxed(x));
+  const rc = new THREE.Raycaster(p.clone().addScaledVector(n, -0.6), n, 0, 2.6); rc.firstHitOnly = true;
+  const h2 = rc.intersectObjects(others, false)[0];
+  if (h2 && !magShift) { const cs = connsBetween(m, h2.object); if (cs.length) { addConnMagnet(cs[0]); toast(`Magnet placed at the connection between ${m.name} and ${h2.object.name}: it follows if you change the connection. Shift-click to put it exactly where you click.`, 'ok'); return; } }
+  if (h2) { const rough = [{ m, o: p, n }, { m: h2.object, o: h2.point.clone(), n: n.clone().negate() }]; addMagnet(magAlign() === 'seam' ? alignedPair(...rough) || rough : rough); }
+  else { magPending = { m, o: p, n }; updateStep(); $('step-text').textContent = `No part touches ${m.name} there. Click the spot on the part it fits against (Esc to cancel)`; rebuildMagnets(); }
+}
+function holeGeometry(mg, o, n, extraOut = 0.3) {      // a cylinder from just outside the surface down to the hole's depth
+  const r = (mg.d + mg.cd) / 2, depth = mg.t + mg.ct, len = depth + extraOut;
+  const g = new THREE.CylinderGeometry(r, r, len, Math.max(24, Math.min(64, Math.round(r * 20))), 1, false);
+  g.deleteAttribute('uv'); g.deleteAttribute('normal');
+  g.translate(0, (extraOut - depth) / 2, 0);                                         // its top sits extraOut above the surface
+  g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(V(0, 1, 0), n)); g.translate(o.x, o.y, o.z);
+  return g;
+}
+function rebuildMagnets() {
+  while (magnetFx.children.length) { const c = magnetFx.children.pop(); c.geometry?.dispose(); c.material?.dispose?.(); }
+  magnets = magnets.filter(mg => { mg.sides = mg.sides.filter(sd => partById(sd.part)); return mg.sides.length; });
+  const items = magnets.flatMap(mg => mg.sides.map(sd => ({ mg, sd })));
+  if (magPending) items.push({ mg: { ...magSize() }, sd: null, pend: magPending });
+  for (const { mg, sd, pend } of items) {
+    const w = pend || sideWorld(sd); if (!w || !isVisibleChain(w.m)) continue;
+    const body = new THREE.Mesh(holeGeometry(mg, w.o, w.n, 0.05), new THREE.MeshBasicMaterial({ color: pend ? '#d6a24a' : sd.pole === 'N' ? '#d2716c' : '#6fa3dd', transparent: true, opacity: 0.45, depthTest: false, depthWrite: false }));
+    body.name = 'magnet-hole'; body.renderOrder = 997; body.raycast = () => {}; magnetFx.add(body);
+    const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 40 }, (_, i) => { const a = i / 40 * Math.PI * 2; return V(Math.cos(a), Math.sin(a), 0).multiplyScalar((mg.d + mg.cd) / 2); })),
+      new THREE.LineBasicMaterial({ color: '#f1d08f', depthTest: false })); ring.position.copy(w.o).addScaledVector(w.n, 0.02); ring.quaternion.setFromUnitVectors(V(0, 0, 1), w.n);
+    ring.renderOrder = 998; ring.raycast = () => {}; magnetFx.add(ring);
+  }
+}
+/** Each part's magnet rows in its Properties: size, partner, resize, remove. */
+function magnetRows(p, el) {
+  const mine = magnets.filter(mg => mg.sides.some(sd => sd.part === p.uuid)); if (!mine.length) return;
+  const box = document.createElement('div'); box.className = 'mag-list';
+  const h = document.createElement('div'); h.className = 'opt-sub'; h.textContent = `Magnets (${mine.length})`; box.append(h);
+  for (const mg of mine) {
+    const other = mg.sides.find(sd => sd.part !== p.uuid), row = document.createElement('div'); row.className = 'mag-row';
+    const t = document.createElement('span'); t.textContent = `${magLabel(mg)} · hole ${(mg.d + mg.cd).toFixed(2)} × ${(mg.t + mg.ct).toFixed(2)}${other ? ` · ${partById(other.part)?.name}` : ''}`;
+    const bt = (txt, title, fn) => { const x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = txt; x.title = title; x.addEventListener('click', fn); return x; };
+    if (mg.conn) {
+      const ci = connInfo(mg.conn); t.textContent += ci ? ' · at the connection' : ' · (its connection is gone)';
+      if (ci) row.append(bt('⌖', 'Select the connection it sits on', () => selectConn(mg.conn)));
+    }
+    row.append(t, bt('Line up', 'Put both holes on one axis, square to the seam (or onto a hole close by), so the magnets go in straight', () => { pushUndo(); const ok = realignMagnet(mg); markDirty(); rebuildMagnets(); renderPartPanel(); toast(ok ? 'Lined that pair up, square to the seam.' : "Couldn't line that pair up: the two spots don't face each other.", ok ? 'ok' : 'bad'); }),
+               bt('Use bar size', `Give this pair the size and fit set in the Magnet tool's bar`, () => { pushUndo(); Object.assign(mg, magSize()); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`That magnet is now ${magLabel(mg)}.`); }),
+               bt('Remove', 'Remove this pair of holes', () => { pushUndo(); magnets = magnets.filter(x => x !== mg); markDirty(); rebuildMagnets(); renderPartPanel(); toast('Removed the magnet.'); }));
+    box.append(row);
+  }
+  el.append(box);
+}
+/** At export: the holes cut into copies of the parts that carry magnets (meshes[i] is the export copy of parts[i]). */
+async function cutMagnetHoles(meshes, parts) {
+  // a hole shared by several options is cut once
+  const uniq = list => list.filter(({ mg, sd }, k) => !list.slice(0, k).some(x => x.mg.d + x.mg.cd >= mg.d + mg.cd - 1e-6 && x.mg.t + x.mg.ct >= mg.t + mg.ct - 1e-6 && V(...x.sd.o).distanceTo(V(...sd.o)) < 1e-3 && V(...x.sd.n).dot(V(...sd.n)) > 0.9999));
+  const todo = parts.map((m, i) => ({ i, m, sides: uniq(magnets.flatMap(mg => mg.sides.filter(sd => sd.part === m.uuid).map(sd => ({ mg, sd })))) })).filter(x => x.sides.length);
+  if (!todo.length) return { meshes, note: '', holes: [] };
+  if ($('exp-merge').checked) {          // merging: the holes are cut by the merge itself, exactly, so the result stays one clean solid
+    const byPart = meshes.map(() => []);
+    for (const { i, sides } of todo) for (const { mg, sd } of sides) { const w = sideWorld(sd), g = holeGeometry(mg, w.o, w.n); byPart[i].push(Float32Array.from((g.index ? g.toNonIndexed() : g).attributes.position.array)); }
+    return { meshes, note: '', holes: byPart.flat(), byPart };
+  }
+  let CSG; try { CSG = await import('three-bvh-csg'); } catch (e) { return { meshes, note: "Magnet holes weren't cut: the hole-cutting tool didn't load. Check your connection. " }; }
+  loading.show('Cutting magnet holes'); const out = meshes.slice(); let holes = 0, failed = [];
+  try {
+    const ev = new CSG.Evaluator(); ev.attributes = ['position']; ev.useGroups = false;
+    for (const [k, { i, m, sides }] of todo.entries()) {
+      loading.set(k / todo.length, `${m.name}: ${sides.length} hole${sides.length > 1 ? 's' : ''}`); await nextFrame();
+      try {
+        const src = meshes[i]; src.updateMatrixWorld(true);
+        const g0 = src.geometry, pos = g0.attributes.position, wpos = new Float32Array(pos.count * 3), v = V();
+        for (let j = 0; j < pos.count; j++) { v.fromBufferAttribute(pos, j).applyMatrix4(src.matrixWorld); wpos.set([v.x, v.y, v.z], 3 * j); }
+        let geom = new THREE.BufferGeometry(); geom.setAttribute('position', new THREE.BufferAttribute(wpos, 3));
+        const ix = Uint32Array.from(g0.index.array); if (src.matrixWorld.determinant() < 0) for (let t = 0; t < ix.length; t += 3) { const tmp = ix[t+1]; ix[t+1] = ix[t+2]; ix[t+2] = tmp; }
+        geom.setIndex(new THREE.BufferAttribute(ix, 1));
+        let brush = new CSG.Brush(geom); brush.updateMatrixWorld();
+        for (const { mg, sd } of sides) {
+          const w = sideWorld(sd); const hole = new CSG.Brush(mergeVertices(holeGeometry(mg, w.o, w.n))); hole.updateMatrixWorld();
+          brush = ev.evaluate(brush, hole, CSG.SUBTRACTION); holes++;
+        }
+        const res = new THREE.Mesh(brush.geometry); res.updateMatrixWorld(true); out[i] = res;
+      } catch (e) { console.warn(e); failed.push(m.name); }
+    }
+  } finally { loading.hide(); }
+  return { meshes: out, holes: [], note: `Cut ${holes} magnet hole${holes === 1 ? '' : 's'}.` + (failed.length ? ` Couldn't cut into ${failed.join(', ')} (its mesh may not be closed); exported without.` : '') + ' ' };
+}
+function bindMagnets() {
+  const SIZE = () => $('mag-size').value;
+  $('mag-size').addEventListener('change', () => { if (SIZE() === 'custom') return; const [d, t] = SIZE().split('x').map(Number); $('mag-d').value = d; $('mag-t').value = t; rebuildMagnets(); });
+  ['mag-d', 'mag-t'].forEach(id => $(id).addEventListener('change', () => { const v = `${+$('mag-d').value}x${+$('mag-t').value}`; $('mag-size').value = [...$('mag-size').options].some(o => o.value === v) ? v : 'custom'; rebuildMagnets(); }));
+  $('mag-fit').addEventListener('change', () => { const f = { resin: 0.15, fdm: 0.3 }[$('mag-fit').value]; if (f != null) { $('mag-cd').value = f; $('mag-ct').value = f; } });
+  ['mag-cd', 'mag-ct'].forEach(id => $(id).addEventListener('change', () => { const a = +$('mag-cd').value, b = +$('mag-ct').value; $('mag-fit').value = a === b && a === 0.15 ? 'resin' : a === b && a === 0.3 ? 'fdm' : 'custom'; }));
+  $('mag-lineup').addEventListener('click', () => { if (!magnets.length) { toast('No magnets yet. Click where two parts meet.'); return; }
+    pushUndo(); let ok = 0; for (const mg of magnets) if (realignMagnet(mg)) ok++; markDirty(); rebuildMagnets(); renderPartPanel();
+    toast(`Lined up ${ok} of ${magnets.length} magnet pair${magnets.length > 1 ? 's' : ''}, square to their seams.` + (ok < magnets.length ? " The rest don't face each other." : ''), ok === magnets.length ? 'ok' : 'bad'); });
+  $('mag-apply').addEventListener('click', () => { if (!magnets.length) { toast('No magnets yet. Click where two parts meet.'); return; }
+    pushUndo(); magnets.forEach(mg => Object.assign(mg, magSize())); markDirty(); rebuildMagnets(); renderPartPanel(); toast(`All ${magnets.length} magnet${magnets.length > 1 ? 's are' : ' is'} now ${magLabel(magSize())}.`, 'ok'); });
+}
+
+// seam preview: amber where surfaces will be pushed, red where a gap is too wide to fill
+const seamFx = new THREE.Group(); scene.add(seamFx);
+function clearSeamPreview() { while (seamFx.children.length) { const c = seamFx.children.pop(); c.geometry?.dispose(); } $('exp-preview').setAttribute('aria-pressed', 'false'); $('exp-preview').textContent = 'Show seams'; }
+async function showSeamPreview() {
+  const ms = exportMeshes(); if (ms.length < 2) { toast('Fill seams needs at least two parts.'); return; }
+  toast('Finding seams…'); await nextFrame();
+  const o = fillOpts(), { out, stats } = fillSeamsAll(ms, o), wide = gapsLeft(ms, out, o.maxGap * 2);
+  clearSeamPreview();
+  const pts = [];
+  ms.forEach((m, k) => { const P = out[k].positions, mv = out[k].moved; for (let i = 0; i < mv.length; i++) if (mv[i] > 0) pts.push(P[3*i], P[3*i+1], P[3*i+2]); });
+  const dots = (arr, color, size) => { if (!arr.length) return; const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+    const p = new THREE.Points(g, new THREE.PointsMaterial({ color, size, sizeAttenuation: false, depthTest: false })); p.renderOrder = 999; seamFx.add(p); };
+  dots(pts, '#d6a24a', 3); dots(wide.spots.flatMap(v => [v.x, v.y, v.z]), '#e36b6b', 5);
+  $('exp-preview').setAttribute('aria-pressed', 'true'); $('exp-preview').textContent = 'Hide seams';
+  $('exp-fill-note').textContent = (stats.moved ? `${stats.seams} seam${stats.seams === 1 ? '' : 's'}: ${stats.moved.toLocaleString()} corners (amber) pushed by up to ${stats.largest.toFixed(2)} mm. No slits left up to ${o.maxGap} mm.`
+    : `No parts within ${o.maxGap} mm of each other.`) + (wide.open ? ` Red: ${wide.open} spot${wide.open > 1 ? 's' : ''} with a gap wider than ${o.maxGap} mm that won't be filled.` : '');
+}
+$('exp-merge').addEventListener('change', () => { $('exp-merge-f').hidden = $('exp-merge-note').hidden = !$('exp-merge').checked; });
+$('exp-pockets').addEventListener('change', () => { $('exp-pockets-f').hidden = !$('exp-pockets').checked; if (!$('exp-pockets').checked) clearPocketPreview(); markDirty(); });
+$('exp-pocket-show').addEventListener('click', () => { if ($('exp-pocket-show').getAttribute('aria-pressed') === 'true') clearPocketPreview(); else showPocketPreview(); });
+['exp-pocket-res', 'exp-pocket-drain'].forEach(id => $(id).addEventListener('change', () => { if (pocketFx.children.length) showPocketPreview(); markDirty(); }));
+$('exp-fill').addEventListener('change', () => { $('exp-fill-f').hidden = !$('exp-fill').checked; if (!$('exp-fill').checked) clearSeamPreview(); markDirty(); });
+$('exp-sprue').addEventListener('click', () => exportSprues());
+$('exp-sprue-clear').addEventListener('click', () => { pushUndo(); sprues = null; afterHierarchyChange(); toast('Removed the sprue frames.'); });
+$('exp-preview').addEventListener('click', () => { if ($('exp-preview').getAttribute('aria-pressed') === 'true') clearSeamPreview(); else showSeamPreview(); });
+['exp-gap', 'exp-overlap'].forEach(id => $(id).addEventListener('change', () => { if (seamFx.children.length) showSeamPreview(); markDirty(); }));
+$('exp-each').addEventListener('click', () => exportSeparate(exportMeshes(), 'parts'));
+/** One STL per part, each where it sits now (so they line up again opened together). */
+async function exportSeparate(all, zipName = 'parts') {
+  if (!all.length) return;
+  const glue = $('exp-glue').checked ? glueOns(all) : null;
+  if (glue?.list.length) {
+    await withHostsBare(glue, async () => {
+      const ms = all.filter(m => !glue.skipMesh.has(m)), used = new Set(), cut = await cutMagnetHoles(ms, ms);
+      const files = ms.map((m, i) => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([cut.meshes[i]]) }; });
+      const mg = await mergeSTLs(files.map(f => f.data), 'Merging each part into one solid', cut.byPart || []); files.forEach((f, i) => { f.data = mg.files[i]; });
+      const g = await glueFiles(glue, used);
+      $('exp-note').textContent = mg.note + (cut.note || '') + g.note;
+      deliver([...files, ...g.files], zipName + '-stl.zip');
+    });
+    return;
+  }
+  const ms = all;
+  const used = new Set(), cut = await cutMagnetHoles(ms, ms); if (cut.note) $('exp-note').textContent = cut.note;
+  const files = ms.map((m, i) => { let n = safe(m.name), k = 2; while (used.has(n)) n = `${safe(m.name)}_${k++}`; used.add(n); return { name: n + '.stl', data: writeSTL([cut.meshes[i]]) }; });
+  const mg = await mergeSTLs(files.map(f => f.data), 'Merging each part into one solid', cut.byPart || []); files.forEach((f, i) => { f.data = mg.files[i]; });
+  if (mg.note || cut.note) $('exp-note').textContent = mg.note + (cut.note || '');
+  deliver(files, zipName + '-stl.zip');
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+let down = null;
+renderer.domElement.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY, onGizmo: tc.dragging || tc.axis !== null, button: e.button }; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!down || down.button !== 0 || down.onGizmo) { down = null; return; }
+  const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
+  if (moved > 5) return;                          // that was an orbit drag
+  if (dirPick) { dirPickClick(raycast(e)); return; }  // picking faces for a direction
+  if (oz) { oozeClick(raycast(e)); return; }                           // stringing ooze between spots
+  if (modHit) { modHitClick(raycast(e), e); return; }                // a crack modifier's new hit
+  if (dm) { crackClick(raycast(e), e); return; }                      // cracking: where it got hit
+  if (bz) { burstClick(raycast(e), e); return; }                      // bursting: where it comes out
+  if (gp) { growClick(raycast(e)); return; }                          // placing a growth
+  if (rp) { reliefPlaceClick(raycast(e), e.shiftKey); return; }                   // placing a relief, or sliding it along the face
+  if (!SNAP_STEPS[tool] && tool !== 'ORIENT' && tool !== 'pose' && !(e.ctrlKey || e.metaKey || e.shiftKey)) {
+    const bh = benchHit(e);
+    if (bh) { if (bh.kind === 'book' && tool === 'select') { openBook(); return; } selectBench(bh.kind, bh.k); return; }
+  }
+  if (['select', 'move', 'rotate', 'MAGNET'].includes(tool) && !(e.ctrlKey || e.metaKey) && !marr.picking) {
+    const c = connAt(e);
+    if (c) { if (tool === 'MAGNET') { const ci = connInfo(c); addConnMagnet(c); if (ci) toast(`Magnet placed at the connection: ${ci.name}. It follows if you change the connection.`, 'ok'); } else selectConn(c); return; }
+  }
+  const hit = raycast(e);
+  if (marr.picking) {                              // Mirror & array: this click picks the centre
+    if (!hit) { toast('Missed. Click a spot on a part.'); return; }
+    marr.picked = hit.point.clone(); marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false');
+    fillSelect($('ma-pivot'), marrPivots().map(o => o.slice(0, 2)), 'pick'); fillSelect($('ma-axis'), marrAxes().map(o => o.slice(0, 2))); marrPreview(); return;
+  }
+  if (tool === 'MAGNET') { magShift = e.shiftKey; handleMagnetClick(hit); magShift = false; return; }
+  if (tool === 'LUCKY') { handleLuckyClick(hit); return; }
+  if (SNAP_STEPS[tool]) {                          // measuring a big surface can take a moment: let the message paint first
+    const ev = { shiftKey: e.shiftKey };
+    if (hit && hit.object.userData.part.tris > 150000) { toast('Measuring surface…'); setTimeout(() => handlePick(ev, hit), 30); }
+    else handlePick(ev, hit);
+    return;
+  }
+  if (tool === 'ORIENT') { if (hit) orientFromFace(hit); return; }
+  const multi = e.ctrlKey || e.metaKey || e.shiftKey;
+  if (multi) { if (hit) select(hit.object, 'toggle'); return; }      // Ctrl-click: add or remove, never clears
+  select(hit ? hit.object : null);
+  if (tool === 'pose' && hit && !jointOf(hit.object)) { /* toast shown by syncGizmo */ }
+});
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+// Viewport navigation, Blender style.
+//  - Wheel zooms toward the point under the cursor by a share of the distance to it, so it never stalls near the orbit
+//    centre; over empty space the orbit centre is pushed ahead once you reach it (dolly through).
+//  - Left/middle drag turns the view around the selection (or the point under the cursor) without the view jumping.
+//  - Double-click glides the view to centre on the clicked spot.
+const nav = { rot: null, glide: null };
+const fwd = () => camera.getWorldDirection(V());
+function sceneScale() { const b = sceneBox(); return b.isEmpty() ? 50 : Math.max(b.getSize(V()).length(), 5); }
+function setPivotDepth(depth) {                                 // move the orbit centre along the view axis: the picture doesn't change
+  orbit.target.copy(camera.position).addScaledVector(fwd(), Math.max(depth, sceneScale() * 0.002));
+}
+renderer.domElement.addEventListener('wheel', e => {
+  e.preventDefault(); nav.glide = null;
+  let dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
+  dy = Math.max(-200, Math.min(200, dy));
+  if (!dy) return;
+  if (camera.isOrthographicCamera) {                              // orthographic: zoom is a scale; keep the spot under the cursor still
+    const r = renderer.domElement.getBoundingClientRect(), nx = ((e.clientX - r.left) / r.width) * 2 - 1, ny = -((e.clientY - r.top) / r.height) * 2 + 1;
+    const z0 = camera.zoom, z1 = Math.min(Math.max(z0 * Math.exp(-dy * 0.0018), 1e-3), 1e5), k = 1 / z0 - 1 / z1;
+    const right = V(1, 0, 0).applyQuaternion(camera.quaternion), upv = V(0, 1, 0).applyQuaternion(camera.quaternion);
+    const shift = right.multiplyScalar(nx * (camera.right - camera.left) / 2 * k).add(upv.multiplyScalar(ny * (camera.top - camera.bottom) / 2 * k));
+    camera.position.add(shift); orbit.target.add(shift); camera.zoom = z1; camera.updateProjectionMatrix(); orbit.update(); markViewMoved(); return;
+  }
+  const hit = raycast(e), dir = raycaster.ray.direction.clone(), f = fwd();
+  const S = sceneScale(), minD = S * 0.002, airD = S * 0.03;     // over empty space never crawl slower than this
+  const d = hit ? hit.distance : Math.max(camera.position.distanceTo(orbit.target), airD);
+  const share = 1 - Math.exp(-Math.abs(dy) * 0.0018);               // ≈16% per wheel notch
+  let move = dy < 0 ? d * share : -d * share / (1 - share);         // zooming out exactly undoes zooming in
+  if (hit && dy < 0) move = Math.min(move, d - minD);               // stop just short of the surface
+  const pivot = hit ? hit.point.clone() : orbit.target.clone();
+  camera.position.addScaledVector(dir, move);
+  const depth = pivot.sub(camera.position).dot(f);                 // keep the pivot at the depth of what you zoomed at
+  setPivotDepth(hit ? depth : Math.max(depth, airD));
+  orbit.update(); markViewMoved();
+}, { passive: false });
+
+renderer.domElement.addEventListener('pointerdown', e => {
+  const turnBtn = e.button === 1 || (e.button === 0 && !(e.shiftKey || e.ctrlKey || e.metaKey));
+  if (!turnBtn || (e.button === 1 && (e.shiftKey || e.ctrlKey || e.metaKey))) return;
+  nav.rot = { x: e.clientX, y: e.clientY, started: false, ev: { clientX: e.clientX, clientY: e.clientY } };
+});
+function orbitPivot(ev) {
+  if ($('set-orbitsel').checked && selection.length) {
+    const b = sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]);
+    if (!b.isEmpty()) return b.getCenter(V());
+  }
+  const hit = raycast(ev);
+  if (hit) return hit.point.clone();
+  return orbit.target.clone();
+}
+window.addEventListener('pointermove', e => {
+  const r = nav.rot; if (!r) return;
+  if (!r.started) {
+    if (Math.hypot(e.clientX - r.x, e.clientY - r.y) < 4) return;
+    if (!orbit.enabled || tc.dragging || marq) { nav.rot = null; return; }   // a gizmo drag or a box select owns this drag
+    r.started = true; r.pivot = orbitPivot(r.ev); nav.glide = null;
+    setPivotDepth(r.pivot.clone().sub(camera.position).dot(fwd()));
+    r.lx = r.x; r.ly = r.y;
+  }
+  const dx = e.clientX - r.lx, dy = e.clientY - r.ly; r.lx = e.clientX; r.ly = e.clientY;
+  turnView(dx, dy, r.pivot);
+});
+window.addEventListener('pointerup', () => { if (nav.rot && nav.rot.started) markViewMoved(); nav.rot = null; });
+
+renderer.domElement.addEventListener('dblclick', e => {
+  if (SNAP_STEPS[tool] || tool === 'ORIENT') return;            // double-clicks there are picks
+  const bh = benchHit(e); if (bh?.kind === 'box') { if (kit?.state === 'sealed') openBox(); else openArt(); return; } if (bh?.kind === 'book') return;
+  const hit = raycast(e); if (!hit) return;
+  nav.glide = { to: hit.point.clone().sub(orbit.target) };
+});
+function stepGlide() {                                            // called every frame
+  const g = nav.glide; if (!g) return;
+  const s = g.to.clone().multiplyScalar(0.18);
+  camera.position.add(s); orbit.target.add(s); g.to.sub(s);
+  if (g.to.length() < sceneScale() * 1e-4) { nav.glide = null; markViewMoved(); }
+}
+function fitClipPlanes() {                                        // near plane follows the camera so close-ups don't get cut away
+  if (camera.isOrthographicCamera) {
+    const S = Math.max(sceneScale(), mat.children.length ? Math.hypot(MAT.w, MAT.h) : 0), d0 = camera.position.distanceTo(orbit.target);
+    if (d0 < S * 2) camera.position.copy(orbit.target).addScaledVector(fwd(), -S * 3);
+    const d = camera.position.distanceTo(orbit.target), near = Math.max(0.01, d - S * 2.5), far = d + S * 20;
+    if (Math.abs(near - camera.near) > near * 0.05 || Math.abs(far - camera.far) > far * 0.05) { camera.near = near; camera.far = far; camera.updateProjectionMatrix(); }
+    return;
+  }
+  const d = camera.position.distanceTo(orbit.target), S = Math.max(sceneScale(), mat.children.length ? Math.hypot(MAT.w, MAT.h) : 0);
+  const near = Math.max(0.005, Math.min(d * 0.02, S * 0.01)), far = Math.max(S * 20, d * 20, 500);
+  if (Math.abs(near - camera.near) > near * 0.05 || Math.abs(far - camera.far) > far * 0.05) { camera.near = near; camera.far = far; camera.updateProjectionMatrix(); }
+}
+function markViewMoved() { orbit.dispatchEvent({ type: 'end' }); }
+/** Switch between perspective and orthographic, keeping the view the same size. */
+function setOrtho(on) {
+  if (!!on === camera.isOrthographicCamera) return;
+  const t = orbit.target.clone(), f = fwd(), d = camera.position.distanceTo(t), halfFov = perspCam.fov * Math.PI / 360;
+  if (on) {
+    orthoCam.quaternion.copy(perspCam.quaternion); orthoCam.position.copy(t).addScaledVector(f, -Math.max(d, sceneScale() * 3));
+    orthoCam.zoom = ORTHO_H / Math.max(d * Math.tan(halfFov), 1e-3); camera = orthoCam;
+  } else {
+    perspCam.quaternion.copy(orthoCam.quaternion); perspCam.position.copy(t).addScaledVector(f, -(ORTHO_H / orthoCam.zoom) / Math.tan(halfFov)); camera = perspCam;
+  }
+  camera.add(sun); orbit.object = camera; tc.camera = camera;
+  resize(); camera.updateProjectionMatrix(); fitClipPlanes(); orbit.update(); markViewMoved();
+  $('nav-proj').textContent = on ? 'Ortho' : 'Persp'; $('nav-proj').setAttribute('aria-pressed', String(!!on));
+  $('menu-ortho')?.setAttribute('aria-checked', String(!!on));
+}
+
+// Colour tool: drag on a part to paint (a drag off the parts still turns the view), Alt-click picks up a colour
+const brushRing = new THREE.Mesh(new THREE.RingGeometry(0.86, 1, 48), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9, depthTest: false }));
+brushRing.renderOrder = 999; brushRing.visible = false; scene.add(brushRing);
+const paintMode = () => document.querySelector('#paint-mode [aria-pressed="true"]')?.dataset.v || 'brush';
+function showBrushRing(hit) {
+  if (!hit || tool !== 'paint' || paintMode() !== 'brush') { brushRing.visible = false; return; }
+  const n = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+  brushRing.position.copy(hit.point).addScaledVector(n, 0.02); brushRing.quaternion.setFromUnitVectors(V(0, 0, 1), n);
+  brushRing.scale.setScalar(Math.max(+$('paint-size').value / 2, 0.05)); brushRing.material.color.set($('paint-erase').checked ? '#ff8a8a' : '#ffffff'); brushRing.visible = true;
+}
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (tool !== 'paint' || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  const hit = raycast(e); if (!hit) return;                              // off the parts: the view turns as usual
+  e.stopImmediatePropagation(); e.preventDefault();
+  const m = hit.object, pt = m.userData.part;
+  if (e.altKey) { const c = colourAt(hit); setBrushColor(c); toast(`Picked up ${c}.`); return; }
+  if (paintMode() === 'fill') {
+    pushUndo();
+    if ($('paint-erase').checked) { pt.fill = null; pt.paint = null; } else pt.fill = brush.color;
+    pt.paintVer = (pt.paintVer || 0) + 1; refreshPaint(m); markDirty(); renderOutliner(); renderPartPanel(); return;
+  }
+  pushUndo(); brush.stroke = { touched: new Set(), last: hit.point.clone(), obj: m };
+  paintAt(m, hit.point, hit.faceIndex);
+  try { renderer.domElement.setPointerCapture(e.pointerId); } catch (err) {}
+}, { capture: true });
+let paintEv = null;
+renderer.domElement.addEventListener('pointermove', e => {
+  if (tool !== 'paint') { if (brushRing.visible) brushRing.visible = false; return; }
+  const first = !paintEv; paintEv = { clientX: e.clientX, clientY: e.clientY }; if (!first) return;
+  requestAnimationFrame(() => {
+    const ev = paintEv; paintEv = null; if (!ev) return;
+    const hit = raycast(ev); showBrushRing(hit);
+    const st = brush.stroke; if (!st || !hit) return;
+    const step = Math.max(+$('paint-size').value * 0.25, 0.02);
+    if (hit.object === st.obj) { const d = st.last.distanceTo(hit.point), n = Math.min(40, Math.floor(d / step));
+      for (let k = 1; k <= n; k++) paintAt(hit.object, st.last.clone().lerp(hit.point, k / (n + 1))); }
+    paintAt(hit.object, hit.point, hit.faceIndex); st.last.copy(hit.point); st.obj = hit.object;
+  });
+});
+renderer.domElement.addEventListener('pointerleave', () => { brushRing.visible = false; });
+window.addEventListener('pointerup', () => { if (!brush.stroke) return; brush.stroke = null; markDirty(); renderPartPanel(); });
+function bindPaint() {
+  const sw = $('paint-swatches');
+  for (const [name, hex] of PAINTS) { const b = document.createElement('button'); b.type = 'button'; b.className = 'swatch'; b.dataset.c = hex; b.style.background = hex;
+    b.title = name; b.setAttribute('role', 'radio'); b.setAttribute('aria-label', name); b.addEventListener('click', () => setBrushColor(hex)); sw.append(b); }
+  setBrushColor(brush.color);
+  $('paint-color').addEventListener('input', () => setBrushColor($('paint-color').value));
+  $('paint-mode').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
+    $('paint-mode').querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); $('paint-size-f').hidden = b.dataset.v !== 'brush'; brushRing.visible = false; });
+  const syncSize = from => { const v = Math.max(0.1, +from.value || 1.5); $('paint-size').value = v; $('paint-size-r').value = Math.min(v, 8); };
+  $('paint-size').addEventListener('change', () => syncSize($('paint-size'))); $('paint-size-r').addEventListener('input', () => syncSize($('paint-size-r')));
+  view.addEventListener('wheel', e => { if (tool !== 'paint' || !e.altKey) return; e.preventDefault(); e.stopImmediatePropagation();      // Alt-wheel: brush size
+    $('paint-size').value = Math.max(0.1, Math.min(30, +$('paint-size').value * (e.deltaY > 0 ? 0.9 : 1.1))).toFixed(2); syncSize($('paint-size')); }, { passive: false, capture: true });
+  $('set-plastic').addEventListener('change', applyPlastic);
+}
+
+// Ctrl-drag (Cmd on a Mac) on the viewport: box-select every part that shows inside the box
+let marq = null;
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || !(e.ctrlKey || e.metaKey) || SNAP_STEPS[tool] || tool === 'ORIENT' || tool === 'pose' || tc.axis !== null) return;   // Shift-drag still pans
+  orbit.enabled = false;                                      // this drag selects instead of orbiting
+  marq = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY, view: view.getBoundingClientRect() };
+}, { capture: true });
+window.addEventListener('pointermove', e => {
+  if (!marq) return;
+  marq.x1 = e.clientX; marq.y1 = e.clientY;
+  if (Math.hypot(marq.x1 - marq.x0, marq.y1 - marq.y0) < 5) return;
+  const el = $('marquee'), v = marq.view, x = Math.min(marq.x0, marq.x1) - v.left, y = Math.min(marq.y0, marq.y1) - v.top;
+  Object.assign(el.style, { left: x + 'px', top: y + 'px', width: Math.abs(marq.x1 - marq.x0) + 'px', height: Math.abs(marq.y1 - marq.y0) + 'px' }); el.hidden = false;
+});
+window.addEventListener('pointerup', () => {
+  if (!marq) return;
+  const m = marq; marq = null; orbit.enabled = true; $('marquee').hidden = true;
+  if (Math.hypot(m.x1 - m.x0, m.y1 - m.y0) < 5) return;       // just a Ctrl-click: handled by the click
+  const r = renderer.domElement.getBoundingClientRect();
+  const x0 = Math.min(m.x0, m.x1), x1 = Math.max(m.x0, m.x1), y0 = Math.min(m.y0, m.y1), y1 = Math.max(m.y0, m.y1);
+  const hits = [], v = V();
+  for (const p of liveParts()) {
+    if (!isVisibleChain(p) || boxed(p)) continue;
+    p.updateMatrixWorld(true);
+    const pos = p.geometry.attributes.position, step = Math.max(1, Math.floor(pos.count / 400));
+    for (let i = 0; i < pos.count; i += step) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(p.matrixWorld).project(camera);
+      if (v.z < -1 || v.z > 1) continue;
+      const sx = r.left + (v.x + 1) / 2 * r.width, sy = r.top + (1 - v.y) / 2 * r.height;
+      if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) { hits.push(p); break; }
+    }
+  }
+  selectMany(hits, true);
+  toast(hits.length ? `Selected ${hits.length} part${hits.length > 1 ? 's' : ''} in the box (${selection.length} in all).` : 'No parts in that box.');
+});
+
+// Match: light up the face a click would select, before clicking (mating faces can be very narrow)
+const hoverFx = new THREE.Group(); scene.add(hoverFx);
+let hoverTimer = 0, hoverKey = '';
+function clearHover() { hoverKey = ''; while (hoverFx.children.length) { const c = hoverFx.children.pop(); c.geometry?.dispose(); } }
+renderer.domElement.addEventListener('pointermove', e => {
+  if ((tool !== 'MATCH' && tool !== 'ORIENT') || e.buttons) { if (hoverFx.children.length) clearHover(); return; }
+  clearTimeout(hoverTimer);
+  hoverTimer = setTimeout(() => {
+    const hit = raycast(e); if (!hit) { clearHover(); return; }
+    let side = 'orient';
+    if (tool === 'MATCH') {
+      const { a, b } = matchSides(), m = hit.object;
+      side = !a || m === a ? 'move' : 'fixed';
+      if (!side) { clearHover(); $('step-hint').textContent = 'Areas go on two parts only. Clear to start over.'; return; }
+      if (picks.some(q => q.mesh === m && q.region.includes(hit.faceIndex))) { clearHover(); $('step-hint').textContent = 'Click to drop this area'; return; }
+    }
+    const topo = topoOf(hit.object), key = hit.object.uuid + ':' + hit.faceIndex;
+    if (key === hoverKey) return;
+    hit.object.updateMatrixWorld(true);
+    const res = pickSurface(topo, hit.object.matrixWorld.clone(), hit.faceIndex, hit.point, settings());
+    clearHover(); hoverKey = key; if (res.err) return;
+    const list = res.region, pos = new Float32Array(list.length * 9);
+    list.forEach((t, i) => { for (let k = 0; k < 3; k++) { const v = topo.idx[3*t+k]; pos.set(topo.pos.subarray(3*v, 3*v+3), i*9 + k*3); } });
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const mm = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: side === 'move' ? '#4db4dc' : side === 'fixed' ? '#e2804f' : '#d6a24a', transparent: true, opacity: .32, side: THREE.DoubleSide,
+      polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4, depthWrite: false }));
+    mm.matrixAutoUpdate = false; mm.matrix.copy(hit.object.matrixWorld); hoverFx.add(mm);
+    $('step-hint').textContent = tool === 'ORIENT' ? `Click to orient by this ${res.info.replace(' mating', '')}` : `Click to add this ${res.info} (${side === 'move' ? 'moves' : 'stays'})`;
+  }, 70);
+});
+renderer.domElement.addEventListener('pointerleave', clearHover);
+
+document.querySelectorAll('.tool').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
+$('step-apply').addEventListener('click', applyMatch);
+$('step-clear').addEventListener('click', () => { cancelPick(); toast('Cleared the picked areas.'); });
+$('btn-import').addEventListener('click', () => $('file-input').click());
+$('file-input').addEventListener('change', e => { importFiles(e.target.files); e.target.value = ''; });
+$('btn-sample').addEventListener('click', loadSample);
+$('btn-arrange').addEventListener('click', layOut);
+$('btn-sprue').addEventListener('click', putOnSprues);
+$('btn-undo').addEventListener('click', undo);
+$('btn-redo').addEventListener('click', redo);
+const syncPair = (r, n) => { $(r).addEventListener('input', () => { $(n).value = $(r).value; }); $(n).addEventListener('change', () => { $(r).value = $(n).value; }); };
+syncPair('set-smooth', 'set-smooth-n');
+// the other pick settings: the typed box is the setting, the bar drags it (typing past the bar's range still works)
+const SLIDERS = ['set-balltol', 'set-radius', 'set-crease', 'set-flat'];
+const syncSlider = id => { $(id + '-r').value = Math.min(+$(id + '-r').max, Math.max(+$(id + '-r').min, +$(id).value || 0)); };
+SLIDERS.forEach(id => {
+  $(id + '-r').addEventListener('input', () => { $(id).value = $(id + '-r').value; });
+  $(id + '-r').addEventListener('change', () => $(id).dispatchEvent(new Event('change', { bubbles: true })));
+  $(id).addEventListener('input', () => syncSlider(id)); $(id).addEventListener('change', () => syncSlider(id));
+});
+$('set-joints').addEventListener('change', () => joints.forEach(j => { const h = j.getObjectByName('joint-helper'); if (h) h.visible = $('set-joints').checked; }));
+
+// Drop overlay: shown only while files are dragged over the viewport
+let dragDepth = 0, dragTimer;
+const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
+const hideDrop = () => { dragDepth = 0; clearTimeout(dragTimer); $('drop').hidden = true; };
+view.addEventListener('dragenter', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth++; $('drop').hidden = false; });
+view.addEventListener('dragover', e => { if (!hasFiles(e)) return; e.preventDefault();
+  clearTimeout(dragTimer); dragTimer = setTimeout(hideDrop, 400); });   // a drag that ends elsewhere stops sending dragover
+view.addEventListener('dragleave', e => { if (--dragDepth <= 0 || !view.contains(e.relatedTarget)) hideDrop(); });
+view.addEventListener('drop', e => { e.preventDefault(); hideDrop(); const fs = [...(e.dataTransfer?.files || [])];
+  // folders must be read from the items during the drop event itself
+  const entries = [...(e.dataTransfer?.items || [])].map(it => it.webkitGetAsEntry?.()).filter(Boolean);
+  const dir = entries.find(en => en.isDirectory);
+  if (dir) { readDropped(entries).then(list => openFolder(list, dir.name)).catch(() => toast("Couldn't read that folder.", 'bad')); return; }
+  const proj = fs.find(f => /\.zip$/i.test(f.name)); if (proj) { openProjectFile(proj); return; }
+  const pics = fs.filter(f => /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name));
+  (async () => { for (const f of pics) await addRefImage(f); })();
+  const rest = fs.filter(f => !pics.includes(f)); if (rest.length) importFiles(rest); });
+['drop', 'dragend'].forEach(t => window.addEventListener(t, hideDrop));
+window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });   // stop the browser opening a missed drop as a file
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.querySelector('.mtop[aria-expanded="true"]')) { e.preventDefault(); closeMenus(); return; }
+  if (loading.on) { if (e.key === 'Escape' && loading.stop) { e.preventDefault(); loading.stop(); } return; }     // nothing else while it works
+  if (e.key === 'Escape' && closeDialogs()) { e.preventDefault(); return; }
+  if (!$('linkask').hidden) {            // the "bring the group?" question is up: its buttons take Enter, Esc dismisses it
+    if (e.key === 'Escape') { e.preventDefault(); closeLinkAsk(null); return; }
+    if (e.key === 'Enter' || $('linkask').contains(e.target)) return;
+  }
+  if (e.target.matches('input, select, textarea')) return;
+  const k = e.key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+  if ((e.ctrlKey || e.metaKey) && k === 'y') { e.preventDefault(); redo(); return; }
+  const ctrl = e.ctrlKey || e.metaKey;
+  if (ctrl && k === 'a' && !e.shiftKey) { e.preventDefault(); selectAll(); return; }
+  if (ctrl && k === 'i') { e.preventDefault(); invertSelection(); return; }
+  if (ctrl && k === 'm' && !e.shiftKey) { e.preventDefault(); openMarr('mirror'); return; }
+  if (ctrl && k === 'p' && !e.shiftKey) { e.preventDefault(); parentToActive(); return; }
+  if (ctrl && e.code === 'Space') { e.preventDefault(); toggleMaxView(); return; }
+  // number pad views, as in Blender: 1 front, 3 right, 7 top (Ctrl: the opposite side), 9 the other side of where you are,
+  // 2 4 6 8 turn the view in steps, 5 perspective / orthographic, . frame the selection, / local view, + and - zoom
+  if (e.code === 'Numpad5') { e.preventDefault(); setOrtho(!camera.isOrthographicCamera); toast(camera.isOrthographicCamera ? 'Orthographic view: no perspective, so things line up with references.' : 'Perspective view.'); return; }
+  const pad = { Numpad1: V(0, -1, 0), Numpad3: V(1, 0, 0), Numpad7: V(0, 0, 1) }[e.code];
+  if (pad) { e.preventDefault(); navCube.goTo(ctrl ? pad.negate() : pad); return; }
+  if (e.code === 'Numpad9') { e.preventDefault(); navCube.goTo(orbit.target.clone().sub(camera.position).normalize()); return; }
+  if (['Numpad2', 'Numpad4', 'Numpad6', 'Numpad8'].includes(e.code)) { e.preventDefault(); stepView(e.code); return; }
+  if (e.code === 'NumpadAdd' || e.code === 'NumpadSubtract') { e.preventDefault(); zoomView(e.code === 'NumpadAdd' ? 1 / 1.2 : 1.2); return; }
+  if (e.code === 'NumpadDecimal') { e.preventDefault(); frameSelected(); return; }
+  if (e.code === 'NumpadDivide') { e.preventDefault(); toggleLocalView(); return; }
+  if (e.altKey && !ctrl) {
+    if (e.code === 'KeyA') { e.preventDefault(); select(null); return; }       // by key, not letter: Alt changes the letter on a Mac
+    if (e.code === 'KeyH') { e.preventDefault(); revealAll(); return; }
+    if (e.code === 'KeyP') { e.preventDefault(); clearParent(); return; }
+    return;
+  }
+  if (ctrl) return;
+  if (e.key === 'F2') { e.preventDefault(); renameSelected(); return; }
+  // tools: Blender's letters where the bench has the same tool, numbers for the snap tools (as they're numbered on the left)
+  const map = { w: 'select', q: 'select', g: 'move', r: 'rotate', p: 'pose', o: 'ORIENT', c: 'paint', m: 'MAGNET', '1': 'BALL', '2': 'PLANE', '3': 'MID', '4': 'THREE', '5': 'MATCH', '6': 'LUCKY' };
+  if (e.key === '?' || e.key === 'F1') { e.preventDefault(); openKeys(); return; }
+  if (e.shiftKey && k === 'a') { e.preventDefault(); openDialog('dlg-shapes'); return; }
+  if (e.shiftKey && k === 'd') { e.preventDefault(); duplicateSelected(); return; }
+  if (e.shiftKey && k === 'h') { e.preventDefault(); hideOthers(); return; }
+  if (e.shiftKey && k === 'c') { e.preventDefault(); frame(sceneBox(liveParts().filter(isVisibleChain))); return; }
+  if (!e.shiftKey && k === 'h') { hideSelected(); return; }
+  if (!e.shiftKey && k === 'a') { selectAll(); return; }
+  if (!e.shiftKey && k === 'i') { $('btn-import').click(); return; }
+  if (!e.shiftKey && k === 'n') { toggleSide(); return; }
+  if (!e.shiftKey && k === 't') { toggleTools(); return; }
+  if ((e.key === '[' || e.key === ']') && tool === 'paint') { const v = Math.max(0.1, Math.min(30, +$('paint-size').value * (e.key === ']' ? 1.15 : 1 / 1.15))); $('paint-size').value = v.toFixed(2); $('paint-size').dispatchEvent(new Event('change')); return; }
+  if (k === 'e' && tool === 'paint') { const c = $('paint-erase'); c.checked = !c.checked; toast(c.checked ? 'Erasing back to bare plastic.' : 'Painting.'); return; }
+  if (k === 'k' && !e.shiftKey) { setFitPinned(!sec.on); toast(sec.on ? 'Section view: move and turn the plane to cut where you want. K turns it off.' : 'Section view off.'); return; }
+  if (k === 'escape' && dirPick) { cancelDirPick(); return; }
+  if (oz && k === 'escape') { endOoze(false); toast('No ooze.'); return; }
+  if (oz && k === 'backspace') { e.preventDefault(); oozeUndo(); return; }
+  if (k === 'escape' && dm) { endCrack(false); toast('Left it as it was.'); return; }
+  if (k === 'escape' && bz) { endBurst(false); toast('Left it as it was.'); return; }
+  if (k === 'escape' && gp) { endGrowPlace(); toast('No growth.'); return; }
+  if ((e.key === '[' || e.key === ']') && selected?.userData.part.grower?.kind === 'ball' && !e.ctrlKey && !e.metaKey) { e.preventDefault(); resizeGrowth(selected, e.key === ']' ? 1.1 : 1 / 1.1); return; }
+  if (k === 'escape' && rp) { endReliefPlace(false); toast('Left the relief where it was.'); return; }
+  if (k === 'escape' && !$('marr').hidden) { if (marr.picking) { marr.picking = false; $('ma-pick').setAttribute('aria-pressed', 'false'); } else closeMarr(); return; }
+  if (k === 'enter' && !$('marr').hidden && !e.target.closest?.('#marr')) { applyMarr(); return; }
+  if (map[k]) { setTool(map[k]); return; }
+  if (k === 'escape' && connSel) { selectConn(null); return; }
+  if (k === 'escape' && benchSel) { select(null); syncGizmo(); renderPartPanel(); return; }
+  if (k === 'escape' && magPending) { magPending = null; rebuildMagnets(); updateStep(); toast('Cancelled that magnet.'); return; }
+  if (k === 'escape') { if (!$('orient').hidden) { closeOrient(); return; } if (picks.length) cancelPick(); else if (tool === 'select' && selection.length) select(null); else setTool('select'); return; }
+  if (k === 'enter' && !$('adjust').hidden && lastOp && !picks.length) { e.preventDefault(); acceptSnap(); return; }
+  if (k === 'enter' && tool === 'MATCH' && picks.length) { e.preventDefault(); applyMatch(); return; }
+  if (k === 'enter' && tool === 'LUCKY' && !luckyFirst && selection.length === 2) { e.preventDefault(); feelLucky(selection[0], selection[1]); return; }
+  if (k === 'escape' && luckyFirst) { luckyFirst = null; updateStep(); toast('Cancelled.'); return; }
+  if (k === 'backspace' && picks.length) { e.preventDefault(); picks.pop(); rebuildPickFx(); updateStep(); return; }
+  if ((k === 'delete' || k === 'x') && benchSel) {
+    if (benchSel.kind === 'section') { setFitPinned(false); return; }
+    if (benchSel.kind === 'ref') removeRef(benchSel.k);
+    else if (benchSel.kind === 'sprue') removeSprue(benchSel.k);
+    else putAway(benchSel.kind === 'book' ? 'book' : 'box');
+    return;
+  }
+  if (k === 'delete' || k === 'x') { deleteSelected(); return; }
+  if (k === 'f' || k === '.') { frameSelected(); return; }
+  if (k === 'home') { frame(benchBox()); return; }
+});
+function frameSelected() { frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox(liveParts().filter(isVisibleChain))); }
+function selectAll() { selectMany(liveParts().filter(isVisibleChain)); toast(`Selected all ${selection.length} parts.`); }
+function invertSelection() { const had = new Set(selection.length ? selection : selected ? [selected] : []); const list = liveParts().filter(m => isVisibleChain(m) && !had.has(m)); if (list.length) selectMany(list); else select(null); }
+/** Turn the view a step round the target, like Blender's number pad 2 4 6 8. */
+function stepView(code) {
+  const a = THREE.MathUtils.degToRad(15), off = camera.position.clone().sub(orbit.target);
+  if (code === 'Numpad4' || code === 'Numpad6') off.applyAxisAngle(V(0, 0, 1), code === 'Numpad4' ? -a : a);
+  else { const right = V().crossVectors(off, camera.up).normalize(), t = off.clone().applyAxisAngle(right, code === 'Numpad8' ? a : -a); if (Math.abs(t.clone().normalize().z) < 0.995) off.copy(t); }
+  camera.position.copy(orbit.target).add(off); camera.lookAt(orbit.target); orbit.update(); markViewMoved();
+}
+function zoomView(f) {
+  if (camera.isOrthographicCamera) { camera.zoom /= f; camera.updateProjectionMatrix(); }
+  else camera.position.copy(orbit.target).add(camera.position.clone().sub(orbit.target).multiplyScalar(f));
+  orbit.update(); markViewMoved();
+}
+/** H, Shift+H, Alt+H: hide what's selected, hide everything else, show it all again (alternates that are switched off stay off). */
+function partsShown(list, on) { list.forEach(m => { m.visible = on; }); renderOutliner(); renderPartPanel(); markDirty(); if (sprues) rebuildSprues(); }
+function hideSelected() {
+  const list = selection.length ? [...selection] : selected ? [selected] : []; if (!list.length) return;
+  select(null); partsShown(list, false); toast(`Hid ${list.length === 1 ? list[0].name : list.length + ' parts'}. Alt+H shows everything again.`);
+}
+function hideOthers() {
+  const keep = new Set((selection.length ? selectionRoots() : selected ? [selected] : []).flatMap(r => [...subtreeParts(r), ...ancestorsOf(r)])); if (!keep.size) return;
+  const list = liveParts().filter(m => m.visible && !keep.has(m) && !m.userData.optOff); partsShown(list, false); toast(`Hid ${list.length} other part${list.length === 1 ? '' : 's'}. Alt+H shows everything again.`);
+}
+function ancestorsOf(m) { const out = []; for (let p = parentPart(m); p; p = parentPart(p)) out.push(p); return out; }
+function revealAll() {
+  localView = null; const list = liveParts().filter(m => !m.visible && !m.userData.optOff); if (!list.length) return;
+  partsShown(list, true); selectMany(list); toast(`Showing ${list.length} hidden part${list.length === 1 ? '' : 's'}.`);
+}
+/** Number pad /: just the selection, framed; again to go back. */
+let localView = null;
+function toggleLocalView() {
+  if (localView) { const { hid, cam, target } = localView; localView = null; partsShown(hid.filter(m => m.parent), true); camera.position.copy(cam); orbit.target.copy(target); orbit.update(); markViewMoved(); toast('Back to everything.'); return; }
+  const keep = new Set((selection.length ? selectionRoots() : selected ? [selected] : []).flatMap(r => [...subtreeParts(r), ...ancestorsOf(r)])); if (!keep.size) { toast('Select a part first.'); return; }
+  const hid = liveParts().filter(m => m.visible && !keep.has(m)); localView = { hid, cam: camera.position.clone(), target: orbit.target.clone() };
+  partsShown(hid, false); frameSelected(); toast('Local view: just the selection. Numpad / again to go back.');
+}
+/** Shift+D: copies of the selection (and what hangs off it), in the same place, attached where the originals are, ready to move. */
+function duplicateSelected() {
+  const roots = selection.length ? selectionRoots() : selected ? [selected] : []; if (!roots.length) return;
+  pushUndo(); lastOp = null; scene.updateMatrixWorld(true); const made = [], I = new THREE.Matrix4();
+  for (const r of roots) { const info = linkInfo(r), c = cloneTree(r, nextName); world.add(c); setWorld(c, r.matrixWorld.clone()); if (info.par) attachLike(c, r, I, info); made.push(c); }
+  afterHierarchyChange(); selectMany(made); setTool('move');
+  toast(`Duplicated ${made.length === 1 ? `as ${made[0].name}` : made.length + ' parts'}: drag the arrows to move ${made.length === 1 ? 'it' : 'them'}.`, 'ok');
+}
+/** Ctrl+P: the others follow the active part, fixed. Alt+P: let go of what they hang off, staying where they are. */
+function parentToActive() {
+  const others = selection.filter(m => m !== selected); if (!selected || !others.length) { toast('Select the parts, then the one they attach to last.'); return; }
+  pushUndo(); let n = 0; for (const m of others) if (!isDescendant(selected, m) && parentPart(m) !== selected) { attach(m, selected, 'plain'); n++; }
+  afterHierarchyChange(); toast(n ? `Attached ${n} part${n > 1 ? 's' : ''} to ${selected.name}.` : 'Nothing to attach.', n ? 'ok' : '');
+}
+function clearParent() {
+  const list = (selection.length ? selection : selected ? [selected] : []).filter(m => parentPart(m)); if (!list.length) return;
+  pushUndo(); list.forEach(m => detach(m)); afterHierarchyChange(); toast(`Detached ${list.length === 1 ? list[0].name : list.length + ' parts'}.`);
+}
+function renameSelected() {
+  if (!selected) return; showDockTab('tab-props'); const n = $('part-name'); if (n) { n.focus(); n.select(); }
+}
+/** N and T, as in Blender: the side panel and the toolbar. Ctrl+Space: the view on its own. */
+function toggleSide() { document.querySelector('.app').classList.toggle('no-side'); }
+function toggleTools() { document.querySelector('.app').classList.toggle('no-tools'); }
+function toggleMaxView() { const a = document.querySelector('.app'), on = !(a.classList.contains('no-side') && a.classList.contains('no-tools')); a.classList.toggle('no-side', on); a.classList.toggle('no-tools', on); }
+function rebuildPickFx() {
+  clearFx();
+  picks.forEach((q, i) => { const side = (q.side ? q.side === 'move' : i < PER_SIDE[tool]) ? '#4db4dc' : '#e2804f'; if (q.region) showRegion(q.mesh, q.region, side); showMarker(q.point, '#ffe066', tool === 'THREE' ? .8 : 1.2); });
+}
+
+// ---------------------------------------------------------------------------
+// Projects: autosave to this browser (IndexedDB) and project files (.zip)
+// ---------------------------------------------------------------------------
+const SETTING_IDS = ['lucky-effort', 'set-smooth', 'set-balltol', 'set-radius', 'set-flat', 'set-joints', 'set-qty', 'set-mirror', 'set-mirror-axis', 'set-orbitsel', 'set-plastic', 'ar-tol', 'set-crease', 'exp-fill', 'exp-merge', 'exp-loose', 'exp-gap', 'exp-overlap', 'exp-pockets', 'exp-pocket-res', 'exp-pocket-drain', 'exp-glue', 'exp-glue-ooze', 'exp-glue-relief', 'exp-glue-scatter', 'exp-glue-fit', 'exp-glue-gap', 'exp-rebuild', 'exp-rebuild-detail'];
+const project = { id: THREE.MathUtils.generateUUID(), name: 'Untitled kit', dirty: false, timer: 0, saving: false, loading: false, saved: new Set() };
+let idb = null;
+const idbReady = new Promise(res => {
+  try {
+    const r = indexedDB.open('kitbash-bench', 1);
+    r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('projects', { keyPath: 'id' }); d.createObjectStore('geoms'); };
+    r.onsuccess = () => { idb = r.result; res(idb); };
+    r.onerror = r.onblocked = () => res(null);
+  } catch (e) { res(null); }
+});
+try { navigator.storage?.persist?.(); } catch (e) {}       // ask the browser not to clear it under storage pressure
+const idbReq = (store, mode, fn) => new Promise((res, rej) => {
+  const tx = idb.transaction(store, mode), st = tx.objectStore(store), r = fn(st);
+  tx.oncomplete = () => res(r && 'result' in r ? r.result : undefined);
+  tx.onerror = tx.onabort = () => rej(tx.error || new Error('storage error'));
+});
+function setProjStatus(text, kind = '') { const el = $('proj-status'); el.textContent = text; el.className = 'proj-status ' + kind; }
+
+/** Everything needed to rebuild the bench: parts, joints, hierarchy, pose, settings, camera. */
+function serializeProject() {
+  scene.updateMatrixWorld(true);
+  const parentId = o => (o.parent === world ? null : o.parent.uuid);
+  const tr = o => ({ pos: o.position.toArray(), quat: o.quaternion.toArray(), scale: o.scale.toArray() });
+  return {
+    format: 'kitbash-bench', version: 1, id: project.id, name: project.name, updated: Date.now(),
+    parts: liveParts().map(m => ({ id: m.uuid, name: m.name, color: m.userData.part.color, visible: m.visible, fill: m.userData.part.fill || null, paint: !!m.userData.part.paint,
+      geom: storedKey(m), tris: m.userData.part.tris, parent: parentId(m), ...tr(m),
+      mods: m.userData.part.mods?.length ? JSON.parse(JSON.stringify(m.userData.part.mods, (k, v) => k === 'err' ? undefined : v)) : undefined,
+      owner: m.userData.part.owner || undefined, ooze: m.userData.part.ooze || undefined, grower: m.userData.part.grower || undefined, prim: m.userData.part.prim || undefined, axes: m.userData.part.axes || undefined, pivot: m.userData.part.pivot || undefined, noGrow: m.userData.part.noGrow || undefined, relief: m.userData.part.relief ? encodeRelief(m.userData.part.relief) || undefined : undefined })),
+    joints: joints.filter(j => j.parent).map(j => { const jd = j.userData.joint; return { id: j.uuid, parent: parentId(j), size: jd.size, rest: jd.rest.toArray(),
+      type: jd.type || 'pinned', restPos: jd.restPos.toArray(), min: jd.min, max: jd.max, axis: jd.axis || null, axisName: jd.axisName || '', pointOff: jd.pointOff || null, partOff: jd.partOff || null, ...tr(j) }; }),
+    links: JSON.parse(JSON.stringify(links)),
+    refs: JSON.parse(JSON.stringify(refs)),
+    settings: Object.fromEntries(SETTING_IDS.map(id => [id, $(id).type === 'checkbox' ? $(id).checked : $(id).value])),
+    camera: { pos: camera.position.toArray(), target: orbit.target.toArray(), ortho: camera.isOrthographicCamera, zoom: camera.zoom },
+    options: JSON.parse(JSON.stringify(options)),
+    sprues: sprues ? JSON.parse(JSON.stringify(sprues)) : null,
+    kit: kit ? JSON.parse(JSON.stringify(kit)) : null,
+    magnets: JSON.parse(JSON.stringify(magnets)),
+  };
+}
+function geomBuffers(m) {
+  const g = storedGeom(m).geometry;                      // a part with modifiers: its mesh as it came in (the stack is worked out again on opening)
+  return { pos: g.attributes.position.array.slice().buffer, idx: Uint32Array.from(g.index.array).buffer };
+}
+function geomFrom(rec) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(rec.pos), 3));
+  g.setIndex(new THREE.Uint32BufferAttribute(new Uint32Array(rec.idx), 1));
+  return g;
+}
+
+/** Replace the bench with a saved project. `geoms` maps geometry key -> {pos, idx} buffers. */
+function buildProject(data, geoms, paints = new Map()) {
+  project.loading = true;
+  closeAutorig(); if (!$('orient').hidden) closeOrient();
+  cancelPick(); select(null); tc.detach();
+  [...parts, ...joints].forEach(o => o.parent && o.parent.remove(o));
+  parts.length = 0; joints.length = 0; undoStack.length = 0; redoStack.length = 0; lastOp = null;
+  for (const [id, v] of Object.entries(data.settings || {})) { const el = $(id); if (!el) continue; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; }
+  $('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider); $('exp-fill-f').hidden = !$('exp-fill').checked; $('exp-pockets-f').hidden = !$('exp-pockets').checked; $('exp-glue-f').hidden = !$('exp-glue').checked; $('exp-merge-f').hidden = $('exp-merge-note').hidden = !$('exp-merge').checked;
+  const byId = new Map(), missing = [], shared = new Map();
+  for (const p of data.parts) {
+    const rec = geoms.get(p.geom); if (!rec) { missing.push(p.name); continue; }
+    const g = shared.get(p.geom) || geomFrom(rec); shared.set(p.geom, g);
+    const m = addPart(p.name, g, { welded: true, color: p.color, id: p.id, geomKey: p.geom });
+    m.visible = p.visible !== false; byId.set(p.id, m);
+    const pt = m.userData.part, pb = paints.get(p.id); pt.fill = p.fill || null;
+    if (p.mods?.length) { pt.base = { geometry: g, geomKey: p.geom }; pt.mods = JSON.parse(JSON.stringify(p.mods)); }
+    if (p.owner) pt.owner = p.owner;
+    if (p.ooze) pt.ooze = p.ooze;
+    if (p.prim) pt.prim = p.prim;
+    if (p.axes) pt.axes = p.axes; if (p.pivot) pt.pivot = p.pivot;
+    if (p.grower) { pt.grower = p.grower; styleDraft(m, !!p.grower.draft); } if (p.noGrow) pt.noGrow = p.noGrow;
+    if (p.relief) pt.relief = decodeRelief(p.relief);
+    if (pb && pb.byteLength === g.attributes.position.count * 4) { pt.paint = new Uint8Array(pb.slice(0)); pt.paintVer = pt.paintSaved = 1; }
+    refreshPaint(m);
+  }
+  for (const j of data.joints || []) { const o = makeJoint(j.size || 0.5); o.uuid = j.id; const jd = o.userData.joint; jd.rest.fromArray(j.rest);
+    Object.assign(jd, { type: j.type || 'pinned', min: j.min ?? null, max: j.max ?? null, axis: j.axis || null, axisName: j.axisName || '', pointOff: j.pointOff || null, partOff: j.partOff || null }); jd.restPos.fromArray(j.restPos || j.pos); byId.set(j.id, o); }
+  const place = (o, rec) => { (rec.parent && byId.get(rec.parent) || world).add(o); o.position.fromArray(rec.pos); o.quaternion.fromArray(rec.quat); o.scale.fromArray(rec.scale); };
+  for (const j of data.joints || []) place(byId.get(j.id), j);
+  for (const p of data.parts) if (byId.has(p.id)) place(byId.get(p.id), p);
+  colorIx = parts.length;
+  options = data.options ? JSON.parse(JSON.stringify(data.options)) : { slots: [], sets: [] }; applyOptions();
+  sprues = data.sprues ? JSON.parse(JSON.stringify(data.sprues)) : null;
+  magnets = Array.isArray(data.magnets) ? JSON.parse(JSON.stringify(data.magnets)) : [];
+  links = Array.isArray(data.links) ? JSON.parse(JSON.stringify(data.links)) : [];
+  refs = Array.isArray(data.refs) ? JSON.parse(JSON.stringify(data.refs)) : []; rebuildRefs();
+  kit = data.kit ? JSON.parse(JSON.stringify(data.kit)) : null; book.doc = null; buildKit().then(() => fitMat(true));
+  applyPlastic();
+  project.id = data.id; project.name = data.name || 'Untitled kit'; $('proj-name').value = project.name;
+  project.saved = new Set(data.parts.map(p => p.geom));
+  if (data.camera) { setOrtho(false); camera.position.fromArray(data.camera.pos); orbit.target.fromArray(data.camera.target); orbit.update();
+    if (data.camera.ortho) { setOrtho(true); if (data.camera.zoom) { camera.zoom = data.camera.zoom; camera.updateProjectionMatrix(); } } }
+  afterHierarchyChange(); updateButtons();
+  project.loading = false; project.dirty = false; project.pristine = false;
+  if (missing.length) toast(`Couldn't find the mesh for ${missing.join(', ')}.`, 'bad');
+  for (const m of liveParts()) if (m.userData.part.mods?.length) evalStack(m);          // modifiers: worked out again in the background
+}
+
+function markDirty() {
+  if (project.loading) return;
+  project.pristine = false;
+  project.dirty = true; project.ver = (project.ver || 0) + 1; setProjStatus('unsaved', 'busy');
+  clearTimeout(project.timer); project.timer = setTimeout(saveToBrowser, 1200);
+}
+async function saveToBrowser() {
+  // a save already running: wait for it, then save whatever changed while it ran (switching projects relies on this)
+  if (project.saving) { await project.saving; if (project.dirty) return saveToBrowser(); return; }
+  if (!(await idbReady)) { setProjStatus('not saved', 'bad'); $('proj-note').textContent = "This browser isn't letting the page store data (a private window, or site data blocked). Use Save project file to keep your work."; return; }
+  let finished; project.saving = new Promise(r => { finished = r; }); setProjStatus('saving…', 'busy');
+  const ver = project.ver || 0;
+  try {
+    const data = serializeProject();
+    for (const m of liveParts()) {                         // meshes never change after import, so each is stored once
+      const k = storedKey(m); if (project.saved.has(k)) continue;
+      await idbReq('geoms', 'readwrite', st => st.put(geomBuffers(m), k)); project.saved.add(k);
+    }
+    for (const m of liveParts()) {                         // brushed paint, saved again only after it changes
+      const pt = m.userData.part; if (!pt.paint || pt.paintSaved === pt.paintVer) continue;
+      await idbReq('geoms', 'readwrite', st => st.put(pt.paint.slice().buffer, 'paint:' + m.uuid)); pt.paintSaved = pt.paintVer;
+    }
+    for (const k of [kit?.image, kit?.pdf, ...refs.map(r => r.asset)].filter(Boolean)) {   // box art, instructions and reference pictures, stored once like meshes
+      if (project.saved.has(k) || !assets.has(k)) continue;
+      await idbReq('geoms', 'readwrite', st => st.put(assets.get(k), k)); project.saved.add(k);
+    }
+    await idbReq('projects', 'readwrite', st => st.put(data));
+    if ((project.ver || 0) === ver) project.dirty = false;            // changed while saving: the timer saves again
+    else { clearTimeout(project.timer); project.timer = setTimeout(saveToBrowser, 400); }
+    if (!project.dirty) setProjStatus(`saved ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`, 'ok');
+    try { localStorage.setItem('kitbash-last', project.id); } catch (e) {}
+    if (!$('dlg-projects').hidden) renderProjectList();
+  } catch (e) {
+    setProjStatus('not saved', 'bad');
+    $('proj-note').textContent = /quota/i.test(e?.name || e?.message || '') ? "Browser storage is full. Delete old saved projects, or use Save project file." : `Couldn't save in this browser (${e?.message || 'storage error'}). Use Save project file to keep your work.`;
+  } finally { project.saving = null; finished(); }
+}
+async function listProjects() {
+  if (!(await idbReady)) return [];
+  try { return (await idbReq('projects', 'readonly', st => st.getAll())).sort((a, b) => b.updated - a.updated); } catch (e) { return []; }
+}
+async function openSaved(id) {
+  if (project.dirty) await saveToBrowser();
+  try {
+    const data = await idbReq('projects', 'readonly', st => st.get(id)); if (!data) throw new Error('not found');
+    const geoms = new Map();
+    for (const k of new Set(data.parts.map(p => p.geom))) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) geoms.set(k, rec); }
+    for (const k of [data.kit?.image, data.kit?.pdf, ...(data.refs || []).map(r => r.asset)].filter(Boolean)) { const rec = await idbReq('geoms', 'readonly', st => st.get(k)); if (rec) assets.set(k, rec); }
+    const paints = new Map();
+    for (const p of data.parts) if (p.paint) { const rec = await idbReq('geoms', 'readonly', st => st.get('paint:' + p.id)); if (rec) paints.set(p.id, rec); }
+    buildProject(data, geoms, paints); frame(sceneBox());
+    setProjStatus('saved', 'ok'); toast(`Opened ${data.name}.`, 'ok');
+    try { localStorage.setItem('kitbash-last', id); } catch (e) {}
+    return true;
+  } catch (e) { toast(`Couldn't open that project (${e.message}).`, 'bad'); return false; }
+}
+async function deleteSaved(id) {
+  try {
+    const all = await listProjects(), gone = all.find(p => p.id === id); if (!gone) return;
+    const keep = new Set(all.filter(p => p.id !== id).flatMap(p => p.parts.map(q => q.geom)));
+    if (id === project.id) liveParts().forEach(m => keep.add(storedKey(m)));
+    await idbReq('projects', 'readwrite', st => st.delete(id));
+    for (const k of new Set(gone.parts.map(q => q.geom))) if (!keep.has(k)) await idbReq('geoms', 'readwrite', st => st.delete(k));
+    for (const q of gone.parts) if (q.paint && id !== project.id) await idbReq('geoms', 'readwrite', st => st.delete('paint:' + q.id));
+    if (id === project.id) project.saved.clear();
+    toast(`Deleted ${gone.name} from this browser.`);
+  } catch (e) { toast(`Couldn't delete it (${e.message}).`, 'bad'); }
+  renderProjectList();
+}
+async function renderProjectList() {
+  const box = $('proj-list'), all = await listProjects();
+  box.innerHTML = '';
+  if (!all.length) { box.innerHTML = '<div class="empty">Nothing saved in this browser yet. Your work saves here as soon as you change something.</div>'; return; }
+  for (const p of all) {
+    const row = document.createElement('div'); row.className = 'proj-row'; if (p.id === project.id) row.setAttribute('aria-current', 'true');
+    const n = document.createElement('div'); n.className = 'pn'; n.textContent = p.name;
+    const m = document.createElement('div'); m.className = 'pm';
+    m.textContent = `${p.parts.length} parts · ${new Date(p.updated).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+    const a = document.createElement('div'); a.className = 'pa';
+    const b = (txt, fn, cls = '') => { const x = document.createElement('button'); x.type = 'button'; x.className = 'btn ' + cls; x.textContent = txt; x.addEventListener('click', fn); a.append(x); return x; };
+    if (p.id !== project.id) b('Open', () => openSaved(p.id)); else { const t = document.createElement('span'); t.className = 'pm'; t.textContent = 'open now'; a.append(t); }
+    const del = b('Delete', () => {                         // two-step: the viewer has no confirm dialog
+      if (del.dataset.armed) return deleteSaved(p.id);
+      del.dataset.armed = '1'; del.textContent = 'Really delete?'; del.classList.add('danger');
+      setTimeout(() => { if (del.isConnected) { delete del.dataset.armed; del.textContent = 'Delete'; del.classList.remove('danger'); } }, 3500);
+    });
+    row.append(n, m, a); box.append(row);
+  }
+}
+async function newProject(name = 'Untitled kit', quiet = false) {
+  if (project.dirty) await saveToBrowser();
+  closeAutorig();
+  buildProject({ id: THREE.MathUtils.generateUUID(), name, parts: [], joints: [], settings: null }, new Map());
+  project.saved.clear(); project.pristine = false; setProjStatus('empty');
+  if (!quiet) toast('New project. Import STL files or open a folder to start.');
+}
+
+// project file: scene.json plus one binary per mesh, zipped
+async function saveProjectFile() {
+  if (!liveParts().length) { toast('Nothing to save yet.'); return; }
+  const data = serializeProject(), files = [{ name: 'scene.json', data: JSON.stringify(data, null, 1) }];
+  const seen = new Set();
+  for (const m of liveParts()) { const k = storedKey(m); if (seen.has(k)) continue; seen.add(k);
+    const { pos, idx } = geomBuffers(m), head = new Uint32Array([pos.byteLength, idx.byteLength]);
+    files.push({ name: `meshes/${k}.bin`, data: new Blob([head, pos, idx]) }); }
+  for (const k of [kit?.image, kit?.pdf, ...refs.map(r => r.asset)].filter(Boolean)) { const a = assets.get(k); if (a) files.push({ name: `assets/${k.slice(6)}`, data: new Blob([a.data]) }); }
+  for (const m of liveParts()) if (m.userData.part.paint) files.push({ name: `paint/${m.uuid}.bin`, data: new Blob([m.userData.part.paint]) });
+  await deliver(files, `${safe(project.name)}.kitbash.zip`);
+}
+async function openProjectFile(file) {
+  if (typeof JSZip === 'undefined') { toast("The zip library didn't load. Check your connection and reload.", 'bad'); return; }
+  try {
+    const zip = await JSZip.loadAsync(file), sceneFile = zip.file('scene.json');
+    if (!sceneFile) throw new Error("it isn't a Kitbash Bench project file");
+    const data = JSON.parse(await sceneFile.async('string'));
+    if (data.format !== 'kitbash-bench') throw new Error("it isn't a Kitbash Bench project file");
+    const geoms = new Map();
+    for (const k of new Set(data.parts.map(p => p.geom))) {
+      const f = zip.file(`meshes/${k}.bin`); if (!f) continue;
+      const buf = await f.async('arraybuffer'), [pl, il] = new Uint32Array(buf, 0, 2);
+      geoms.set(k, { pos: buf.slice(8, 8 + pl), idx: buf.slice(8 + pl, 8 + pl + il) });
+    }
+    for (const [k, type, name] of [[data.kit?.image, 'image', data.kit?.artName], [data.kit?.pdf, 'application/pdf', data.kit?.pdfName], ...(data.refs || []).map(r => [r.asset, 'image', r.name + '.png'])]) {
+      const f = k && zip.file(`assets/${k.slice(6)}`); if (!f) continue;
+      const nm = name || ''; const t = type === 'image' ? (/\.png$/i.test(nm) ? 'image/png' : /\.webp$/i.test(nm) ? 'image/webp' : /\.gif$/i.test(nm) ? 'image/gif' : 'image/jpeg') : type;
+      assets.set(k, { type: t, name: nm, data: await f.async('arraybuffer') });
+    }
+    if (project.dirty) await saveToBrowser();
+    const existing = (await listProjects()).some(p => p.id === data.id);
+    if (existing && data.id !== project.id) data.id = THREE.MathUtils.generateUUID();   // never overwrite a different saved copy
+    const paints = new Map();
+    for (const p of data.parts) { const f = p.paint && zip.file(`paint/${p.id}.bin`); if (f) paints.set(p.id, await f.async('arraybuffer')); }
+    buildProject(data, geoms, paints); project.saved.clear(); liveParts().forEach(m => { m.userData.part.paintSaved = 0; }); frame(sceneBox());
+    toast(`Opened ${data.name} from file.`, 'ok'); markDirty();
+  } catch (e) { toast(`Couldn't open ${file.name}: ${e.message}.`, 'bad'); }
+}
+
+
+// ---------------------------------------------------------------------------
+// Window chrome: menus, the tabbed dock, dialogs, mirrored settings
+// ---------------------------------------------------------------------------
+function openDialog(id) {
+  const d = $(id); document.querySelectorAll('.dlg').forEach(x => { if (x !== d) x.hidden = true; });
+  if (id === 'dlg-export') { try { syncGlueNote(); } catch (e) {} if (d.hidden) { expPick.what = selected || selection.length ? 'sel' : 'all'; } syncExportPick(); }
+  d.hidden = false; (d.querySelector('.content button, .content input, .content select') || d.querySelector('.dlg-x')).focus({ preventScroll: true });
+}
+function closeDialogs() { let any = false; document.querySelectorAll('.dlg').forEach(d => { if (!d.hidden) { d.hidden = true; any = true; } }); return any; }
+function showDockTab(tabId) {
+  const tab = $(tabId), group = tab.closest('.dgroup'); group.classList.remove('folded'); group.querySelector('.dfold').setAttribute('aria-expanded', 'true');
+  group.querySelectorAll('.dtab').forEach(t => { const on = t === tab; t.setAttribute('aria-selected', String(on)); t.tabIndex = on ? 0 : -1; $(t.getAttribute('aria-controls')).hidden = !on; });
+}
+function closeMenus() { document.querySelectorAll('.menu .mlist').forEach(l => { l.hidden = true; l.previousElementSibling.setAttribute('aria-expanded', 'false'); }); }
+/** Grey out what can't be done right now, tick the toggles. */
+function refreshMenus() {
+  const any = liveParts().length > 0;
+  $('menu-undo').disabled = !undoStack.length; $('menu-redo').disabled = !redoStack.length;
+  $('menu-selall').disabled = !any; $('menu-selnone').disabled = !selection.length && !selected; $('menu-delete').disabled = !selected && !benchSel;
+  $('btn-arrange').disabled = $('btn-sprue').disabled = $('btn-autorig').disabled = !any; $('menu-unsprue').disabled = !sprues; $('menu-unbox').disabled = kit?.state !== 'sealed';
+  $('menu-slot').disabled = selection.length < 2; $('menu-mirror').disabled = $('menu-array').disabled = !selection.length && !selected; $('menu-pockets').disabled = !liveParts().length; $('menu-nomagnets').disabled = !magnets.length; $('menu-clearpaint').disabled = !liveParts().some(m => m.userData.part.paint || m.userData.part.fill); $('menu-export').disabled = !any; $('menu-frame').disabled = !any;
+  $('menu-joints').setAttribute('aria-checked', String($('set-joints').checked));
+  $('menu-seams').setAttribute('aria-checked', $('exp-preview').getAttribute('aria-pressed')); $('menu-seams').disabled = liveParts().length < 2;
+}
+function openMenu(top) {
+  closeMenus(); refreshMenus();
+  const list = top.nextElementSibling; list.hidden = false; top.setAttribute('aria-expanded', 'true');
+  return list;
+}
+function bindChrome() {
+  // menus: click to open, hover to switch while one is open, arrows to move, Esc to close
+  document.querySelectorAll('.menu .mtop').forEach(top => {
+    top.addEventListener('click', e => { e.stopPropagation();
+      if (top.getAttribute('aria-expanded') === 'true' && performance.now() - (top._hoverOpened || 0) > 400) closeMenus(); else openMenu(top); });
+    top.addEventListener('mouseenter', () => { if (document.querySelector('.mtop[aria-expanded="true"]') && top.getAttribute('aria-expanded') !== 'true') { openMenu(top); top._hoverOpened = performance.now(); } });
+    top.addEventListener('keydown', e => { if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openMenu(top).querySelector('.mi:not(:disabled)')?.focus(); } });
+  });
+  document.querySelectorAll('.mlist').forEach(list => {
+    list.addEventListener('click', e => { if (e.target.closest('.mi')) closeMenus(); });
+    list.addEventListener('keydown', e => {
+      const items = [...list.querySelectorAll('.mi:not(:disabled):not([hidden])')], i = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length]?.focus(); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); const t = list.previousElementSibling; closeMenus(); t.focus(); }
+      else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); const tops = [...document.querySelectorAll('.mtop')], k = tops.indexOf(list.previousElementSibling);
+        const nt = tops[(k + (e.key === 'ArrowRight' ? 1 : -1) + tops.length) % tops.length]; openMenu(nt).querySelector('.mi:not(:disabled)')?.focus(); }
+    });
+  });
+  document.addEventListener('pointerdown', e => { if (!e.target.closest('.menu')) closeMenus(); });
+  // menu commands that aren't existing buttons
+  const on = (id, fn) => $(id).addEventListener('click', fn);
+  on('menu-export', () => openDialog('dlg-export'));
+  on('menu-prefs', () => openDialog('dlg-prefs'));
+  on('menu-clearpaint', () => { const n = clearPaint(liveParts()); toast(n ? `Cleared the paint on ${n} part${n > 1 ? 's' : ''}. Undo brings it back.` : 'Nothing is painted.'); });
+  on('menu-undo', undo); on('menu-redo', redo);
+  on('menu-selall', () => { selectMany(liveParts().filter(isVisibleChain)); });
+  on('menu-selnone', () => { select(null); syncGizmo(); renderPartPanel(); });
+  on('menu-delete', () => {
+    if (!benchSel) { deleteSelected(); return; }
+    if (benchSel.kind === 'section') { setFitPinned(false); return; }
+    if (benchSel.kind === 'sprue') removeSprue(benchSel.k);
+    else putAway(benchSel.kind === 'book' ? 'book' : 'box');
+  });
+  on('menu-unsprue', () => $('exp-sprue-clear').click());
+  on('menu-unbox', openBox);
+  on('menu-nomagnets', () => { if (!magnets.length) return; pushUndo(); const n = magnets.length; magnets = []; afterHierarchyChange(); toast(`Removed ${n} magnet${n > 1 ? 's' : ''}. Undo brings them back.`); });
+  on('menu-pockets', () => { openDialog('dlg-export'); if (!$('exp-pockets').checked) { $('exp-pockets').checked = true; $('exp-pockets').dispatchEvent(new Event('change')); } showPocketPreview(); });
+  on('menu-slot', () => { showDockTab('tab-opts'); $('opt-new').click(); });
+  on('menu-home', () => $('nav-home').click());
+  on('menu-front', () => navCube.goTo(V(0, -1, 0))); on('menu-right', () => navCube.goTo(V(1, 0, 0))); on('menu-top', () => navCube.goTo(V(0, 0, 1)));
+  on('menu-frame', () => frame(selection.length ? sceneBox([...new Set(selectionRoots().flatMap(subtreeParts))]) : sceneBox()));
+  on('menu-ortho', () => setOrtho(!camera.isOrthographicCamera));
+  on('menu-fit', () => setFitPinned(!sec.on));
+  $('fit-close').addEventListener('click', e => { e.stopPropagation(); setFitPinned(false); });
+  on('menu-scatter', () => startScatter());
+  on('menu-crack', () => startCrack());
+  on('menu-burst', () => startBurst());
+  on('menu-grow', () => startGrowth());
+  on('menu-split', () => startSplit());
+  on('menu-clean', () => startClean());
+  on('menu-ooze', () => startOoze());
+  on('menu-mirror', () => openMarr('mirror')); on('menu-array', () => openMarr('linear'));
+  on('menu-addref', () => $('ref-input').click());
+  on('menu-relief', () => openRelief());
+  $('ref-input').addEventListener('change', async () => { for (const f of [...$('ref-input').files]) await addRefImage(f); $('ref-input').value = ''; });
+  on('menu-joints', () => { const c = $('set-joints'); c.checked = !c.checked; c.dispatchEvent(new Event('change', { bubbles: true })); });
+  on('menu-seams', () => $('exp-preview').click());
+  // dialogs
+  document.querySelectorAll('.dlg-x').forEach(x => x.addEventListener('click', () => { x.closest('.dlg').hidden = true; }));
+  // dock tabs and folding
+  document.querySelectorAll('.dtab').forEach(t => {
+    t.addEventListener('click', () => showDockTab(t.id));
+    t.addEventListener('keydown', e => { if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      const tabs = [...t.parentElement.querySelectorAll('.dtab:not([hidden])')], k = tabs.indexOf(t), n = tabs[(k + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length]; showDockTab(n.id); n.focus(); });
+  });
+  document.querySelectorAll('.dfold').forEach(b => b.addEventListener('click', () => { const g = b.closest('.dgroup'); g.classList.toggle('folded'); b.setAttribute('aria-expanded', String(!g.classList.contains('folded'))); }));
+  // settings shown in two places (options bar and Preferences) stay in step with the one the app reads
+  document.querySelectorAll('[data-mirror]').forEach(m => {
+    const src = $(m.dataset.mirror), key = m.type === 'checkbox' ? 'checked' : 'value', pull = () => { m[key] = src[key]; };
+    pull(); src.addEventListener('change', pull); src.addEventListener('input', pull);
+    m.addEventListener('change', () => { src[key] = m[key]; src.dispatchEvent(new Event('change', { bubbles: true })); });
+  });
+  // shortcuts for the menus
+  window.addEventListener('keydown', e => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const k = e.key.toLowerCase();
+    if (k === 'o' && !e.shiftKey) { e.preventDefault(); $('proj-open-file').click(); }
+    else if (k === 'o' && e.shiftKey) { e.preventDefault(); $('proj-list-btn').click(); }
+    else if (k === 's') { e.preventDefault(); $('proj-save-file').click(); }
+    else if (k === 'e') { e.preventDefault(); if (liveParts().length) openDialog('dlg-export'); }
+    else if (k === ',') { e.preventDefault(); openDialog('dlg-prefs'); }
+  });
+  bindWorkspaces();
+  syncOptbar();
+}
+/** Every keyboard shortcut, in one place. */
+function openKeys() { openDialog('dlg-keys'); }
+function bindWorkspaces() {
+  const order = Object.keys(WS_NAMES);
+  ['menu-unbox', 'menu-unsprue', 'menu-clearpaint', 'menu-nomagnets', 'exp-sprue'].forEach(id => document.querySelectorAll(`.wsop[data-click="${id}"]`).forEach(b => b.classList.add('ctx')));
+  document.querySelectorAll('#dlg-shapes [data-shape]').forEach(b => b.addEventListener('click', () => addShape(b.dataset.shape)));
+  $('menu-shapes').addEventListener('click', () => { closeMenus(); openDialog('dlg-shapes'); });
+  $('keys-open').addEventListener('click', openKeys); $('menu-keys').addEventListener('click', () => { closeMenus(); openKeys(); });
+  document.querySelectorAll('.wstab').forEach(t => {
+    t.addEventListener('click', () => setWorkspace(t.dataset.ws));
+    t.addEventListener('keydown', e => { if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return; e.preventDefault();
+      const i = order.indexOf(workspace), n = order[(i + (e.key === 'ArrowRight' ? 1 : -1) + order.length) % order.length]; setWorkspace(n); $('ws-' + n).focus(); });
+  });
+  const custom = {
+    'ws-shapes': () => openDialog('dlg-shapes'),
+    'ws-paint': () => setTool('paint'), 'ws-magnet': () => setTool('MAGNET'),
+    'ws-drop': () => { const list = selection.length ? selection : selected ? [selected] : []; if (!list.length) return; pushUndo(); for (const p of list) applyWorld(p, Tr(V(0, 0, -lowestZ([p])))); afterHierarchyChange(); toast(`Dropped ${list.length === 1 ? list[0].name : list.length + ' parts'} onto the mat.`); },
+    'ws-square': () => { if (selected) openOrient(selected, { kind: 'auto' }); },
+    'ws-sets': () => showDockTab('tab-opts'),
+    'ws-glue': () => { openDialog('dlg-export'); if (!$('exp-glue').checked) { $('exp-glue').checked = true; $('exp-glue').dispatchEvent(new Event('change')); } $('exp-glue-f').scrollIntoView({ block: 'nearest' }); },
+  };
+  document.querySelectorAll('.wsop[data-click]').forEach(b => b.addEventListener('click', () => { const id = b.dataset.click; if (custom[id]) custom[id](); else $(id)?.click(); syncWsOps(); }));
+  // the buttons follow the menu items they stand for
+  const mo = new MutationObserver(() => syncWsOps());
+  for (const id of new Set([...document.querySelectorAll('.wsop[data-click]')].map(b => b.dataset.click))) { const t = $(id); if (t) mo.observe(t, { attributes: true, attributeFilter: ['disabled', 'aria-checked', 'aria-pressed'] }); }
+  mo.observe($('exp-sprue-f'), { attributes: true, attributeFilter: ['hidden'] });
+  // Ctrl+PageUp / PageDown step through the workspaces, as in Blender
+  window.addEventListener('keydown', e => { if (!(e.ctrlKey || e.metaKey) || e.altKey || (e.key !== 'PageUp' && e.key !== 'PageDown')) return; if (e.target.matches?.('input, select, textarea')) return; e.preventDefault(); const i = order.indexOf(workspace); setWorkspace(order[(i + (e.key === 'PageDown' ? 1 : order.length - 1)) % order.length]); });
+  let saved = null; try { saved = localStorage.getItem('kitbash-ws'); } catch (e) {}
+  setWorkspace(saved || 'assemble', { quiet: true });
+}
+
+function bindProject() {
+  $('proj-name').addEventListener('change', () => { project.name = $('proj-name').value.trim() || 'Untitled kit'; $('proj-name').value = project.name; markDirty(); });
+  $('proj-new').addEventListener('click', () => newProject());
+  $('proj-list-btn').addEventListener('click', () => { openDialog('dlg-projects'); renderProjectList(); });
+  $('proj-save-file').addEventListener('click', saveProjectFile);
+  $('proj-open-file').addEventListener('click', () => $('proj-file').click());
+  $('proj-file').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) openProjectFile(f); });
+  SETTING_IDS.forEach(id => $(id).addEventListener('change', markDirty));
+  orbit.addEventListener('end', () => { if (liveParts().length && !project.dirty) { clearTimeout(project.timer); project.timer = setTimeout(() => project.dirty || saveToBrowser(), 4000); } });
+  window.addEventListener('pagehide', () => { if (project.dirty) saveToBrowser(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && project.dirty) saveToBrowser(); });
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight; if (!w || !h) return;
+  renderer.setSize(w, h, false); perspCam.aspect = w / h; perspCam.updateProjectionMatrix();
+  orthoCam.left = -ORTHO_H * w / h; orthoCam.right = ORTHO_H * w / h; orthoCam.top = ORTHO_H; orthoCam.bottom = -ORTHO_H; orthoCam.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view);
+bindAdjust();
+bindFit(); bindDirPick(); bindCrack(); bindBurst(); bindRelief(); bindOoze(); bindFloating();
+document.querySelectorAll('#move-frame button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === moveFrame)); b.addEventListener('click', () => setMoveFrame(b.dataset.v)); });
+document.querySelectorAll('#affect button').forEach(b => { b.setAttribute('aria-pressed', String((b.dataset.v === 'axes') === axesEdit)); b.addEventListener('click', () => setAxesEdit(b.dataset.v === 'axes')); });
+document.querySelectorAll('#pose-mode button').forEach(b => { b.setAttribute('aria-pressed', String(b.dataset.v === poseMode)); b.addEventListener('click', () => setPoseMode(b.dataset.v)); });
+bindProject();
+bindAutorig(); bindTreeDnD(); bindMarr();
+bindOrient();
+bindOptions();
+bindKit(); bindLinkAsk(); bindChrome(); bindPaint(); bindMagnets();
+$('set-loadas').addEventListener('change', () => { try { localStorage.setItem('kitbash-loadas', $('set-loadas').value); } catch (e) {} });
+try { const v = localStorage.getItem('kitbash-loadas'); if (['ask', 'kit', 'spread', 'asis', 'auto'].includes(v)) $('set-loadas').value = v; } catch (e) {}
+$('set-linkmove').addEventListener('change', () => { try { localStorage.setItem('kitbash-linkmove', $('set-linkmove').value); } catch (e) {} });
+try { const v = localStorage.getItem('kitbash-linkmove'); if (['ask', 'alone', 'group'].includes(v)) $('set-linkmove').value = v; } catch (e) {}   // a habit, kept for this browser
+$('set-bench').addEventListener('change', () => { setBench($('set-bench').value); fitMat(true); try { localStorage.setItem('kitbash-surface', $('set-bench').value); } catch (e) {} });
+$('set-mat').addEventListener('change', () => { fitMat(true); try { localStorage.setItem('kitbash-mat', $('set-mat').value); } catch (e) {} });
+try { const v = localStorage.getItem('kitbash-mat'); if (v && [...$('set-mat').options].some(o => o.value === v)) $('set-mat').value = v; } catch (e) {}
+try { const v = localStorage.getItem('kitbash-surface'); if (v && MAT_STYLES[v] || v === 'grid') $('set-bench').value = v; } catch (e) {}     // a preference for this browser, not per project
+setBench($('set-bench').value);
+setTool('select');
+$('set-smooth-n').value = $('set-smooth').value; SLIDERS.forEach(syncSlider);   // the browser may restore form values on reload: line the bars up with the boxes
+(async () => {
+  project.loading = true;
+  loadSample(); undoStack.length = 0;        // something to look at straight away
+  project.name = 'Sample kit'; $('proj-name').value = project.name;
+  project.loading = false; project.dirty = false; project.pristine = true; setProjStatus('not saved yet');
+  updateButtons();
+  const all = await listProjects();
+  let last = null; try { last = localStorage.getItem('kitbash-last'); } catch (e) {}
+  const pick = all.find(p => p.id === last) || all[0];
+  if (pick && await openSaved(pick.id)) toast(`Welcome back. Reopened ${pick.name} from this browser.`, 'ok');
+})();
+renderer.setAnimationLoop(() => { stepGlide(); orbit.update(); fitClipPlanes(); if (sec.on || sec.helpers.size) updateSection(); updateSkeleton(); updateMatView(); renderer.render(scene, camera); navCube.render(); });
+// automated tests only (a query string never reaches the page inside claude.ai)
+if (new URLSearchParams(location.search).has('kbtest')) { window.__kb = { THREE, get camera() { return camera; }, setOrtho, get refs() { return refs; }, rebuildRefs, silhouette, refMask, poseFigures, overlap, orbit, scene, liveParts, renderer, tc, proxy, get links() { return links; }, jointOf, solveLinks, get sprues() { return sprues; }, get kit() { return kit; }, get magnets() { return magnets; }, cutMagnetHoles, get connSel() { return connSel; }, faceAxes, get dirPick() { return dirPick; }, eigenSym3, topoOf, get rp() { return rp; }, get oz() { return oz; }, glueOns, ensureStack, evalStack, newModId, partById, afterHierarchyChange, undo, get MAT() { return MAT; } }; }
